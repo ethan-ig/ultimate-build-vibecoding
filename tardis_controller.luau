@@ -20,7 +20,13 @@ local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
 local RECALL_GROUND_CLEARANCE = 0.10
 local FADE_TIME = 14
 local FADE_STEP = 0.18
-local MOVE_BATCH_SIZE = 40
+
+-- UB property changes are remote/rate limited. Keep these deliberately
+-- conservative because this TARDIS is ~320 separate parts.
+local STARTUP_BATCH_SIZE = 10
+local MOVE_BATCH_SIZE = 24
+local VISUAL_BATCH_SIZE = 24
+local BATCH_DELAY = 0.03
 
 --------------------------------------------------
 -- ULTIMATE BUILD PROXY HELPERS
@@ -94,26 +100,53 @@ local function readObjectProperty(entry, property)
 end
 
 local function writeObjectProperty(entry, property, value)
+    -- Do not spend one of UB's replicated property mutations when the real
+    -- part already has the requested value.
+    if entry.raw then
+        local current = nil
+        local readable = pcall(function()
+            current = entry.raw[property]
+        end)
+
+        if readable and current == value then
+            return true
+        end
+    end
+
     -- UB proxy writes are the important path: these are what Ultimate Build
     -- can replicate through its own property system.
     if entry.proxy then
-        local ok = pcall(function()
+        local ok, err = pcall(function()
             entry.proxy[property] = value
         end)
 
         if ok then
             return true
         end
+
+        print("TARDIS proxy write failed:", property, tostring(err))
     end
 
     -- Fallback for a raw Roblox BasePart. Useful if UB handed us a real part.
     if entry.raw then
-        return pcall(function()
+        local ok, err = pcall(function()
             entry.raw[property] = value
         end)
+
+        if not ok then
+            print("TARDIS raw write failed:", property, tostring(err))
+        end
+
+        return ok
     end
 
     return false
+end
+
+local function yieldBatch(index, batchSize)
+    if index % batchSize == 0 then
+        task.wait(BATCH_DELAY)
+    end
 end
 
 --------------------------------------------------
@@ -313,14 +346,24 @@ end
 -- STARTUP PHYSICS
 --------------------------------------------------
 
+-- Do these as separate, throttled passes. With hundreds of parts, doing two
+-- replicated writes per part in one tight loop can trip UB's Promise/remote
+-- limiter and abort the Code block.
+print("TARDIS startup: anchoring parts...")
+
 for index, entry in ipairs(tardisParts) do
     writeObjectProperty(entry, "Anchored", true)
-    writeObjectProperty(entry, "CanCollide", true)
-
-    if index % MOVE_BATCH_SIZE == 0 then
-        task.wait()
-    end
+    yieldBatch(index, STARTUP_BATCH_SIZE)
 end
+
+print("TARDIS startup: enabling collision...")
+
+for index, entry in ipairs(tardisParts) do
+    writeObjectProperty(entry, "CanCollide", true)
+    yieldBatch(index, STARTUP_BATCH_SIZE)
+end
+
+print("TARDIS startup physics ready")
 
 --------------------------------------------------
 -- PIVOT / RELATIVE CFRAMES
@@ -387,9 +430,7 @@ local function moveTardis(targetCFrame)
             writeObjectProperty(entry, "CFrame", targetCFrame * relative)
         end
 
-        if index % MOVE_BATCH_SIZE == 0 then
-            task.wait()
-        end
+        yieldBatch(index, MOVE_BATCH_SIZE)
     end
 end
 
@@ -403,8 +444,9 @@ local function setTransparency(value)
     value = math.clamp(value, 0, 1)
     currentTransparency = value
 
-    for _, entry in ipairs(tardisParts) do
+    for index, entry in ipairs(tardisParts) do
         writeObjectProperty(entry, "Transparency", value)
+        yieldBatch(index, VISUAL_BATCH_SIZE)
     end
 end
 
