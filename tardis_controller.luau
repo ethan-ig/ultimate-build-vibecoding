@@ -7,7 +7,9 @@
 --
 -- Every shell piece needs Display name = Tardis
 --
--- No sounds. No lights. No outputs.
+-- IMPORTANT: Ultimate Build workspace scans return basePart proxy tables.
+-- We keep the proxy for replicated property writes and use proxy.Part for
+-- real Roblox geometry/CFrame reads.
 
 local inputA = inputs["a"]
 local inputC = inputs["c"]
@@ -21,112 +23,281 @@ local FADE_STEP = 0.18
 local MOVE_BATCH_SIZE = 40
 
 --------------------------------------------------
--- DISPLAY NAME
+-- ULTIMATE BUILD PROXY HELPERS
 --------------------------------------------------
 
-local function getDisplayName(part)
+local function resolveRawPart(object)
+    if not object then
+        return nil
+    end
+
+    local rawPart = nil
+
+    pcall(function()
+        rawPart = object.Part
+    end)
+
+    if typeof(rawPart) == "Instance" then
+        local isBasePart = false
+        pcall(function()
+            isBasePart = rawPart:IsA("BasePart")
+        end)
+
+        if isBasePart then
+            return rawPart
+        end
+    end
+
+    if typeof(object) == "Instance" then
+        local isBasePart = false
+        pcall(function()
+            isBasePart = object:IsA("BasePart")
+        end)
+
+        if isBasePart then
+            return object
+        end
+    end
+
+    return nil
+end
+
+local function readObjectProperty(entry, property)
     local value = nil
+    local gotValue = false
 
-    local ok = pcall(function()
-        value = part.attributes["Display name"]
-    end)
+    if entry.proxy then
+        local ok = pcall(function()
+            value = entry.proxy[property]
+        end)
 
-    if ok and type(value) == "string" and value ~= "" then
-        return value
+        if ok and value ~= nil then
+            gotValue = true
+        end
     end
 
-    ok = pcall(function()
-        value = part:GetAttribute("Display name")
-    end)
+    if not gotValue and entry.raw then
+        local ok = pcall(function()
+            value = entry.raw[property]
+        end)
 
-    if ok and type(value) == "string" and value ~= "" then
-        return value
+        if ok and value ~= nil then
+            gotValue = true
+        end
     end
 
-    ok = pcall(function()
-        value = part.DisplayName
-    end)
-
-    if ok and type(value) == "string" and value ~= "" then
+    if gotValue then
         return value
     end
 
     return nil
 end
 
-local function isTardis(part)
-    local displayName = getDisplayName(part)
+local function writeObjectProperty(entry, property, value)
+    -- UB proxy writes are the important path: these are what Ultimate Build
+    -- can replicate through its own property system.
+    if entry.proxy then
+        local ok = pcall(function()
+            entry.proxy[property] = value
+        end)
 
-    if type(displayName) ~= "string" then
-        return false
+        if ok then
+            return true
+        end
     end
 
-    displayName = string.lower(displayName)
-    displayName = string.gsub(displayName, "^%s+", "")
-    displayName = string.gsub(displayName, "%s+$", "")
+    -- Fallback for a raw Roblox BasePart. Useful if UB handed us a real part.
+    if entry.raw then
+        return pcall(function()
+            entry.raw[property] = value
+        end)
+    end
 
-    return displayName == string.lower(TARGET_NAME)
+    return false
+end
+
+--------------------------------------------------
+-- DISPLAY NAME
+--------------------------------------------------
+
+local function getDisplayName(object)
+    local value = nil
+
+    -- UB proxy attribute table.
+    for _, key in ipairs({
+        "Display name",
+        "Display Name",
+        "Display",
+        "DisplayName",
+    }) do
+        local ok = pcall(function()
+            value = object.attributes[key]
+        end)
+
+        if ok and type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+
+    -- UB proxy GetAttribute support.
+    for _, key in ipairs({
+        "Display name",
+        "Display Name",
+        "Display",
+        "DisplayName",
+    }) do
+        local ok = pcall(function()
+            value = object:GetAttribute(key)
+        end)
+
+        if ok and type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+
+    -- Some proxy implementations expose the display value directly.
+    for _, key in ipairs({
+        "Display name",
+        "Display Name",
+        "Display",
+        "DisplayName",
+    }) do
+        local ok = pcall(function()
+            value = object[key]
+        end)
+
+        if ok and type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+
+    -- Last-resort raw-part attributes.
+    local rawPart = resolveRawPart(object)
+    if rawPart then
+        for _, key in ipairs({
+            "Display name",
+            "Display Name",
+            "Display",
+            "DisplayName",
+        }) do
+            local ok = pcall(function()
+                value = rawPart:GetAttribute(key)
+            end)
+
+            if ok and type(value) == "string" and value ~= "" then
+                return value
+            end
+        end
+    end
+
+    -- Name is only a fallback. UB's visible Display name is preferred.
+    local ok = pcall(function()
+        value = object.Name
+    end)
+
+    if ok and type(value) == "string" and value ~= "" then
+        return value
+    end
+
+    if rawPart then
+        ok = pcall(function()
+            value = rawPart.Name
+        end)
+
+        if ok and type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+
+    return nil
+end
+
+local function normalizeName(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    value = string.lower(value)
+    value = string.gsub(value, "^%s+", "")
+    value = string.gsub(value, "%s+$", "")
+
+    return value
+end
+
+local function isTardis(object)
+    return normalizeName(getDisplayName(object)) == string.lower(TARGET_NAME)
 end
 
 --------------------------------------------------
 -- FIND TARDIS PARTS
 --
--- Try the cheap/known scan first. If this UB build returns
--- nothing useful, fall back to the documented descendant scan.
+-- Ultimate Build's workspace:GetChildren/GetDescendants return editable
+-- basePart proxies. proxy.Part is the real BasePart.
 --------------------------------------------------
 
 local tardisParts = {}
 local seen = {}
 
-local function scan(list)
-    if not list then
+local function scan(label, list)
+    if type(list) ~= "table" then
+        print("TARDIS scan failed:", label, "did not return a table")
         return
     end
 
-    for _, part in ipairs(list) do
-        if part ~= script and not seen[part] and isTardis(part) then
-            local hasCFrame = false
+    print("TARDIS scan:", label, "objects:", #list)
 
-            pcall(function()
-                hasCFrame = typeof(part.CFrame) == "CFrame"
-            end)
+    for _, object in ipairs(list) do
+        if object ~= script and isTardis(object) then
+            local rawPart = resolveRawPart(object)
 
-            if hasCFrame then
-                seen[part] = true
-                table.insert(tardisParts, part)
+            if rawPart then
+                local identity = rawPart
+
+                if not seen[identity] then
+                    seen[identity] = true
+                    table.insert(tardisParts, {
+                        proxy = object,
+                        raw = rawPart,
+                    })
+                end
+            else
+                print("TARDIS matched Display name but .Part was unavailable")
             end
         end
     end
 end
 
-local function safeList(callback)
+local function safeList(label, callback)
     local ok, result = pcall(callback)
 
-    if ok then
-        return result
+    if not ok then
+        print("TARDIS scan error:", label, tostring(result))
+        return nil
     end
 
-    return nil
+    return result
 end
 
-scan(safeList(function()
+-- true = parts owned by this player. Try that first because it is cheaper.
+scan("GetChildren(true)", safeList("GetChildren(true)", function()
     return workspace:GetChildren(true)
 end))
 
 if #tardisParts == 0 then
-    scan(safeList(function()
+    scan("GetDescendants(true)", safeList("GetDescendants(true)", function()
         return workspace:GetDescendants(true)
     end))
 end
 
+-- Then allow every part editable by the player.
 if #tardisParts == 0 then
-    scan(safeList(function()
+    scan("GetChildren()", safeList("GetChildren()", function()
         return workspace:GetChildren()
     end))
 end
 
 if #tardisParts == 0 then
-    scan(safeList(function()
+    scan("GetDescendants()", safeList("GetDescendants()", function()
         return workspace:GetDescendants()
     end))
 end
@@ -134,7 +305,7 @@ end
 print("TARDIS parts found:", #tardisParts)
 
 if #tardisParts == 0 then
-    print("TARDIS ERROR: no parts with Display name = Tardis")
+    print("TARDIS ERROR: no editable parts with Display name = Tardis")
     return
 end
 
@@ -142,9 +313,9 @@ end
 -- STARTUP PHYSICS
 --------------------------------------------------
 
-for index, part in ipairs(tardisParts) do
-    part.Anchored = true
-    part.CanCollide = true
+for index, entry in ipairs(tardisParts) do
+    writeObjectProperty(entry, "Anchored", true)
+    writeObjectProperty(entry, "CanCollide", true)
 
     if index % MOVE_BATCH_SIZE == 0 then
         task.wait()
@@ -155,12 +326,24 @@ end
 -- PIVOT / RELATIVE CFRAMES
 --------------------------------------------------
 
-local startingPivot = tardisParts[1].CFrame
+local startingPivot = readObjectProperty(tardisParts[1], "CFrame")
+
+if typeof(startingPivot) ~= "CFrame" then
+    print("TARDIS ERROR: first matched part has no readable CFrame")
+    return
+end
+
 local defaultRotation = startingPivot - startingPivot.Position
 local relativeCFrames = {}
 
-for _, part in ipairs(tardisParts) do
-    relativeCFrames[part] = startingPivot:ToObjectSpace(part.CFrame)
+for _, entry in ipairs(tardisParts) do
+    local partCFrame = readObjectProperty(entry, "CFrame")
+
+    if typeof(partCFrame) == "CFrame" then
+        relativeCFrames[entry] = startingPivot:ToObjectSpace(partCFrame)
+    else
+        print("TARDIS WARNING: matched part has no readable CFrame")
+    end
 end
 
 --------------------------------------------------
@@ -170,19 +353,21 @@ end
 local tardisBottomOffset = 0
 local lowestBottom = math.huge
 
-for _, part in ipairs(tardisParts) do
-    local cf = part.CFrame
-    local size = part.Size
+for _, entry in ipairs(tardisParts) do
+    local cf = readObjectProperty(entry, "CFrame")
+    local size = readObjectProperty(entry, "Size")
 
-    local verticalHalfExtent =
-        math.abs(cf.RightVector.Y) * (size.X / 2)
-        + math.abs(cf.UpVector.Y) * (size.Y / 2)
-        + math.abs(cf.LookVector.Y) * (size.Z / 2)
+    if typeof(cf) == "CFrame" and typeof(size) == "Vector3" then
+        local verticalHalfExtent =
+            math.abs(cf.RightVector.Y) * (size.X / 2)
+            + math.abs(cf.UpVector.Y) * (size.Y / 2)
+            + math.abs(cf.LookVector.Y) * (size.Z / 2)
 
-    local bottomY = cf.Position.Y - verticalHalfExtent
+        local bottomY = cf.Position.Y - verticalHalfExtent
 
-    if bottomY < lowestBottom then
-        lowestBottom = bottomY
+        if bottomY < lowestBottom then
+            lowestBottom = bottomY
+        end
     end
 end
 
@@ -195,8 +380,12 @@ end
 --------------------------------------------------
 
 local function moveTardis(targetCFrame)
-    for index, part in ipairs(tardisParts) do
-        part.CFrame = targetCFrame * relativeCFrames[part]
+    for index, entry in ipairs(tardisParts) do
+        local relative = relativeCFrames[entry]
+
+        if relative then
+            writeObjectProperty(entry, "CFrame", targetCFrame * relative)
+        end
 
         if index % MOVE_BATCH_SIZE == 0 then
             task.wait()
@@ -214,8 +403,8 @@ local function setTransparency(value)
     value = math.clamp(value, 0, 1)
     currentTransparency = value
 
-    for _, part in ipairs(tardisParts) do
-        part.Transparency = value
+    for _, entry in ipairs(tardisParts) do
+        writeObjectProperty(entry, "Transparency", value)
     end
 end
 
