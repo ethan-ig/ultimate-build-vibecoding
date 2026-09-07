@@ -422,6 +422,104 @@ local function getPlayerGroundY(root)
     return groundY
 end
 
+-- Find the highest collidable surface directly below the player without using
+-- Roblox raycast APIs that Ultimate Build may wrap differently. This only runs
+-- when calculating a recall destination; the rest of the controller is unchanged.
+local function updateFloorSlab(originCoord, directionCoord, minCoord, maxCoord, tMin, tMax)
+    local epsilon = 0.000001
+
+    if math.abs(directionCoord) <= epsilon then
+        if originCoord < minCoord or originCoord > maxCoord then
+            return tMin, tMax, false
+        end
+        return tMin, tMax, true
+    end
+
+    local t1 = (minCoord - originCoord) / directionCoord
+    local t2 = (maxCoord - originCoord) / directionCoord
+    if t1 > t2 then
+        local swap = t1
+        t1 = t2
+        t2 = swap
+    end
+
+    if t1 > tMin then tMin = t1 end
+    if t2 < tMax then tMax = t2 end
+    return tMin, tMax, tMin <= tMax
+end
+
+local function floorHitY(part, x, z, maxY)
+    if not part or part == script or contains(moveParts, part) then return nil end
+
+    local cf = nil
+    local size = nil
+    local rawPart = nil
+
+    pcall(function() rawPart = part.Part end)
+
+    local ok = pcall(function()
+        cf = part.CFrame
+        size = part.Size
+    end)
+
+    if (not ok or not cf or not size) and rawPart then
+        ok = pcall(function()
+            cf = rawPart.CFrame
+            size = rawPart.Size
+        end)
+    end
+
+    if not ok or not cf or not size then return nil end
+
+    local canCollide = getBlockValue(part, "CanCollide")
+    if canCollide == nil and rawPart then
+        pcall(function() canCollide = rawPart.CanCollide end)
+    end
+    if canCollide == false then return nil end
+
+    local startY = maxY + 2
+    local distance = 20000
+    local worldOrigin = Vector3.new(x, startY, z)
+    local worldEnd = Vector3.new(x, startY - distance, z)
+
+    local localOrigin = nil
+    local localEnd = nil
+    ok = pcall(function()
+        localOrigin = cf:PointToObjectSpace(worldOrigin)
+        localEnd = cf:PointToObjectSpace(worldEnd)
+    end)
+    if not ok or not localOrigin or not localEnd then return nil end
+
+    local direction = localEnd - localOrigin
+    local tMin = 0
+    local tMax = 1
+    local hit = true
+
+    tMin, tMax, hit = updateFloorSlab(localOrigin.X, direction.X, -size.X / 2, size.X / 2, tMin, tMax)
+    if not hit then return nil end
+    tMin, tMax, hit = updateFloorSlab(localOrigin.Y, direction.Y, -size.Y / 2, size.Y / 2, tMin, tMax)
+    if not hit then return nil end
+    tMin, tMax, hit = updateFloorSlab(localOrigin.Z, direction.Z, -size.Z / 2, size.Z / 2, tMin, tMax)
+    if not hit or tMin < 0 or tMin > 1 then return nil end
+
+    local hitY = startY - distance * tMin
+    if hitY > maxY + 0.5 then return nil end
+    return hitY
+end
+
+local function findFloorY(x, z, maxY)
+    local bestY = nil
+
+    for _, part in ipairs(workspace:GetDescendants(true)) do
+        local hitY = floorHitY(part, x, z, maxY)
+        if hitY and (bestY == nil or hitY > bestY) then
+            bestY = hitY
+        end
+    end
+
+    return bestY
+end
+
 local function getCharacterDestination()
     local root = getLocalPlayerRoot()
     if not root then
@@ -429,7 +527,11 @@ local function getCharacterDestination()
         return nil
     end
 
-    local groundY = getPlayerGroundY(root)
+    local groundY = findFloorY(root.Position.X, root.Position.Z, root.Position.Y + 1)
+    if groundY == nil then
+        groundY = getPlayerGroundY(root)
+    end
+
     local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
     return CFrame.new(root.Position.X, pivotY, root.Position.Z) * defaultRotation
 end
