@@ -1,40 +1,27 @@
 -- SIMPLE TARDIS CONTROLLER
 --
--- INPUT A
---   false = dematerialize
---   true  = materialize at Input C
+-- A = false -> dematerialize
+-- A = true  -> materialize at Input C
+-- C = destination Vector3 or CFrame
+-- J = dematerialize, then materialize on local player
 --
--- INPUT C
---   Vector3 or CFrame destination
+-- Every shell piece: Display name = Tardis
 --
--- INPUT J
---   one-shot recall:
---   dematerialize, then materialize on your character
---
--- Every TARDIS shell piece must have:
---   Display name = Tardis
---
--- No sounds. No light logic. No outputs. No waveform stuff.
+-- ALL MOVEMENT IS DONE WITH CFrame.
 
 local inputA = inputs["a"]
 local inputC = inputs["c"]
 local inputJ = inputs["j"]
 
 local TARGET_NAME = "Tardis"
-
-local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
+local HIDDEN_CFRAME = CFrame.new(-2000, 1, 2772)
 local RECALL_GROUND_CLEARANCE = 0.10
-
--- Full visible <-> invisible transition time.
 local FADE_TIME = 14
-
--- 357 pieces at ~5.5 writes/sec stays below UB's old 2500/s remote limit.
 local FADE_STEP = 0.18
-
 local MOVE_BATCH_SIZE = 40
 
 --------------------------------------------------
--- FIND TARDIS SHELL
+-- FIND SHELL
 --------------------------------------------------
 
 local tardisParts = {}
@@ -43,12 +30,11 @@ for _, part in ipairs(workspace:GetChildren(true)) do
     if part ~= script then
         local displayName = nil
 
-        local ok = pcall(function()
+        pcall(function()
             displayName = part.attributes["Display name"]
         end)
 
-        if ok
-        and type(displayName) == "string"
+        if type(displayName) == "string"
         and string.lower(displayName) == string.lower(TARGET_NAME) then
             table.insert(tardisParts, part)
         end
@@ -58,12 +44,12 @@ end
 print("TARDIS parts found:", #tardisParts)
 
 if #tardisParts == 0 then
-    print("TARDIS ERROR: no parts with Display name = Tardis")
+    print("TARDIS ERROR: no parts named Tardis")
     return
 end
 
 --------------------------------------------------
--- FORCE SHELL ANCHORED + COLLIDABLE
+-- LOCK SHELL
 --------------------------------------------------
 
 for index, part in ipairs(tardisParts) do
@@ -76,12 +62,11 @@ for index, part in ipairs(tardisParts) do
 end
 
 --------------------------------------------------
--- PIVOT + OFFSETS
+-- PIVOT / OFFSETS
 --------------------------------------------------
 
 local startingPivot = tardisParts[1].CFrame
-local defaultRotation = startingPivot - startingPivot.Position
-
+local startingRotation = startingPivot - startingPivot.Position
 local relativeCFrames = {}
 
 for _, part in ipairs(tardisParts) do
@@ -89,7 +74,7 @@ for _, part in ipairs(tardisParts) do
 end
 
 --------------------------------------------------
--- FIND TRUE BOTTOM OF TARDIS
+-- BOTTOM OFFSET
 --------------------------------------------------
 
 local tardisBottomOffset = 0
@@ -116,17 +101,24 @@ if lowestBottom < math.huge then
 end
 
 --------------------------------------------------
--- MOVE WHOLE TARDIS
+-- CFRAME MOVEMENT
 --------------------------------------------------
 
-local function moveTardis(pivot)
+local function moveTardisToCFrame(targetCFrame)
+    if typeof(targetCFrame) ~= "CFrame" then
+        print("TARDIS MOVE ERROR: target is not CFrame")
+        return false
+    end
+
     for index, part in ipairs(tardisParts) do
-        part.CFrame = pivot * relativeCFrames[part]
+        part.CFrame = targetCFrame * relativeCFrames[part]
 
         if index % MOVE_BATCH_SIZE == 0 then
             task.wait()
         end
     end
+
+    return true
 end
 
 --------------------------------------------------
@@ -160,21 +152,18 @@ local function fadeTo(target)
         return
     end
 
-    -- Reversing halfway only takes the remaining fraction of 14 seconds.
     local duration = FADE_TIME * distance
-    local startClock = os.clock()
+    local started = os.clock()
 
     while true do
         local progress = math.clamp(
-            (os.clock() - startClock) / duration,
+            (os.clock() - started) / duration,
             0,
             1
         )
 
         local eased = smoothStep(progress)
-        local value = startValue + (target - startValue) * eased
-
-        setTransparency(value)
+        setTransparency(startValue + (target - startValue) * eased)
 
         if progress >= 1 then
             break
@@ -187,43 +176,37 @@ local function fadeTo(target)
 end
 
 --------------------------------------------------
--- DESTINATION FROM INPUT C
+-- INPUT C -> CFRAME
 --------------------------------------------------
 
-local function getInputDestination()
+local function getInputCFrame()
     local value = inputC:GetState()
-
-    if typeof(value) == "Vector3" then
-        return CFrame.new(value) * defaultRotation
-    end
 
     if typeof(value) == "CFrame" then
         return value
     end
 
-    print("INPUT C must be Vector3 or CFrame")
+    if typeof(value) == "Vector3" then
+        return CFrame.new(value) * startingRotation
+    end
+
+    print("INPUT C must be CFrame or Vector3")
     return startingPivot
 end
 
 --------------------------------------------------
--- LOCAL PLAYER DESTINATION
+-- PLAYER -> CFRAME
 --------------------------------------------------
 
 local function getLocalPlayerRoot()
     local Players = game:GetService("Players")
     local player = Players.LocalPlayer
 
-    if not player then
+    if not player or not player.Character then
         return nil
     end
 
-    local character = player.Character
-
-    if not character then
-        return nil
-    end
-
-    return character:FindFirstChild("HumanoidRootPart")
+    return player.Character:FindFirstChild("HumanoidRootPart")
 end
 
 local function getPlayerGroundY(root)
@@ -241,17 +224,14 @@ local function getPlayerGroundY(root)
         local rootHeight = root.Size.Y
 
         if hipHeight and hipHeight > 0.5 then
-            groundY =
-                root.Position.Y
-                - (rootHeight / 2)
-                - hipHeight
+            groundY = root.Position.Y - (rootHeight / 2) - hipHeight
         end
     end
 
     return groundY
 end
 
-local function getCharacterDestination()
+local function getCharacterCFrame()
     local root = getLocalPlayerRoot()
 
     if not root then
@@ -260,7 +240,6 @@ local function getCharacterDestination()
     end
 
     local groundY = getPlayerGroundY(root)
-
     local pivotY =
         groundY
         - tardisBottomOffset
@@ -270,14 +249,14 @@ local function getCharacterDestination()
         root.Position.X,
         pivotY,
         root.Position.Z
-    ) * defaultRotation
+    ) * startingRotation
 end
 
 --------------------------------------------------
 -- MATERIALIZE / DEMATERIALIZE
 --------------------------------------------------
 
-local hiddenPivot = CFrame.new(HIDDEN_POSITION) * defaultRotation
+local hiddenCFrame = HIDDEN_CFRAME * startingRotation
 local hidden = false
 
 local function dematerialize()
@@ -288,26 +267,22 @@ local function dematerialize()
     print("TARDIS DEMATERIALIZING")
 
     fadeTo(1)
-    moveTardis(hiddenPivot)
-
+    moveTardisToCFrame(hiddenCFrame)
     hidden = true
 
     print("TARDIS DEMATERIALIZED")
 end
 
-local function materializeAt(destination)
-    if not destination then
+local function materializeAtCFrame(destinationCFrame)
+    if typeof(destinationCFrame) ~= "CFrame" then
         return
     end
 
     print("TARDIS MATERIALIZING")
 
-    -- Move while invisible, then fade in.
     setTransparency(1)
-    moveTardis(destination)
-
+    moveTardisToCFrame(destinationCFrame)
     hidden = false
-
     fadeTo(0)
 
     print("TARDIS MATERIALIZED")
@@ -322,58 +297,41 @@ local lastJState = false
 local recallRunning = false
 
 if lastAState then
-    currentTransparency = 0
     setTransparency(0)
     hidden = false
 else
-    currentTransparency = 1
     setTransparency(1)
-    moveTardis(hiddenPivot)
+    moveTardisToCFrame(hiddenCFrame)
     hidden = true
 end
 
-print("SIMPLE TARDIS READY")
+print("SIMPLE CFRAME TARDIS READY")
 
 --------------------------------------------------
 -- MAIN LOOP
 --------------------------------------------------
 
 while true do
-    --------------------------------------------------
-    -- J RECALL
-    --------------------------------------------------
-
     local jState = inputJ:GetState() == true
 
     if jState and not lastJState and not recallRunning then
         recallRunning = true
 
-        print("J RECALL START")
-
-        -- If visible, disappear first.
         if not hidden then
             dematerialize()
         end
 
-        -- Sample your position immediately before materializing.
-        local destination = getCharacterDestination()
+        local destinationCFrame = getCharacterCFrame()
 
-        if destination then
-            materializeAt(destination)
+        if destinationCFrame then
+            materializeAtCFrame(destinationCFrame)
         end
 
-        -- Resync A so J does not immediately trigger an opposite transition.
         lastAState = inputA:GetState() == true
         recallRunning = false
-
-        print("J RECALL COMPLETE")
     end
 
     lastJState = jState
-
-    --------------------------------------------------
-    -- NORMAL A CONTROL
-    --------------------------------------------------
 
     if not recallRunning then
         local aState = inputA:GetState() == true
@@ -382,7 +340,7 @@ while true do
             lastAState = aState
 
             if aState then
-                materializeAt(getInputDestination())
+                materializeAtCFrame(getInputCFrame())
             else
                 dematerialize()
             end
