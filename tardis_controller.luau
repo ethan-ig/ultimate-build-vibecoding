@@ -1,69 +1,67 @@
--- TARDIS controller - Fiu-safe direct discovery version
+-- TARDIS CONTROLLER - RECOVERY / DIRECT UB PROXY VERSION
 --
--- INPUT A: true = materialized, false = dematerialized
--- INPUT C: Vector3/CFrame normal destination
--- INPUT J: rising edge = recall to local player
+-- This intentionally backs away from the experimental wrapper-heavy versions.
+-- The important rule in this file is:
+--   * reads may be protected
+--   * UB proxy PROPERTY WRITES are direct and are NOT wrapped in pcall
 --
--- DISPLAY NAMES:
+-- INPUTS
+--   A = true materialized / false dematerialized
+--   C = normal destination (Vector3 or CFrame)
+--   J = one-shot recall: demat -> remat on local player
+--
+-- DISPLAY NAMES
 --   Tardis
 --   TardisDematSound
 --   TardisMatSound
 --   Tardislight
 --
--- IMPORTANT:
--- Structural properties are written through UB proxies so they replicate.
--- SoundBlocks are controlled ONLY through FireInput. We do not write their
--- attributes because those writes were causing Fiu's asynchronous Promise
--- rejection. TimePosition/TimeLength/IsPlaying are read-only here and drive
--- the visual effect.
+-- SOUNDBLOCKS
+--   Set manually:
+--     Repeat = false
+--     ResetTimePosition = true
 --
--- Discovery intentionally matches the old working skyshow command system:
--- Workspace:GetChildren() with NO true parameter and NO GetDescendants().
+-- No Code outputs are required.
 
-local inputA = inputs["a"]
-local inputC = inputs["c"]
-local inputJ = inputs["j"]
+local inputA = script.inputs["a"]
+local inputC = script.inputs["c"]
+local inputJ = script.inputs["j"]
 
 local SHELL_NAME = "Tardis"
 local DEMAT_SOUND_NAME = "TardisDematSound"
 local MAT_SOUND_NAME = "TardisMatSound"
 local LIGHT_NAME = "Tardislight"
 
+local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
+local RECALL_GROUND_CLEARANCE = 0.10
+
+-- Visual timing
 local VISUAL_START_TIME = 0.20
 local SOUND_TAIL_TIME = 2.50
 local FALLBACK_FADE_TIME = 14
 local FALLBACK_TAIL_TIME = 2.50
 local SOUND_START_TIMEOUT = 3
-local LOOP_INTERVAL = 1 / 60
 
-local FADE_AGGRESSION = 0.27
-local WAVE_STRENGTH = 0.92
+-- Audio-locked visual shaping
+local FADE_AGGRESSION = 0.48
+local WAVE_STRENGTH = 0.62
 
-local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
-local RECALL_GROUND_CLEARANCE = 0.10
+-- IMPORTANT: 357 parts x 4 Hz ~= 1428 replicated transparency writes/sec.
+-- This stays comfortably below the old UB ~2500 remote writes/sec limit.
+local REPLICATED_FADE_HZ = 4
+local REPLICATED_FADE_INTERVAL = 1 / REPLICATED_FADE_HZ
 
-local FADE_WRITE_BUDGET = 1500
-local FADE_MAX_HZ = 20
-local FADE_MIN_HZ = 4
-local LIGHT_HZ = 20
+-- Movement is a one-shot burst. Yield every batch so we do not hammer UB.
+local MOVE_BATCH_SIZE = 32
+local LOOP_INTERVAL = 1 / 30
 
 --------------------------------------------------
--- UB PROXY ACCESS
+-- SAFE READ HELPERS
+--
+-- Reads are allowed to be protected. PROPERTY WRITES below are not.
 --------------------------------------------------
 
-local function setProperty(object, property, value)
-    if not object then
-        return false
-    end
-
-    local ok = pcall(function()
-        object[property] = value
-    end)
-
-    return ok
-end
-
-local function getProperty(object, property)
+local function readProperty(object, property)
     if not object then
         return nil
     end
@@ -88,6 +86,14 @@ local function readAttribute(object, name)
         return object.attributes[name]
     end)
 
+    if ok and value ~= nil then
+        return value
+    end
+
+    ok, value = pcall(function()
+        return object:GetAttribute(name)
+    end)
+
     if ok then
         return value
     end
@@ -95,14 +101,15 @@ local function readAttribute(object, name)
     return nil
 end
 
-local function readDisplayName(object)
+local function getDisplayName(object)
     local value = readAttribute(object, "Display name")
 
     if type(value) == "string" and value ~= "" then
         return value
     end
 
-    value = getProperty(object, "Name")
+    -- Older Code-block builds exposed this spelling/property.
+    value = readProperty(object, "DisplayName")
 
     if type(value) == "string" and value ~= "" then
         return value
@@ -111,15 +118,52 @@ local function readDisplayName(object)
     return nil
 end
 
+local function hasCFrame(object)
+    return typeof(readProperty(object, "CFrame")) == "CFrame"
+end
+
 --------------------------------------------------
 -- DISCOVERY
+--
+-- GetChildren(true) is the version that previously found the 357 TARDIS
+-- shell blocks correctly on this build. We keep that as the primary source.
+-- A plain GetChildren() pass is merged only to give specialty blocks another
+-- chance to appear without using the troublesome descendant scan.
 --------------------------------------------------
 
-print("TARDIS SAFE INIT 1: skyshow-style GetChildren scan")
+print("TARDIS RECOVERY INIT 1")
 
--- IMPORTANT: this intentionally matches the old working command system.
--- No true flag and no recursive descendant call.
-local ownedParts = workspace:GetChildren()
+local candidates = {}
+local candidateSet = {}
+
+local function addCandidates(list)
+    if not list then
+        return
+    end
+
+    for _, object in ipairs(list) do
+        if object ~= script and not candidateSet[object] then
+            candidateSet[object] = true
+            table.insert(candidates, object)
+        end
+    end
+end
+
+local okOwned, owned = pcall(function()
+    return workspace:GetChildren(true)
+end)
+
+if okOwned then
+    addCandidates(owned)
+end
+
+local okAll, allChildren = pcall(function()
+    return workspace:GetChildren()
+end)
+
+if okAll then
+    addCandidates(allChildren)
+end
 
 local shellParts = {}
 local moveParts = {}
@@ -140,97 +184,237 @@ local function contains(list, object)
     return false
 end
 
-local function addMovable(list, object)
-    if not object or contains(list, object) then
-        return
-    end
-
-    local cf = getProperty(object, "CFrame")
-
-    if typeof(cf) == "CFrame" then
+local function addUnique(list, object)
+    if object and not contains(list, object) then
         table.insert(list, object)
     end
 end
 
-for _, object in ipairs(ownedParts) do
-    if object ~= script then
-        local displayName = readDisplayName(object)
+for _, object in ipairs(candidates) do
+    local displayName = getDisplayName(object)
 
-        if displayName then
-            local lower = string.lower(displayName)
+    if displayName then
+        local lower = string.lower(displayName)
 
-            if lower == string.lower(SHELL_NAME) then
-                table.insert(shellParts, object)
-                addMovable(moveParts, object)
-                addMovable(fadeParts, object)
+        if lower == string.lower(SHELL_NAME) and hasCFrame(object) then
+            table.insert(shellParts, object)
+            addUnique(moveParts, object)
+            addUnique(fadeParts, object)
 
-            elseif lower == string.lower(DEMAT_SOUND_NAME) then
-                dematSound = object
+        elseif lower == string.lower(DEMAT_SOUND_NAME) then
+            dematSound = object
 
-            elseif lower == string.lower(MAT_SOUND_NAME) then
-                matSound = object
+        elseif lower == string.lower(MAT_SOUND_NAME) then
+            matSound = object
 
-            elseif lower == string.lower(LIGHT_NAME) then
-                tardisLight = object
-
-            elseif string.find(lower, "tardis", 1, true) then
-                print("TARDIS other named block:", displayName)
-            end
+        elseif lower == string.lower(LIGHT_NAME) then
+            tardisLight = object
         end
     end
 end
 
-addMovable(moveParts, dematSound)
-addMovable(moveParts, matSound)
-addMovable(moveParts, tardisLight)
+-- Specialty blocks are optional. Core A/J behavior must still work without them.
+if dematSound and hasCFrame(dematSound) then
+    addUnique(moveParts, dematSound)
+    addUnique(fadeParts, dematSound)
+end
 
-addMovable(fadeParts, dematSound)
-addMovable(fadeParts, matSound)
+if matSound and hasCFrame(matSound) then
+    addUnique(moveParts, matSound)
+    addUnique(fadeParts, matSound)
+end
 
-print("TARDIS scanned children:", #ownedParts)
+if tardisLight and hasCFrame(tardisLight) then
+    addUnique(moveParts, tardisLight)
+end
+
+print("TARDIS candidates:", #candidates)
 print("TARDIS shell:", #shellParts)
 print("TARDIS movers:", #moveParts)
 print(dematSound and "FOUND demat sound" or "MISSING demat sound")
 print(matSound and "FOUND mat sound" or "MISSING mat sound")
 print(tardisLight and "FOUND Tardislight" or "MISSING Tardislight")
 
---------------------------------------------------
--- STARTUP LOCK
---------------------------------------------------
-
-for _, object in ipairs(shellParts) do
-    setProperty(object, "Anchored", true)
-    setProperty(object, "CanCollide", true)
+if #shellParts == 0 then
+    print("TARDIS FATAL: zero shell pieces detected")
+    return
 end
 
-print("TARDIS SAFE INIT 2: shell anchored/collidable")
+--------------------------------------------------
+-- STARTUP PHYSICS
+--
+-- DIRECT UB PROXY WRITES. DO NOT wrap these in pcall.
+--------------------------------------------------
+
+for index, part in ipairs(shellParts) do
+    part.Anchored = true
+    part.CanCollide = true
+
+    if index % MOVE_BATCH_SIZE == 0 then
+        task.wait()
+    end
+end
+
+print("TARDIS RECOVERY INIT 2: shell anchored + collidable")
+
+--------------------------------------------------
+-- PIVOT / OFFSETS
+--------------------------------------------------
+
+local startingPivot = shellParts[1].CFrame
+local defaultRotation = startingPivot - startingPivot.Position
+
+for _, part in ipairs(moveParts) do
+    local cf = readProperty(part, "CFrame")
+
+    if typeof(cf) == "CFrame" then
+        relativeCFrames[part] = startingPivot:ToObjectSpace(cf)
+    end
+end
+
+--------------------------------------------------
+-- BOTTOM OF SHELL
+--------------------------------------------------
+
+local tardisBottomOffset = 0
+local lowestBottom = math.huge
+
+for _, part in ipairs(shellParts) do
+    local cf = readProperty(part, "CFrame")
+    local size = readProperty(part, "Size")
+
+    if typeof(cf) == "CFrame" and typeof(size) == "Vector3" then
+        local verticalHalfExtent =
+            math.abs(cf.RightVector.Y) * (size.X / 2)
+            + math.abs(cf.UpVector.Y) * (size.Y / 2)
+            + math.abs(cf.LookVector.Y) * (size.Z / 2)
+
+        local bottom = cf.Position.Y - verticalHalfExtent
+
+        if bottom < lowestBottom then
+            lowestBottom = bottom
+        end
+    end
+end
+
+if lowestBottom < math.huge then
+    tardisBottomOffset = lowestBottom - startingPivot.Position.Y
+end
+
+print("TARDIS RECOVERY INIT 3: offsets ready")
+
+--------------------------------------------------
+-- DIRECT SERVER-REPLICATED MOVEMENT
+--
+-- This is the critical change: no pcall around part.CFrame assignment.
+--------------------------------------------------
+
+local function moveTardis(pivot)
+    if not pivot then
+        return
+    end
+
+    print("TARDIS MOVE BEGIN ->", pivot.Position)
+
+    for index, part in ipairs(moveParts) do
+        local offset = relativeCFrames[part]
+
+        if offset then
+            part.CFrame = pivot * offset
+        end
+
+        if index % MOVE_BATCH_SIZE == 0 then
+            task.wait()
+        end
+    end
+
+    print("TARDIS MOVE COMPLETE")
+end
+
+--------------------------------------------------
+-- DIRECT SERVER-REPLICATED TRANSPARENCY
+--------------------------------------------------
+
+local lastFadeWrite = -math.huge
+local lastReplicatedTransparency = nil
+
+local function setTardisTransparency(value, force)
+    value = math.clamp(value, 0, 1)
+
+    local now = os.clock()
+
+    if not force then
+        if now - lastFadeWrite < REPLICATED_FADE_INTERVAL then
+            return
+        end
+
+        if lastReplicatedTransparency ~= nil
+        and math.abs(value - lastReplicatedTransparency) < 0.015 then
+            return
+        end
+    end
+
+    lastFadeWrite = now
+    lastReplicatedTransparency = value
+
+    for _, part in ipairs(fadeParts) do
+        part.Transparency = value
+    end
+end
+
+--------------------------------------------------
+-- TOP LIGHT
+--
+-- For stability we only pulse the physical light block's Transparency here.
+-- No Brightness attribute writes until the core is proven stable again.
+--------------------------------------------------
+
+local lastLightWrite = -math.huge
+
+local function setTopLightTransparency(value, force)
+    if not tardisLight then
+        return
+    end
+
+    local now = os.clock()
+
+    if not force and now - lastLightWrite < REPLICATED_FADE_INTERVAL then
+        return
+    end
+
+    lastLightWrite = now
+    tardisLight.Transparency = math.clamp(value, 0, 1)
+end
 
 --------------------------------------------------
 -- SOUNDBLOCK CONTROL
 --
--- DO NOT write Repeat/ResetTimePosition/TimePosition from Code.
--- Fiu was rejecting those writes asynchronously.
---
--- Set BOTH SoundBlocks manually:
---   Repeat = false
---   ResetTimePosition = true
+-- No sound attributes are written from Code.
 --------------------------------------------------
 
-local function setSoundPowered(block, state)
+local function fireSound(block, state)
     if not block then
         return false
     end
 
+    local input = nil
+
     local ok = pcall(function()
-        block:FireInput("Input", state)
+        input = block.inputs["Input"]
     end)
 
-    return ok
+    if not ok or not input then
+        return false
+    end
+
+    -- This is the documented wiring API.
+    input:Fire(state, true)
+    return true
 end
 
 local function stopSound(block)
     if block then
-        setSoundPowered(block, false)
+        fireSound(block, false)
     end
 end
 
@@ -239,9 +423,9 @@ local function playSound(block)
         return false
     end
 
-    -- ResetTimePosition=true means this false edge rewinds it.
-    setSoundPowered(block, false)
-    return setSoundPowered(block, true)
+    -- With ResetTimePosition=true, the false edge rewinds before the true edge.
+    fireSound(block, false)
+    return fireSound(block, true)
 end
 
 local function getSoundTime(block)
@@ -254,152 +438,6 @@ end
 
 local function isSoundPlaying(block)
     return readAttribute(block, "IsPlaying") == true
-end
-
-print("TARDIS SAFE INIT 3: SoundBlocks untouched; FireInput ready")
-
---------------------------------------------------
--- PIVOT / OFFSETS
---------------------------------------------------
-
-local startingPivot = nil
-
-if #shellParts > 0 then
-    startingPivot = getProperty(shellParts[1], "CFrame")
-end
-
-if not startingPivot then
-    print("TARDIS FATAL: no shell pieces named Tardis")
-
-    while true do
-        task.wait(1)
-    end
-end
-
-for _, object in ipairs(moveParts) do
-    local cf = getProperty(object, "CFrame")
-
-    if typeof(cf) == "CFrame" then
-        relativeCFrames[object] = startingPivot:ToObjectSpace(cf)
-    end
-end
-
-local defaultRotation = startingPivot - startingPivot.Position
-
---------------------------------------------------
--- SHELL BOTTOM
---------------------------------------------------
-
-local tardisBottomOffset = 0
-local lowestBottom = math.huge
-
-for _, object in ipairs(shellParts) do
-    local cf = getProperty(object, "CFrame")
-    local size = getProperty(object, "Size")
-
-    if typeof(cf) == "CFrame" and typeof(size) == "Vector3" then
-        local halfHeight =
-            math.abs(cf.RightVector.Y) * (size.X / 2)
-            + math.abs(cf.UpVector.Y) * (size.Y / 2)
-            + math.abs(cf.LookVector.Y) * (size.Z / 2)
-
-        local bottom = cf.Position.Y - halfHeight
-
-        if bottom < lowestBottom then
-            lowestBottom = bottom
-        end
-    end
-end
-
-if lowestBottom < math.huge then
-    tardisBottomOffset = lowestBottom - startingPivot.Position.Y
-end
-
-print("TARDIS SAFE INIT 4: pivot/offsets ready")
-
---------------------------------------------------
--- SERVER-REPLICATED MOVEMENT
---------------------------------------------------
-
-local function moveTardis(pivot)
-    if not pivot then
-        return false
-    end
-
-    local failures = 0
-
-    for _, object in ipairs(moveParts) do
-        local offset = relativeCFrames[object]
-
-        if offset then
-            if not setProperty(object, "CFrame", pivot * offset) then
-                failures = failures + 1
-            end
-        end
-    end
-
-    print("TARDIS MOVE ->", pivot.Position, "failures:", failures)
-    return failures == 0
-end
-
---------------------------------------------------
--- REPLICATED TRANSPARENCY
---------------------------------------------------
-
-local fadeCount = math.max(#fadeParts, 1)
-local fadeHz = math.floor(FADE_WRITE_BUDGET / fadeCount)
-fadeHz = math.clamp(fadeHz, FADE_MIN_HZ, FADE_MAX_HZ)
-
-local fadeInterval = 1 / fadeHz
-local lastFadeAt = -math.huge
-local lastFadeValue = nil
-
-print("TARDIS replicated fade:", fadeHz, "Hz")
-
-local function setShellTransparency(value, force)
-    value = math.clamp(value, 0, 1)
-
-    local now = os.clock()
-
-    if not force then
-        if now - lastFadeAt < fadeInterval then
-            return
-        end
-
-        if lastFadeValue ~= nil
-        and math.abs(value - lastFadeValue) < 0.008 then
-            return
-        end
-    end
-
-    lastFadeAt = now
-    lastFadeValue = value
-
-    for _, object in ipairs(fadeParts) do
-        setProperty(object, "Transparency", value)
-    end
-end
-
---------------------------------------------------
--- TOP LAMP
---------------------------------------------------
-
-local lightInterval = 1 / LIGHT_HZ
-local lastLightAt = -math.huge
-
-local function setTopLightTransparency(value, force)
-    if not tardisLight then
-        return
-    end
-
-    local now = os.clock()
-
-    if not force and now - lastLightAt < lightInterval then
-        return
-    end
-
-    lastLightAt = now
-    setProperty(tardisLight, "Transparency", math.clamp(value, 0, 1))
 end
 
 --------------------------------------------------
@@ -417,47 +455,25 @@ local function getInputDestination()
         return value
     end
 
+    print("INPUT C invalid; using original position")
     return startingPivot
 end
 
 local function getLocalPlayerRoot()
-    local Players = nil
+    local Players = game:GetService("Players")
+    local player = Players.LocalPlayer
 
-    local ok = pcall(function()
-        Players = game:GetService("Players")
-    end)
-
-    if not ok or not Players then
+    if not player then
         return nil
     end
 
-    local player = nil
+    local character = player.Character
 
-    ok = pcall(function()
-        player = Players.LocalPlayer
-    end)
-
-    if not ok or not player then
+    if not character then
         return nil
     end
 
-    local character = nil
-
-    ok = pcall(function()
-        character = player.Character
-    end)
-
-    if not ok or not character then
-        return nil
-    end
-
-    local root = nil
-
-    pcall(function()
-        root = character.HumanoidRootPart
-    end)
-
-    return root
+    return character:FindFirstChild("HumanoidRootPart")
 end
 
 local function getPlayerGroundY(root)
@@ -468,11 +484,7 @@ local function getPlayerGroundY(root)
         return groundY
     end
 
-    local humanoid = nil
-
-    pcall(function()
-        humanoid = character.Humanoid
-    end)
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
 
     if humanoid then
         local hipHeight = humanoid.HipHeight
@@ -507,24 +519,22 @@ end
 local hiddenPivot = CFrame.new(HIDDEN_POSITION) * defaultRotation
 
 --------------------------------------------------
--- SOUND-TIME PULSE
+-- SOUND-TIME-LOCKED PULSE
+--
+-- UB exposes TimePosition but not a real waveform/loudness value in the
+-- documented SoundBlock interface. This makes a sharp pulse whose PHASE is
+-- locked to TimePosition, so it pauses/seeks/restarts with the sound.
 --------------------------------------------------
 
 local function soundPulse(t)
     t = t or 0
 
-    local a = math.abs(math.sin(t * 5.7))
-    local b = math.abs(math.sin(t * 11.9 + 0.7))
-    local c = math.abs(math.sin(t * 23.4 + 1.8))
-    local d = math.abs(math.sin(t * 37.1 + 0.2))
+    local a = math.abs(math.sin(t * 5.9))
+    local b = math.abs(math.sin(t * 12.7 + 0.6))
+    local c = math.abs(math.sin(t * 25.1 + 1.4))
 
-    local pulse =
-        a * 0.38
-        + b * 0.28
-        + c * 0.20
-        + d * 0.14
-
-    return math.clamp(pulse, 0, 1) ^ 0.32
+    local pulse = a * 0.46 + b * 0.34 + c * 0.20
+    return math.clamp(pulse, 0, 1) ^ 0.28
 end
 
 local function getVisualEndTime(sound)
@@ -537,40 +547,23 @@ local function getVisualEndTime(sound)
     return VISUAL_START_TIME + FALLBACK_FADE_TIME
 end
 
-local function getWaveTransparency(targetFade, progress, pulse)
-    progress = math.clamp(progress, 0, 1)
+local function getAudioDrivenTransparency(targetFade, baseFade, pulse)
+    baseFade = math.clamp(baseFade, 0, 1)
     pulse = math.clamp(pulse or 0, 0, 1)
-
-    local aggressive = progress ^ FADE_AGGRESSION
 
     if targetFade >= 1 then
         return math.clamp(
-            aggressive + pulse * WAVE_STRENGTH * (1 - aggressive),
+            baseFade + pulse * WAVE_STRENGTH * (1 - baseFade),
             0,
             1
         )
     end
 
-    local base = 1 - aggressive
-
     return math.clamp(
-        base - pulse * WAVE_STRENGTH * base,
+        baseFade - pulse * WAVE_STRENGTH * baseFade,
         0,
         1
     )
-end
-
-local function applyVisual(transition, progress, pulse, force)
-    local transparency = getWaveTransparency(
-        transition.targetFade,
-        progress,
-        pulse
-    )
-
-    setShellTransparency(transparency, force == true)
-
-    local lampPulse = math.clamp(pulse, 0, 1) ^ 0.16
-    setTopLightTransparency(1 - lampPulse, force == true)
 end
 
 --------------------------------------------------
@@ -591,19 +584,18 @@ local autoSequence = false
 --------------------------------------------------
 
 if inputState then
-    setShellTransparency(0, true)
+    setTardisTransparency(0, true)
     setTopLightTransparency(0, true)
 else
-    setShellTransparency(1, true)
+    setTardisTransparency(1, true)
     setTopLightTransparency(1, true)
     moveTardis(hiddenPivot)
 end
 
-print("TARDIS SAFE INIT 5: initial state applied")
-print("TARDIS SAFE INIT COMPLETE")
+print("TARDIS RECOVERY INIT COMPLETE")
 
 --------------------------------------------------
--- MATERIALIZATION PREP
+-- PREP MATERIALIZATION
 --------------------------------------------------
 
 local function prepareMaterialization(kind)
@@ -611,7 +603,7 @@ local function prepareMaterialization(kind)
         return true
     end
 
-    setShellTransparency(1, true)
+    setTardisTransparency(1, true)
     setTopLightTransparency(1, true)
 
     local destination = nil
@@ -626,6 +618,7 @@ local function prepareMaterialization(kind)
         return false
     end
 
+    -- Move while invisible.
     moveTardis(destination)
 
     hidden = false
@@ -656,44 +649,23 @@ local function startTransition(kind, targetFade, sound)
         stopSound(dematSound)
     end
 
-    local visualEnd = getVisualEndTime(sound)
-
-    local completed
-
-    if targetFade >= 1 then
-        completed = currentFade
-    else
-        completed = 1 - currentFade
-    end
-
-    completed = math.clamp(completed, 0, 1)
-
-    local soundStarted = playSound(sound)
     local now = os.clock()
+    local soundStarted = playSound(sound)
 
     activeTransition = {
         kind = kind,
         targetFade = targetFade,
+        startFade = currentFade,
         sound = sound,
-        visualEnd = visualEnd,
         requestTime = now,
+        visualEnd = getVisualEndTime(sound),
         maxSoundTime = 0,
         soundAdvanced = false,
-        visualComplete = false,
-        visualCompleteAt = nil,
-
         fallback = not soundStarted,
         fallbackStart = now,
-        fallbackStartProgress = completed,
-        fallbackDuration = math.max(
-            0.05,
-            FALLBACK_FADE_TIME * (1 - completed)
-        ),
+        visualComplete = false,
+        visualCompleteAt = nil,
     }
-
-    if not soundStarted then
-        print("TARDIS: SoundBlock FireInput failed; fallback clock")
-    end
 
     return true
 end
@@ -706,10 +678,6 @@ local function requestMaterialize(kind)
     return startTransition(kind, 0, matSound)
 end
 
---------------------------------------------------
--- FINISH TRANSITION
---------------------------------------------------
-
 local function finishTransition(transition)
     if activeTransition ~= transition then
         return
@@ -720,7 +688,7 @@ local function finishTransition(transition)
 
     if transition.targetFade >= 1 then
         currentFade = 1
-        setShellTransparency(1, true)
+        setTardisTransparency(1, true)
         setTopLightTransparency(1, true)
 
         moveTardis(hiddenPivot)
@@ -731,7 +699,7 @@ local function finishTransition(transition)
         end
     else
         currentFade = 0
-        setShellTransparency(0, true)
+        setTardisTransparency(0, true)
         setTopLightTransparency(0, true)
         hidden = false
 
@@ -743,10 +711,6 @@ local function finishTransition(transition)
     end
 end
 
---------------------------------------------------
--- UPDATE TRANSITION
---------------------------------------------------
-
 local function updateTransition()
     local transition = activeTransition
 
@@ -755,8 +719,12 @@ local function updateTransition()
     end
 
     local now = os.clock()
-    local progress = nil
+    local rawProgress = nil
     local pulseTime = 0
+
+    --------------------------------------------------
+    -- AUDIO CLOCK
+    --------------------------------------------------
 
     if not transition.fallback and transition.sound then
         local soundTime = getSoundTime(transition.sound)
@@ -778,7 +746,7 @@ local function updateTransition()
                 transition.visualEnd = length - SOUND_TAIL_TIME
             end
 
-            progress = math.clamp(
+            rawProgress = math.clamp(
                 (soundTime - VISUAL_START_TIME)
                 / math.max(0.05, transition.visualEnd - VISUAL_START_TIME),
                 0,
@@ -790,49 +758,65 @@ local function updateTransition()
         and not transition.soundAdvanced then
             transition.fallback = true
             transition.fallbackStart = now
-            transition.fallbackStartProgress = 0
-            transition.fallbackDuration = FALLBACK_FADE_TIME
-            print("TARDIS: sound clock stalled; fallback")
+            print("TARDIS: audio clock unavailable; fallback timing")
         end
     end
+
+    --------------------------------------------------
+    -- FALLBACK CLOCK
+    --------------------------------------------------
 
     if transition.fallback then
         local elapsed = now - transition.fallbackStart
         pulseTime = elapsed
 
-        local localProgress = math.clamp(
-            elapsed / transition.fallbackDuration,
+        rawProgress = math.clamp(
+            elapsed / FALLBACK_FADE_TIME,
             0,
             1
         )
-
-        progress =
-            transition.fallbackStartProgress
-            + (1 - transition.fallbackStartProgress) * localProgress
     end
 
-    if progress == nil then
+    if rawProgress == nil then
         return
     end
+
+    --------------------------------------------------
+    -- AGGRESSIVE BASE FADE + SOUND-LOCKED PULSE
+    --------------------------------------------------
+
+    local easedProgress = rawProgress ^ FADE_AGGRESSION
+
+    local baseFade =
+        transition.startFade
+        + (transition.targetFade - transition.startFade) * easedProgress
+
+    currentFade = baseFade
 
     local pulse = soundPulse(pulseTime)
+    local visualTransparency = getAudioDrivenTransparency(
+        transition.targetFade,
+        baseFade,
+        pulse
+    )
 
-    if progress < 1 then
-        if transition.targetFade >= 1 then
-            currentFade = progress ^ FADE_AGGRESSION
-        else
-            currentFade = 1 - (progress ^ FADE_AGGRESSION)
-        end
+    if rawProgress < 1 then
+        setTardisTransparency(visualTransparency, false)
 
-        applyVisual(transition, progress, pulse, false)
+        local lampPulse = pulse ^ 0.16
+        setTopLightTransparency(1 - lampPulse, false)
         return
     end
+
+    --------------------------------------------------
+    -- VISUAL COMPLETE / AUDIO TAIL
+    --------------------------------------------------
 
     if not transition.visualComplete then
         transition.visualComplete = true
         transition.visualCompleteAt = now
         currentFade = transition.targetFade
-        setShellTransparency(transition.targetFade, true)
+        setTardisTransparency(transition.targetFade, true)
     end
 
     local lampPulse = soundPulse(pulseTime) ^ 0.16
@@ -849,6 +833,13 @@ local function updateTransition()
 
         if transition.soundAdvanced
         and not isSoundPlaying(transition.sound) then
+            finished = true
+        end
+
+        -- Some SoundBlocks do not report an end cleanly. Do not hang forever.
+        if not finished
+        and transition.visualCompleteAt
+        and now - transition.visualCompleteAt >= SOUND_TAIL_TIME + 1 then
             finished = true
         end
 
@@ -873,9 +864,9 @@ local function startAutoRecall()
     print("J RECALL START")
     autoSequence = true
 
-    if hidden or currentFade >= 1 then
+    if hidden or currentFade >= 0.999 then
         currentFade = 1
-        setShellTransparency(1, true)
+        setTardisTransparency(1, true)
         setTopLightTransparency(1, true)
         hidden = true
         requestMaterialize("auto_materialize")
@@ -899,20 +890,18 @@ while true do
 
     lastJState = jState
 
+    -- During a J recall, A is deliberately ignored until the automatic cycle ends.
     if not autoSequence then
         local newAState = inputA:GetState() == true
 
         if newAState ~= lastInputState then
             lastInputState = newAState
 
-            print(
-                "INPUT A:",
-                newAState and "MATERIALIZE" or "DEMATERIALIZE"
-            )
-
             if newAState then
+                print("INPUT A: MATERIALIZE")
                 requestMaterialize("manual_materialize")
             else
+                print("INPUT A: DEMATERIALIZE")
                 requestDemat("manual_demat")
             end
         end
