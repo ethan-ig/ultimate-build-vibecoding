@@ -16,9 +16,17 @@
 --   TardisMatSound     = materialization SoundBlock
 --   Tardislight        = top lamp/light block
 --
--- No outputs or sound wires are required.
--- INPUT A is authoritative: changing A always cancels J/auto recall.
--- Sound TimePosition is the master transition clock when available.
+-- IMPORTANT REPLICATION DESIGN
+--
+-- Ultimate Build Code runs locally, but writes through the UB metatable/proxy
+-- are forwarded to the server. Raw .Part writes are LOCAL ONLY.
+--
+-- This controller therefore uses TWO visual paths:
+--   1. Raw .Part writes at 60 Hz for smooth local animation.
+--   2. Rate-limited UB proxy writes so the server + other clients see it.
+--
+-- This avoids flooding UB's property replication remote with
+-- (part count * 60) transparency writes every second.
 
 local inputA = script.inputs["a"]
 local inputC = script.inputs["c"]
@@ -42,6 +50,8 @@ local SOUND_TAIL_TIME = 2.50
 local FALLBACK_FADE_TIME = 14
 local FALLBACK_TAIL_TIME = 2.50
 local SOUND_START_TIMEOUT = 3
+
+-- Local animation refresh.
 local UPDATE_INTERVAL = 1 / 60
 
 -- Aggressive audio following.
@@ -59,6 +69,23 @@ local LIGHT_IDLE_BRIGHTNESS_DEFAULT = 2
 
 local SOUND_VOLUME = 1
 local SOUND_PITCH = 1
+
+--------------------------------------------------
+-- NETWORK / SERVER REPLICATION
+--------------------------------------------------
+
+-- Leave lots of room below UB's property-remote limit for sound/light/input
+-- traffic. This is a PROPERTY-WRITE budget, not frames per second.
+local NETWORK_FADE_WRITE_BUDGET = 900
+local NETWORK_FADE_MAX_HZ = 15
+local NETWORK_FADE_MIN_HZ = 2
+
+-- Movement is more important than fade fidelity. Send CFrames in controlled
+-- batches, then do one guarded retry so a dropped packet cannot leave another
+-- client looking at the old TARDIS location.
+local NETWORK_MOVE_BATCH_SIZE = 25
+local NETWORK_MOVE_BATCH_WAIT = 0.05
+local NETWORK_MOVE_RETRY_DELAY = 0.45
 
 --------------------------------------------------
 -- POSITIONING
@@ -107,6 +134,8 @@ local function setBlockValue(block, key, value)
         return false
     end
 
+    -- IMPORTANT: block[key], NOT block.Part[key].
+    -- The UB proxy write is the path that replicates to the server.
     local ok = pcall(function()
         block[key] = value
     end)
@@ -136,6 +165,39 @@ local function getDisplayName(part)
 end
 
 --------------------------------------------------
+-- RAW LOCAL INSTANCE HELPERS
+--------------------------------------------------
+
+local function getRawPart(block)
+    if not block then
+        return nil
+    end
+
+    local ok, raw = pcall(function()
+        return block.Part
+    end)
+
+    if ok then
+        return raw
+    end
+
+    return nil
+end
+
+local function setLocalProperty(block, property, value)
+    local raw = getRawPart(block)
+    if not raw then
+        return false
+    end
+
+    local ok = pcall(function()
+        raw[property] = value
+    end)
+
+    return ok
+end
+
+--------------------------------------------------
 -- FIND NAMED BLOCK
 --------------------------------------------------
 
@@ -156,29 +218,13 @@ local dematSound = findNamedBlock(DEMAT_SOUND_NAME)
 local matSound = findNamedBlock(MAT_SOUND_NAME)
 local tardisLight = findNamedBlock(LIGHT_NAME)
 
-print(dematSound and "FOUND TardisDematSound" or "WARNING: TardisDematSound missing - fallback visual enabled")
-print(matSound and "FOUND TardisMatSound" or "WARNING: TardisMatSound missing - fallback visual enabled")
+print(dematSound and "FOUND TardisDematSound" or "WARNING: TardisDematSound missing - fallback enabled")
+print(matSound and "FOUND TardisMatSound" or "WARNING: TardisMatSound missing - fallback enabled")
 print(tardisLight and "FOUND Tardislight" or "WARNING: Tardislight missing")
 
 --------------------------------------------------
--- RAW INSTANCE HELPERS
+-- RAW SOUND / LIGHT INSTANCES
 --------------------------------------------------
-
-local function getRawPart(block)
-    if not block then
-        return nil
-    end
-
-    local ok, raw = pcall(function()
-        return block.Part
-    end)
-
-    if ok then
-        return raw
-    end
-
-    return nil
-end
 
 local function findRawSound(block)
     local rawPart = getRawPart(block)
@@ -207,6 +253,7 @@ local function findRawLight(block)
         local ok, light = pcall(function()
             return rawPart:FindFirstChildWhichIsA(className, true)
         end)
+
         if ok and light then
             return light
         end
@@ -232,6 +279,7 @@ local function getSoundInput(block)
         local ok, value = pcall(function()
             return block.inputs[name]
         end)
+
         if ok and value then
             return value
         end
@@ -247,6 +295,7 @@ local function getSoundInput(block)
                 return value
             end
         end)
+
         if success and result then
             return result
         end
@@ -323,9 +372,7 @@ local function playSound(block, position)
     setSoundPowered(block, false)
     task.wait()
     setBlockValue(block, "TimePosition", position or 0)
-
-    local ok = setSoundPowered(block, true)
-    return ok
+    return setSoundPowered(block, true)
 end
 
 --------------------------------------------------
@@ -379,35 +426,59 @@ for _, part in ipairs(workspace:GetDescendants(true)) do
     end
 end
 
--- Sound blocks move and fade with the shell.
+-- SoundBlocks physically move + fade with shell.
 addPart(moveParts, dematSound)
 addPart(moveParts, matSound)
 addPart(fadeParts, dematSound)
 addPart(fadeParts, matSound)
 
--- Roof light moves with the shell; its transparency is controlled separately.
+-- Roof light moves with shell, but has its own audio-reactive transparency.
 addPart(moveParts, tardisLight)
 
 print("TARDIS shell blocks:", #shellParts)
 print("TARDIS moving blocks:", #moveParts)
+print("TARDIS fading blocks:", #fadeParts)
 
 --------------------------------------------------
--- FORCE ANCHORED + COLLIDABLE ON START
+-- NETWORK FADE RATE
 --------------------------------------------------
 
-local function lockTardisAssembly()
+local fadePartCount = math.max(#fadeParts, 1)
+local networkFadeHz = math.floor(NETWORK_FADE_WRITE_BUDGET / fadePartCount)
+networkFadeHz = math.clamp(networkFadeHz, NETWORK_FADE_MIN_HZ, NETWORK_FADE_MAX_HZ)
+local networkFadeInterval = 1 / networkFadeHz
+local lastNetworkFadeAt = 0
+local lastNetworkFadeValue = nil
+
+print("TARDIS local fade: 60 Hz")
+print("TARDIS server fade:", networkFadeHz, "Hz")
+
+--------------------------------------------------
+-- FORCE ANCHORED + COLLIDABLE
+--------------------------------------------------
+
+local function lockTardisAssemblyLocal()
     for _, part in ipairs(moveParts) do
-        pcall(function()
-            part.Anchored = true
-        end)
-        pcall(function()
-            part.CanCollide = true
-        end)
+        setLocalProperty(part, "Anchored", true)
+        setLocalProperty(part, "CanCollide", true)
     end
 end
 
-lockTardisAssembly()
-print("TARDIS LOCKED: Anchored=true, CanCollide=true")
+local function lockTardisAssemblyServer()
+    for index, part in ipairs(moveParts) do
+        -- Proxy writes replicate to server.
+        setBlockValue(part, "Anchored", true)
+        setBlockValue(part, "CanCollide", true)
+
+        if index % NETWORK_MOVE_BATCH_SIZE == 0 then
+            task.wait(NETWORK_MOVE_BATCH_WAIT)
+        end
+    end
+end
+
+lockTardisAssemblyLocal()
+task.spawn(lockTardisAssemblyServer)
+print("TARDIS startup lock requested: Anchored=true, CanCollide=true")
 
 --------------------------------------------------
 -- PIVOT / OFFSETS
@@ -461,34 +532,108 @@ if startingPivot then
 end
 
 --------------------------------------------------
--- MOVE WHOLE ASSEMBLY
+-- REPLICATED MOVEMENT
 --------------------------------------------------
 
-local function moveTardis(pivot)
-    lockTardisAssembly()
+local moveGeneration = 0
 
+local function moveTardisLocal(pivot)
+    -- Raw writes make the initiating client move instantly.
     for _, part in ipairs(moveParts) do
         local offset = relativeCFrames[part]
+
         if offset then
-            pcall(function()
-                part.CFrame = pivot * offset
-            end)
+            setLocalProperty(part, "CFrame", pivot * offset)
         end
     end
 end
 
+local function replicatePivotPass(pivot, generation)
+    for index, part in ipairs(moveParts) do
+        if generation ~= moveGeneration then
+            return
+        end
+
+        local offset = relativeCFrames[part]
+
+        if offset then
+            -- THIS is the important server-replicated path.
+            setBlockValue(part, "CFrame", pivot * offset)
+        end
+
+        if index % NETWORK_MOVE_BATCH_SIZE == 0 then
+            task.wait(NETWORK_MOVE_BATCH_WAIT)
+        end
+    end
+end
+
+local function moveTardis(pivot)
+    moveGeneration = moveGeneration + 1
+    local generation = moveGeneration
+
+    lockTardisAssemblyLocal()
+    moveTardisLocal(pivot)
+
+    -- First server pass immediately, but asynchronously so visuals don't wait.
+    task.spawn(function()
+        replicatePivotPass(pivot, generation)
+    end)
+
+    -- Guarded second pass catches an occasional dropped/throttled property write.
+    task.spawn(function()
+        task.wait(NETWORK_MOVE_RETRY_DELAY)
+
+        if generation == moveGeneration then
+            replicatePivotPass(pivot, generation)
+        end
+    end)
+end
+
 --------------------------------------------------
--- TRANSPARENCY
+-- REPLICATED TRANSPARENCY
 --------------------------------------------------
 
-local function setShellTransparency(value)
+local function setLocalFadeTransparency(value)
     value = math.clamp(value, 0, 1)
 
     for _, part in ipairs(fadeParts) do
-        pcall(function()
-            part.Transparency = value
-        end)
+        setLocalProperty(part, "Transparency", value)
     end
+end
+
+local function replicateFadeTransparency(value, force)
+    value = math.clamp(value, 0, 1)
+
+    local now = os.clock()
+
+    if not force then
+        if now - lastNetworkFadeAt < networkFadeInterval then
+            return
+        end
+
+        if lastNetworkFadeValue ~= nil
+        and math.abs(value - lastNetworkFadeValue) < 0.015 then
+            return
+        end
+    end
+
+    lastNetworkFadeAt = now
+    lastNetworkFadeValue = value
+
+    for _, part in ipairs(fadeParts) do
+        -- Proxy write = server + other clients.
+        setBlockValue(part, "Transparency", value)
+    end
+end
+
+local function setShellTransparency(value, forceNetwork)
+    value = math.clamp(value, 0, 1)
+
+    -- Smooth on this client.
+    setLocalFadeTransparency(value)
+
+    -- Rate-limited replication for everyone else.
+    replicateFadeTransparency(value, forceNetwork == true)
 end
 
 --------------------------------------------------
@@ -502,15 +647,16 @@ local lightIdleBrightness =
 local lightIdleTransparency = 0
 
 if tardisLight then
-    local ok, value = pcall(function()
-        return tardisLight.Transparency
-    end)
-    if ok and type(value) == "number" then
-        lightIdleTransparency = value
+    local t = tonumber(getBlockValue(tardisLight, "Transparency"))
+    if t then
+        lightIdleTransparency = math.clamp(t, 0, 1)
     end
 end
 
-local function setTopLight(brightness, transparency)
+local lastLightNetworkAt = 0
+local LIGHT_NETWORK_INTERVAL = 1 / 20
+
+local function setTopLight(brightness, transparency, forceNetwork)
     if not tardisLight then
         return
     end
@@ -518,11 +664,8 @@ local function setTopLight(brightness, transparency)
     brightness = math.max(0, brightness or 0)
     transparency = math.clamp(transparency or 0, 0, 1)
 
-    setBlockValue(tardisLight, "Brightness", brightness)
-
-    pcall(function()
-        tardisLight.Transparency = transparency
-    end)
+    -- Local glass + actual Light instance.
+    setLocalProperty(tardisLight, "Transparency", transparency)
 
     if rawTopLight then
         pcall(function()
@@ -530,13 +673,22 @@ local function setTopLight(brightness, transparency)
             rawTopLight.Enabled = brightness > 0.01
         end)
     end
+
+    -- Replicate the lamp at a modest rate. One part is cheap, but don't waste
+    -- remote capacity while hundreds of shell pieces are also fading.
+    local now = os.clock()
+    if forceNetwork or now - lastLightNetworkAt >= LIGHT_NETWORK_INTERVAL then
+        lastLightNetworkAt = now
+        setBlockValue(tardisLight, "Transparency", transparency)
+        setBlockValue(tardisLight, "Brightness", brightness)
+    end
 end
 
 local function setIdleLight(isHidden)
     if isHidden then
-        setTopLight(0, 1)
+        setTopLight(0, 1, true)
     else
-        setTopLight(lightIdleBrightness, lightIdleTransparency)
+        setTopLight(lightIdleBrightness, lightIdleTransparency, true)
     end
 end
 
@@ -654,6 +806,7 @@ local function getRawSound(block)
     elseif block == matSound then
         return rawMatSound
     end
+
     return nil
 end
 
@@ -664,6 +817,7 @@ local function readPlaybackLoudness(block)
         local ok, value = pcall(function()
             return raw.PlaybackLoudness
         end)
+
         if ok and type(value) == "number" then
             return value, true
         end
@@ -720,8 +874,8 @@ local function getAudioPulse(transition, soundTime)
     )
 
     local shaped = normalized ^ LOUDNESS_GAMMA
-
     local alpha = shaped > transition.envelope and ATTACK or RELEASE
+
     transition.envelope =
         transition.envelope
         + (shaped - transition.envelope) * alpha
@@ -753,12 +907,10 @@ local function applyAudioVisual(transition, progress, soundTime)
     local transparency
 
     if transition.targetFade >= 1 then
-        -- Dematerializing: peaks kick HARD toward invisible.
         transparency =
             aggressive
             + pulse * SHELL_WAVE_STRENGTH * (1 - aggressive)
     else
-        -- Materializing: peaks kick HARD toward visible.
         local base = 1 - aggressive
         transparency =
             base
@@ -766,7 +918,7 @@ local function applyAudioVisual(transition, progress, soundTime)
     end
 
     transparency = math.clamp(transparency, 0, 1)
-    setShellTransparency(transparency)
+    setShellTransparency(transparency, false)
 
     local lampPulse = pulse ^ 0.12
 
@@ -785,7 +937,7 @@ local function applyAudioVisual(transition, progress, soundTime)
         lampTransparency = 0
     end
 
-    setTopLight(brightness, lampTransparency)
+    setTopLight(brightness, lampTransparency, false)
 end
 
 --------------------------------------------------
@@ -806,10 +958,10 @@ local autoSequence = false
 --------------------------------------------------
 
 if inputState then
-    setShellTransparency(0)
+    setShellTransparency(0, true)
     setIdleLight(false)
 else
-    setShellTransparency(1)
+    setShellTransparency(1, true)
     setIdleLight(true)
     moveTardis(hiddenPivot)
 end
@@ -823,8 +975,8 @@ local function prepareMaterialization(kind)
         return true
     end
 
-    setShellTransparency(1)
-    setTopLight(0, 1)
+    setShellTransparency(1, true)
+    setTopLight(0, 1, true)
 
     local destination
 
@@ -877,13 +1029,21 @@ local function startTransition(kind, targetFade, sound)
     else
         completedProgress = 1 - currentFade
     end
+
     completedProgress = math.clamp(completedProgress, 0, 1)
+
+    -- currentFade follows the aggressive curve, so invert that curve when
+    -- mapping a reversal back onto the sound playhead.
+    local linearCompleted = 0
+    if completedProgress > 0 then
+        linearCompleted = completedProgress ^ (1 / FADE_AGGRESSION)
+    end
 
     local seekPosition = 0
     if completedProgress > 0.01 then
         seekPosition =
             VISUAL_START_TIME
-            + completedProgress * (visualEnd - VISUAL_START_TIME)
+            + linearCompleted * (visualEnd - VISUAL_START_TIME)
     end
 
     local soundStarted = false
@@ -892,6 +1052,7 @@ local function startTransition(kind, targetFade, sound)
     end
 
     local now = os.clock()
+    local remainingProgress = 1 - linearCompleted
 
     activeTransition = {
         kind = kind,
@@ -902,9 +1063,10 @@ local function startTransition(kind, targetFade, sound)
         maxSoundTime = seekPosition,
         visualComplete = false,
 
-        -- IMPORTANT: missing/broken sound can NEVER make Input A a no-op.
         fallback = not soundStarted,
         fallbackStart = now,
+        fallbackStartLinearProgress = linearCompleted,
+        fallbackDuration = math.max(0.05, FALLBACK_FADE_TIME * remainingProgress),
         fallbackTailStart = nil,
 
         peak = LOUDNESS_PEAK_FLOOR,
@@ -913,7 +1075,7 @@ local function startTransition(kind, targetFade, sound)
     }
 
     if not soundStarted then
-        print("TARDIS: sound unavailable; transition started immediately on fallback clock")
+        print("TARDIS: sound unavailable; using fallback clock")
     end
 
     return true
@@ -941,9 +1103,10 @@ local function finishTransition(transition)
 
     if transition.targetFade >= 1 then
         currentFade = 1
-        setShellTransparency(1)
+        setShellTransparency(1, true)
         setIdleLight(true)
 
+        -- Move only after the departure sound tail ends.
         moveTardis(hiddenPivot)
         hidden = true
 
@@ -952,7 +1115,7 @@ local function finishTransition(transition)
         end
     else
         currentFade = 0
-        setShellTransparency(0)
+        setShellTransparency(0, true)
         setIdleLight(false)
         hidden = false
 
@@ -1015,8 +1178,8 @@ local function updateTransition()
                 if progress >= 1 then
                     transition.visualComplete = true
                     currentFade = transition.targetFade
-                    setShellTransparency(transition.targetFade)
-                    setTopLight(0, 1)
+                    setShellTransparency(transition.targetFade, true)
+                    setTopLight(0, 1, true)
                 end
             end
 
@@ -1040,11 +1203,13 @@ local function updateTransition()
             end
         end
 
-        -- If the sound never actually advances, switch over quickly.
+        -- If TimePosition never advances, switch to fallback without hanging.
         if now - transition.requestTime >= SOUND_START_TIMEOUT
         and transition.maxSoundTime <= 0.01 then
             transition.fallback = true
             transition.fallbackStart = now
+            transition.fallbackStartLinearProgress = 0
+            transition.fallbackDuration = FALLBACK_FADE_TIME
             transition.peak = LOUDNESS_PEAK_FLOOR
             transition.envelope = 0
             transition.previousEnvelope = 0
@@ -1058,14 +1223,17 @@ local function updateTransition()
 
     if transition.fallback then
         local elapsed = now - transition.fallbackStart
+        local localProgress = math.clamp(
+            elapsed / transition.fallbackDuration,
+            0,
+            1
+        )
 
-        if elapsed <= FALLBACK_FADE_TIME then
-            local progress = math.clamp(
-                elapsed / FALLBACK_FADE_TIME,
-                0,
-                1
-            )
+        local progress =
+            transition.fallbackStartLinearProgress
+            + (1 - transition.fallbackStartLinearProgress) * localProgress
 
+        if localProgress < 1 then
             applyAudioVisual(transition, progress, elapsed)
 
             if transition.targetFade >= 1 then
@@ -1077,8 +1245,8 @@ local function updateTransition()
         elseif not transition.visualComplete then
             transition.visualComplete = true
             currentFade = transition.targetFade
-            setShellTransparency(transition.targetFade)
-            setTopLight(0, 1)
+            setShellTransparency(transition.targetFade, true)
+            setTopLight(0, 1, true)
             transition.fallbackTailStart = now
 
         elseif transition.fallbackTailStart
@@ -1098,8 +1266,8 @@ local function startAutoRecall()
 
     if hidden or currentFade >= 1 then
         currentFade = 1
-        setShellTransparency(1)
-        setTopLight(0, 1)
+        setShellTransparency(1, true)
+        setTopLight(0, 1, true)
         hidden = true
         requestMaterialize("auto_materialize")
     else
@@ -1110,47 +1278,15 @@ end
 --------------------------------------------------
 -- MAIN LOOP
 --
--- INPUT A IS CHECKED FIRST AND IS ALWAYS AUTHORITATIVE.
--- A change cancels any J recall and immediately takes control.
+-- J is a rising-edge one-shot. While J recall is running, A is deliberately
+-- ignored so the normal state input cannot immediately cancel the sequence.
+-- Outside J recall, A works normally.
 --------------------------------------------------
 
 while true do
-    --------------------------------------------------
-    -- MANUAL INPUT A FIRST
-    --------------------------------------------------
-
-    local newAState = inputA:GetState() == true
-    local aChanged = newAState ~= lastInputState
-
-    if aChanged then
-        lastInputState = newAState
-
-        if autoSequence then
-            print("INPUT A: cancelling J recall / auto sequence")
-        end
-
-        autoSequence = false
-
-        print(
-            "INPUT A:",
-            newAState and "MATERIALIZE" or "DEMATERIALIZE"
-        )
-
-        if newAState then
-            requestMaterialize("manual_materialize")
-        else
-            requestDemat("manual_demat")
-        end
-    end
-
-    --------------------------------------------------
-    -- J ONLY FIRES IF A DID NOT CHANGE THIS FRAME
-    --------------------------------------------------
-
     local jState = inputJ:GetState() == true
 
-    if not aChanged
-    and jState
+    if jState
     and not lastJState
     and not autoSequence then
         startAutoRecall()
@@ -1158,9 +1294,24 @@ while true do
 
     lastJState = jState
 
-    --------------------------------------------------
-    -- UPDATE EFFECT
-    --------------------------------------------------
+    if not autoSequence then
+        local newAState = inputA:GetState() == true
+
+        if newAState ~= lastInputState then
+            lastInputState = newAState
+
+            print(
+                "INPUT A:",
+                newAState and "MATERIALIZE" or "DEMATERIALIZE"
+            )
+
+            if newAState then
+                requestMaterialize("manual_materialize")
+            else
+                requestDemat("manual_demat")
+            end
+        end
+    end
 
     updateTransition()
     task.wait(UPDATE_INTERVAL)
