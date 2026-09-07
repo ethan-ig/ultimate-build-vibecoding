@@ -1,4 +1,4 @@
--- TARDIS controller - Fiu-safe nested discovery version
+-- TARDIS controller - Fiu-safe direct discovery version
 --
 -- INPUT A: true = materialized, false = dematerialized
 -- INPUT C: Vector3/CFrame normal destination
@@ -16,6 +16,9 @@
 -- attributes because those writes were causing Fiu's asynchronous Promise
 -- rejection. TimePosition/TimeLength/IsPlaying are read-only here and drive
 -- the visual effect.
+--
+-- Discovery intentionally matches the old working skyshow command system:
+-- Workspace:GetChildren() with NO true parameter and NO GetDescendants().
 
 local inputA = inputs["a"]
 local inputC = inputs["c"]
@@ -112,11 +115,11 @@ end
 -- DISCOVERY
 --------------------------------------------------
 
-print("TARDIS SAFE INIT 1: scanning owned descendants")
+print("TARDIS SAFE INIT 1: skyshow-style GetChildren scan")
 
--- The previous GetChildren(true) only found the 357 shell pieces.
--- Specialty blocks can be nested, so use the documented descendant scan.
-local ownedParts = workspace:GetDescendants(true)
+-- IMPORTANT: this intentionally matches the old working command system.
+-- No true flag and no recursive descendant call.
+local ownedParts = workspace:GetChildren()
 
 local shellParts = {}
 local moveParts = {}
@@ -169,6 +172,9 @@ for _, object in ipairs(ownedParts) do
 
             elseif lower == string.lower(LIGHT_NAME) then
                 tardisLight = object
+
+            elseif string.find(lower, "tardis", 1, true) then
+                print("TARDIS other named block:", displayName)
             end
         end
     end
@@ -181,6 +187,7 @@ addMovable(moveParts, tardisLight)
 addMovable(fadeParts, dematSound)
 addMovable(fadeParts, matSound)
 
+print("TARDIS scanned children:", #ownedParts)
 print("TARDIS shell:", #shellParts)
 print("TARDIS movers:", #moveParts)
 print(dematSound and "FOUND demat sound" or "MISSING demat sound")
@@ -375,9 +382,6 @@ end
 
 --------------------------------------------------
 -- TOP LAMP
---
--- We animate the block's replicated Transparency only. No specialty attribute
--- writes, so this stays on the safe property path.
 --------------------------------------------------
 
 local lightInterval = 1 / LIGHT_HZ
@@ -504,9 +508,6 @@ local hiddenPivot = CFrame.new(HIDDEN_POSITION) * defaultRotation
 
 --------------------------------------------------
 -- SOUND-TIME PULSE
---
--- TimePosition is the actual playback head. This pulse is phase-locked to it,
--- so it pauses/seeks/restarts with the sound instead of using a separate clock.
 --------------------------------------------------
 
 local function soundPulse(t)
@@ -834,7 +835,6 @@ local function updateTransition()
         setShellTransparency(transition.targetFade, true)
     end
 
-    -- Keep the lamp throbbing during the sound tail.
     local lampPulse = soundPulse(pulseTime) ^ 0.16
     setTopLightTransparency(1 - lampPulse, false)
 
