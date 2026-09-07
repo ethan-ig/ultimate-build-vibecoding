@@ -1,55 +1,145 @@
 -- SIMPLE TARDIS CONTROLLER
 --
--- A = false -> dematerialize
--- A = true  -> materialize at Input C
--- C = destination Vector3 or CFrame
--- J = dematerialize, then materialize on local player
+-- A false = dematerialize
+-- A true  = materialize at Input C
+-- C       = Vector3 or CFrame destination
+-- J       = one-shot recall to your character
 --
--- Every shell piece: Display name = Tardis
+-- Every shell piece needs Display name = Tardis
 --
--- ALL MOVEMENT IS DONE WITH CFrame.
+-- No sounds. No lights. No outputs.
 
 local inputA = inputs["a"]
 local inputC = inputs["c"]
 local inputJ = inputs["j"]
 
 local TARGET_NAME = "Tardis"
-local HIDDEN_CFRAME = CFrame.new(-2000, 1, 2772)
+local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
 local RECALL_GROUND_CLEARANCE = 0.10
 local FADE_TIME = 14
 local FADE_STEP = 0.18
 local MOVE_BATCH_SIZE = 40
 
 --------------------------------------------------
--- FIND SHELL
+-- DISPLAY NAME
+--------------------------------------------------
+
+local function getDisplayName(part)
+    local value = nil
+
+    local ok = pcall(function()
+        value = part.attributes["Display name"]
+    end)
+
+    if ok and type(value) == "string" and value ~= "" then
+        return value
+    end
+
+    ok = pcall(function()
+        value = part:GetAttribute("Display name")
+    end)
+
+    if ok and type(value) == "string" and value ~= "" then
+        return value
+    end
+
+    ok = pcall(function()
+        value = part.DisplayName
+    end)
+
+    if ok and type(value) == "string" and value ~= "" then
+        return value
+    end
+
+    return nil
+end
+
+local function isTardis(part)
+    local displayName = getDisplayName(part)
+
+    if type(displayName) ~= "string" then
+        return false
+    end
+
+    displayName = string.lower(displayName)
+    displayName = string.gsub(displayName, "^%s+", "")
+    displayName = string.gsub(displayName, "%s+$", "")
+
+    return displayName == string.lower(TARGET_NAME)
+end
+
+--------------------------------------------------
+-- FIND TARDIS PARTS
+--
+-- Try the cheap/known scan first. If this UB build returns
+-- nothing useful, fall back to the documented descendant scan.
 --------------------------------------------------
 
 local tardisParts = {}
+local seen = {}
 
-for _, part in ipairs(workspace:GetChildren(true)) do
-    if part ~= script then
-        local displayName = nil
+local function scan(list)
+    if not list then
+        return
+    end
 
-        pcall(function()
-            displayName = part.attributes["Display name"]
-        end)
+    for _, part in ipairs(list) do
+        if part ~= script and not seen[part] and isTardis(part) then
+            local hasCFrame = false
 
-        if type(displayName) == "string"
-        and string.lower(displayName) == string.lower(TARGET_NAME) then
-            table.insert(tardisParts, part)
+            pcall(function()
+                hasCFrame = typeof(part.CFrame) == "CFrame"
+            end)
+
+            if hasCFrame then
+                seen[part] = true
+                table.insert(tardisParts, part)
+            end
         end
     end
+end
+
+local function safeList(callback)
+    local ok, result = pcall(callback)
+
+    if ok then
+        return result
+    end
+
+    return nil
+end
+
+scan(safeList(function()
+    return workspace:GetChildren(true)
+end))
+
+if #tardisParts == 0 then
+    scan(safeList(function()
+        return workspace:GetDescendants(true)
+    end))
+end
+
+if #tardisParts == 0 then
+    scan(safeList(function()
+        return workspace:GetChildren()
+    end))
+end
+
+if #tardisParts == 0 then
+    scan(safeList(function()
+        return workspace:GetDescendants()
+    end))
 end
 
 print("TARDIS parts found:", #tardisParts)
 
 if #tardisParts == 0 then
-    print("TARDIS ERROR: no parts named Tardis")
+    print("TARDIS ERROR: no parts with Display name = Tardis")
     return
 end
 
 --------------------------------------------------
--- LOCK SHELL
+-- STARTUP PHYSICS
 --------------------------------------------------
 
 for index, part in ipairs(tardisParts) do
@@ -62,11 +152,11 @@ for index, part in ipairs(tardisParts) do
 end
 
 --------------------------------------------------
--- PIVOT / OFFSETS
+-- PIVOT / RELATIVE CFRAMES
 --------------------------------------------------
 
 local startingPivot = tardisParts[1].CFrame
-local startingRotation = startingPivot - startingPivot.Position
+local defaultRotation = startingPivot - startingPivot.Position
 local relativeCFrames = {}
 
 for _, part in ipairs(tardisParts) do
@@ -74,7 +164,7 @@ for _, part in ipairs(tardisParts) do
 end
 
 --------------------------------------------------
--- BOTTOM OFFSET
+-- ACTUAL BOTTOM OF TARDIS
 --------------------------------------------------
 
 local tardisBottomOffset = 0
@@ -101,15 +191,10 @@ if lowestBottom < math.huge then
 end
 
 --------------------------------------------------
--- CFRAME MOVEMENT
+-- CFRAME MOVEMENT ONLY
 --------------------------------------------------
 
-local function moveTardisToCFrame(targetCFrame)
-    if typeof(targetCFrame) ~= "CFrame" then
-        print("TARDIS MOVE ERROR: target is not CFrame")
-        return false
-    end
-
+local function moveTardis(targetCFrame)
     for index, part in ipairs(tardisParts) do
         part.CFrame = targetCFrame * relativeCFrames[part]
 
@@ -117,8 +202,6 @@ local function moveTardisToCFrame(targetCFrame)
             task.wait()
         end
     end
-
-    return true
 end
 
 --------------------------------------------------
@@ -153,11 +236,11 @@ local function fadeTo(target)
     end
 
     local duration = FADE_TIME * distance
-    local started = os.clock()
+    local startClock = os.clock()
 
     while true do
         local progress = math.clamp(
-            (os.clock() - started) / duration,
+            (os.clock() - startClock) / duration,
             0,
             1
         )
@@ -179,7 +262,7 @@ end
 -- INPUT C -> CFRAME
 --------------------------------------------------
 
-local function getInputCFrame()
+local function getInputDestination()
     local value = inputC:GetState()
 
     if typeof(value) == "CFrame" then
@@ -187,7 +270,7 @@ local function getInputCFrame()
     end
 
     if typeof(value) == "Vector3" then
-        return CFrame.new(value) * startingRotation
+        return CFrame.new(value) * defaultRotation
     end
 
     print("INPUT C must be CFrame or Vector3")
@@ -195,7 +278,7 @@ local function getInputCFrame()
 end
 
 --------------------------------------------------
--- PLAYER -> CFRAME
+-- PLAYER DESTINATION -> CFRAME
 --------------------------------------------------
 
 local function getLocalPlayerRoot()
@@ -231,7 +314,7 @@ local function getPlayerGroundY(root)
     return groundY
 end
 
-local function getCharacterCFrame()
+local function getCharacterDestination()
     local root = getLocalPlayerRoot()
 
     if not root then
@@ -240,23 +323,20 @@ local function getCharacterCFrame()
     end
 
     local groundY = getPlayerGroundY(root)
-    local pivotY =
-        groundY
-        - tardisBottomOffset
-        + RECALL_GROUND_CLEARANCE
+    local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
 
     return CFrame.new(
         root.Position.X,
         pivotY,
         root.Position.Z
-    ) * startingRotation
+    ) * defaultRotation
 end
 
 --------------------------------------------------
--- MATERIALIZE / DEMATERIALIZE
+-- DEMAT / MAT
 --------------------------------------------------
 
-local hiddenCFrame = HIDDEN_CFRAME * startingRotation
+local hiddenPivot = CFrame.new(HIDDEN_POSITION) * defaultRotation
 local hidden = false
 
 local function dematerialize()
@@ -264,28 +344,20 @@ local function dematerialize()
         return
     end
 
-    print("TARDIS DEMATERIALIZING")
-
     fadeTo(1)
-    moveTardisToCFrame(hiddenCFrame)
+    moveTardis(hiddenPivot)
     hidden = true
-
-    print("TARDIS DEMATERIALIZED")
 end
 
-local function materializeAtCFrame(destinationCFrame)
-    if typeof(destinationCFrame) ~= "CFrame" then
+local function materializeAt(destinationCFrame)
+    if not destinationCFrame then
         return
     end
 
-    print("TARDIS MATERIALIZING")
-
     setTransparency(1)
-    moveTardisToCFrame(destinationCFrame)
+    moveTardis(destinationCFrame)
     hidden = false
     fadeTo(0)
-
-    print("TARDIS MATERIALIZED")
 end
 
 --------------------------------------------------
@@ -301,11 +373,11 @@ if lastAState then
     hidden = false
 else
     setTransparency(1)
-    moveTardisToCFrame(hiddenCFrame)
+    moveTardis(hiddenPivot)
     hidden = true
 end
 
-print("SIMPLE CFRAME TARDIS READY")
+print("SIMPLE TARDIS READY")
 
 --------------------------------------------------
 -- MAIN LOOP
@@ -321,11 +393,7 @@ while true do
             dematerialize()
         end
 
-        local destinationCFrame = getCharacterCFrame()
-
-        if destinationCFrame then
-            materializeAtCFrame(destinationCFrame)
-        end
+        materializeAt(getCharacterDestination())
 
         lastAState = inputA:GetState() == true
         recallRunning = false
@@ -340,7 +408,7 @@ while true do
             lastAState = aState
 
             if aState then
-                materializeAtCFrame(getInputCFrame())
+                materializeAt(getInputDestination())
             else
                 dematerialize()
             end
