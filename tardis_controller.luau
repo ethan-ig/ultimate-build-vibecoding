@@ -14,6 +14,8 @@ local inputJ = script.inputs["j"]
 local SHELL_NAME = "Tardis"
 local DEMAT_SOUND_NAME = "TardisDematSound"
 local MAT_SOUND_NAME = "TardisMatSound"
+local INTERIOR_DEMAT_SOUND_NAME = "InteriorTardisDematSound"
+local INTERIOR_MAT_SOUND_NAME = "InteriorTardisMatSound"
 local LIGHT_NAME = "Tardislight"
 
 -- Audio is the master clock.
@@ -91,10 +93,14 @@ end
 
 local dematSound = findNamedBlock(DEMAT_SOUND_NAME)
 local matSound = findNamedBlock(MAT_SOUND_NAME)
+local interiorDematSound = findNamedBlock(INTERIOR_DEMAT_SOUND_NAME)
+local interiorMatSound = findNamedBlock(INTERIOR_MAT_SOUND_NAME)
 local tardisLight = findNamedBlock(LIGHT_NAME)
 
 print(dematSound and "FOUND: TardisDematSound" or "ERROR: missing TardisDematSound")
 print(matSound and "FOUND: TardisMatSound" or "ERROR: missing TardisMatSound")
+print(interiorDematSound and "FOUND: InteriorTardisDematSound" or "WARNING: missing InteriorTardisDematSound")
+print(interiorMatSound and "FOUND: InteriorTardisMatSound" or "WARNING: missing InteriorTardisMatSound")
 print(tardisLight and "FOUND: Tardislight" or "WARNING: missing Tardislight")
 
 local function getSoundInput(block)
@@ -148,20 +154,48 @@ end
 
 configureSound(dematSound)
 configureSound(matSound)
+configureSound(interiorDematSound)
+configureSound(interiorMatSound)
+
+local function getMirroredSound(block)
+    if block == dematSound then return interiorDematSound end
+    if block == matSound then return interiorMatSound end
+    if block == interiorDematSound then return dematSound end
+    if block == interiorMatSound then return matSound end
+    return nil
+end
 
 local function stopSound(block)
     if not block then return end
+
+    local mirror = getMirroredSound(block)
+
     setSoundPowered(block, false)
+    if mirror then setSoundPowered(mirror, false) end
+
     task.wait()
+
     setBlockValue(block, "TimePosition", 0)
+    if mirror then setBlockValue(mirror, "TimePosition", 0) end
 end
 
 local function playSound(block, position)
     if not block then return false end
+
+    local mirror = getMirroredSound(block)
+    local startPosition = position or 0
+
     setSoundPowered(block, false)
+    if mirror then setSoundPowered(mirror, false) end
+
     task.wait()
-    setBlockValue(block, "TimePosition", position or 0)
+
+    setBlockValue(block, "TimePosition", startPosition)
+    if mirror then setBlockValue(mirror, "TimePosition", startPosition) end
+
     setSoundPowered(block, true)
+    if mirror then setSoundPowered(mirror, true) end
+
     return true
 end
 
