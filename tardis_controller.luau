@@ -1,10 +1,13 @@
 -- TARDIS controller
 -- A: true=materialized, false=dematerialized
+-- B: optional player name target (partial names accepted)
 -- C: normal destination (Vector3/CFrame)
 -- J: recall (demat, then remat on local player)
 -- No Code outputs are required.
 
 local inputA = script.inputs["a"]
+local inputB = nil
+pcall(function() inputB = script.inputs["b"] end)
 local inputC = script.inputs["c"]
 local inputJ = script.inputs["j"]
 
@@ -524,6 +527,7 @@ local lastFadeWrite = 0
 print("TARDIS fade refresh:", fadeUpdateRate, "Hz")
 
 local findFloorY
+local findFloorNearY
 
 local function getInputDestination()
     local value = inputC:GetState()
@@ -541,7 +545,7 @@ local function getInputDestination()
     if not requested then return nil end
 
     local position = requested.Position
-    local groundY = findFloorY(position.X, position.Z, 10000)
+    local groundY = findFloorNearY(position.X, position.Z, position.Y)
     if groundY == nil then
         return requested
     end
@@ -686,6 +690,29 @@ findFloorY = function(x, z, maxY)
     return bestY
 end
 
+-- Coordinate destinations use Y only as a rough vertical hint. Prefer a floor
+-- at/below that height, but if the supplied Y is rough, choose the closest
+-- collidable surface instead of blindly taking the highest object in the map.
+findFloorNearY = function(x, z, hintY)
+    local bestY = nil
+    local bestScore = math.huge
+    local preferredCeiling = hintY + 8
+
+    for _, part in ipairs(workspace:GetDescendants(true)) do
+        local hitY = floorHitY(part, x, z, 10000)
+        if hitY then
+            local abovePenalty = hitY > preferredCeiling and 100000 or 0
+            local score = abovePenalty + math.abs(hitY - hintY)
+            if score < bestScore then
+                bestScore = score
+                bestY = hitY
+            end
+        end
+    end
+
+    return bestY
+end
+
 local function getCharacterDestination()
     local root = getLocalPlayerRoot()
     if not root then
@@ -697,6 +724,83 @@ local function getCharacterDestination()
     if groundY == nil then
         groundY = getPlayerGroundY(root)
     end
+
+    local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
+    return CFrame.new(root.Position.X, pivotY, root.Position.Z) * defaultRotation
+end
+
+local function getPlayerQuery()
+    if not inputB then return nil end
+
+    local value = nil
+    pcall(function() value = inputB:GetState() end)
+    if type(value) ~= "string" then return nil end
+
+    local query = string.match(value, "^%s*(.-)%s*$")
+    if not query or query == "" then return nil end
+    return string.lower(query)
+end
+
+local function resolvePlayerByQuery(query)
+    if not query then return nil end
+
+    local Players = nil
+    pcall(function() Players = game:GetService("Players") end)
+    if not Players then return nil end
+
+    local players = nil
+    pcall(function() players = Players:GetPlayers() end)
+    if not players then return nil end
+
+    local exactDisplay = nil
+    local prefixUser = nil
+    local prefixDisplay = nil
+
+    for _, player in ipairs(players) do
+        local username = string.lower(player.Name or "")
+        local displayName = string.lower(player.DisplayName or "")
+
+        if username == query then
+            return player
+        end
+        if displayName == query and not exactDisplay then
+            exactDisplay = player
+        end
+        if string.sub(username, 1, #query) == query and not prefixUser then
+            prefixUser = player
+        end
+        if string.sub(displayName, 1, #query) == query and not prefixDisplay then
+            prefixDisplay = player
+        end
+    end
+
+    return exactDisplay or prefixUser or prefixDisplay
+end
+
+local function getPlayerInputDestination()
+    local query = getPlayerQuery()
+    if not query then return nil end
+
+    local player = resolvePlayerByQuery(query)
+    if not player then
+        print("B TARGET NOT FOUND:", query)
+        return nil
+    end
+
+    local character = nil
+    pcall(function() character = player.Character end)
+    if not character then return nil end
+
+    local root = nil
+    pcall(function() root = character:FindFirstChild("HumanoidRootPart") end)
+    if not root then return nil end
+
+    local groundY = findFloorY(root.Position.X, root.Position.Z, root.Position.Y + 1)
+    if groundY == nil then
+        groundY = getPlayerGroundY(root)
+    end
+
+    print("B TARGET:", player.Name)
 
     local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
     return CFrame.new(root.Position.X, pivotY, root.Position.Z) * defaultRotation
@@ -743,7 +847,10 @@ local function prepareMaterialization(kind)
     if kind == "auto_materialize" then
         destination = getCharacterDestination()
     else
-        destination = getInputDestination()
+        destination = getPlayerInputDestination()
+        if not destination then
+            destination = getInputDestination()
+        end
     end
 
     if not destination then return false end
