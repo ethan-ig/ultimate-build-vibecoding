@@ -354,7 +354,46 @@ for _, part in ipairs(shellParts) do
     end
 end
 
+-- Make the interior teleport spot a two-way exit back to the current TARDIS.
+local interiorExitClickable = false
+local enterRaw = getClickRawPart(enterTarget)
+
+if enterRaw then
+    local exitDetector = nil
+    pcall(function() exitDetector = enterRaw:FindFirstChild("TardisExitClick") end)
+
+    if not exitDetector then
+        pcall(function()
+            exitDetector = Instance.new("ClickDetector")
+            exitDetector.Name = "TardisExitClick"
+            exitDetector.MaxActivationDistance = 18
+            exitDetector.Parent = enterRaw
+        end)
+    end
+
+    if exitDetector then
+        interiorExitClickable = pcall(function()
+            exitDetector.MouseClick:Connect(function(player)
+                if not player or #shellParts == 0 then return end
+
+                local exteriorCFrame = nil
+                pcall(function() exteriorCFrame = shellParts[1].CFrame end)
+                if not exteriorCFrame then return end
+
+                local character = player.Character
+                if not character then return end
+
+                local root = character:FindFirstChild("HumanoidRootPart")
+                if root then
+                    root.CFrame = exteriorCFrame * CFrame.new(0, 3, -6)
+                end
+            end)
+        end)
+    end
+end
+
 print("TARDIS clickable blocks:", clickableCount)
+print("TARDIS interior exit clickable:", interiorExitClickable)
 
 local lightOriginalTransparency = 0
 local lightOriginalBrightness = 2
