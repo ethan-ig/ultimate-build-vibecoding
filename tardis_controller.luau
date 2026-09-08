@@ -249,6 +249,113 @@ print("TARDIS shell blocks:", #shellParts)
 print("TARDIS moving blocks:", #moveParts)
 print("TARDIS wave-fading blocks:", #fadeParts)
 
+-- Click-to-enter is deliberately isolated from all TARDIS movement/fade lists.
+local ENTER_TARGET_NAME = "interiortardisteleportspot"
+
+local function getClickRawPart(block)
+    if not block then return nil end
+
+    local raw = nil
+    pcall(function() raw = block.Part end)
+    if raw then return raw end
+
+    if typeof(block) == "Instance" then return block end
+    return nil
+end
+
+local function findEnterTarget()
+    local wanted = string.lower(ENTER_TARGET_NAME)
+
+    for _, block in ipairs(workspace:GetDescendants(true)) do
+        if block ~= script then
+            local displayName = getDisplayName(block)
+            if displayName and string.lower(displayName) == wanted then
+                return block
+            end
+
+            local objectName = getBlockValue(block, "Name")
+            if type(objectName) == "string" and string.lower(objectName) == wanted then
+                return block
+            end
+
+            local raw = getClickRawPart(block)
+            if raw then
+                local rawName = nil
+                pcall(function() rawName = raw.Name end)
+                if type(rawName) == "string" and string.lower(rawName) == wanted then
+                    return block
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local enterTarget = findEnterTarget()
+
+local function getEnterTargetCFrame()
+    if not enterTarget then
+        enterTarget = findEnterTarget()
+    end
+    if not enterTarget then return nil end
+
+    local cf = nil
+    pcall(function() cf = enterTarget.CFrame end)
+    if cf then return cf end
+
+    local raw = getClickRawPart(enterTarget)
+    if raw then
+        pcall(function() cf = raw.CFrame end)
+    end
+
+    return cf
+end
+
+local clickableCount = 0
+
+for _, part in ipairs(shellParts) do
+    local raw = getClickRawPart(part)
+    if raw then
+        local detector = nil
+        pcall(function() detector = raw:FindFirstChildOfClass("ClickDetector") end)
+
+        if not detector then
+            pcall(function()
+                detector = Instance.new("ClickDetector")
+                detector.Name = "TardisEnterClick"
+                detector.MaxActivationDistance = 18
+                detector.Parent = raw
+            end)
+        end
+
+        if detector then
+            local connected = pcall(function()
+                detector.MouseClick:Connect(function(player)
+                    if not player then return end
+
+                    local targetCFrame = getEnterTargetCFrame()
+                    if not targetCFrame then return end
+
+                    local character = player.Character
+                    if not character then return end
+
+                    local root = character:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        root.CFrame = targetCFrame * CFrame.new(0, 3, 0)
+                    end
+                end)
+            end)
+
+            if connected then
+                clickableCount = clickableCount + 1
+            end
+        end
+    end
+end
+
+print("TARDIS clickable blocks:", clickableCount)
+
 local lightOriginalTransparency = 0
 local lightOriginalBrightness = 2
 
