@@ -452,6 +452,17 @@ if startingPivot then
     end
 end
 
+local matSoundRaw = nil
+local matSoundRawOffset = nil
+if startingPivot and matSound then
+    pcall(function() matSoundRaw = matSound.Part end)
+    if matSoundRaw then
+        pcall(function()
+            matSoundRawOffset = startingPivot:ToObjectSpace(matSoundRaw.CFrame)
+        end)
+    end
+end
+
 local defaultRotation = startingPivot
     and (startingPivot - startingPivot.Position)
     or CFrame.identity
@@ -485,6 +496,15 @@ local function moveTardis(pivot)
         if offset then
             pcall(function() part.CFrame = pivot * offset end)
         end
+    end
+
+    -- Keep the exterior materialization SoundBlock's actual raw Part glued to
+    -- the box too. Its wrapper can report a moved CFrame while the emitter Part
+    -- stays behind in Ultimate Build, so enforce the stored TARDIS-relative pose.
+    if matSoundRaw and matSoundRawOffset then
+        pcall(function()
+            matSoundRaw.CFrame = pivot * matSoundRawOffset
+        end)
     end
 end
 
