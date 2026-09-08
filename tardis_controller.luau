@@ -690,23 +690,17 @@ findFloorY = function(x, z, maxY)
     return bestY
 end
 
--- Coordinate destinations use Y only as a rough vertical hint. Prefer a floor
--- at/below that height, but if the supplied Y is rough, choose the closest
--- collidable surface instead of blindly taking the highest object in the map.
+-- Coordinate destinations use Y only as a rough ceiling hint. Scan downward
+-- from just above it and choose the highest collidable surface, so stacked
+-- roads/floors win over lower baseplates instead of burying the TARDIS.
 findFloorNearY = function(x, z, hintY)
     local bestY = nil
-    local bestScore = math.huge
     local preferredCeiling = hintY + 8
 
     for _, part in ipairs(workspace:GetDescendants(true)) do
-        local hitY = floorHitY(part, x, z, 10000)
-        if hitY then
-            local abovePenalty = hitY > preferredCeiling and 100000 or 0
-            local score = abovePenalty + math.abs(hitY - hintY)
-            if score < bestScore then
-                bestScore = score
-                bestY = hitY
-            end
+        local hitY = floorHitY(part, x, z, preferredCeiling)
+        if hitY and (bestY == nil or hitY > bestY) then
+            bestY = hitY
         end
     end
 
