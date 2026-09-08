@@ -523,12 +523,32 @@ local fadeUpdateInterval = 1 / fadeUpdateRate
 local lastFadeWrite = 0
 print("TARDIS fade refresh:", fadeUpdateRate, "Hz")
 
+local findFloorY
+
 local function getInputDestination()
     local value = inputC:GetState()
-    if typeof(value) == "Vector3" then return CFrame.new(value) * defaultRotation end
-    if typeof(value) == "CFrame" then return value end
-    print("Input C must be Vector3 or CFrame. Got:", typeof(value))
-    return startingPivot
+    local requested = nil
+
+    if typeof(value) == "Vector3" then
+        requested = CFrame.new(value) * defaultRotation
+    elseif typeof(value) == "CFrame" then
+        requested = value
+    else
+        print("Input C must be Vector3 or CFrame. Got:", typeof(value))
+        requested = startingPivot
+    end
+
+    if not requested then return nil end
+
+    local position = requested.Position
+    local groundY = findFloorY(position.X, position.Z, 10000)
+    if groundY == nil then
+        return requested
+    end
+
+    local rotation = requested - position
+    local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
+    return CFrame.new(position.X, pivotY, position.Z) * rotation
 end
 
 local function getLocalPlayerRoot()
@@ -653,7 +673,7 @@ local function floorHitY(part, x, z, maxY)
     return hitY
 end
 
-local function findFloorY(x, z, maxY)
+findFloorY = function(x, z, maxY)
     local bestY = nil
 
     for _, part in ipairs(workspace:GetDescendants(true)) do
