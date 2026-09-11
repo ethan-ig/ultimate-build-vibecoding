@@ -1178,14 +1178,30 @@ local function rotorNameMatches(block)
     return false
 end
 
-for _, part in ipairs(workspace:GetDescendants(true)) do
-    if part ~= script and rotorNameMatches(part) then
+for _, block in ipairs(workspace:GetDescendants(true)) do
+    if block ~= script and rotorNameMatches(block) then
+        -- Cylinder blocks can keep DisplayName on the UB wrapper while their
+        -- physical CFrame lives on wrapper.Part. Prefer that raw Part so the
+        -- actual visible cylinder is what gets animated.
+        local target = nil
         local cf = nil
-        pcall(function() cf = part.CFrame end)
-        if cf then
-            table.insert(timeRotorParts, part)
-            timeRotorStartCFrames[part] = cf
-            pcall(function() part.Anchored = true end)
+        local raw = nil
+
+        pcall(function() raw = block.Part end)
+        if raw then
+            pcall(function() cf = raw.CFrame end)
+            if cf then target = raw end
+        end
+
+        if not target then
+            pcall(function() cf = block.CFrame end)
+            if cf then target = block end
+        end
+
+        if target and cf and not contains(timeRotorParts, target) then
+            table.insert(timeRotorParts, target)
+            timeRotorStartCFrames[target] = cf
+            pcall(function() target.Anchored = true end)
         end
     end
 end
