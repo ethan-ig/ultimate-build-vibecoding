@@ -1145,7 +1145,7 @@ end
 
 -- Interior time rotor animation. Kept completely separate from exterior
 -- movement/fade logic and updated from the existing controller heartbeat.
-local TIME_ROTOR_NAME = "time rotor"
+local TIME_ROTOR_NAME = "timerotor"
 local TIME_ROTOR_TRAVEL = 6
 local TIME_ROTOR_SPEED = 0.35 -- complete up/down cycles per second
 local timeRotorParts = {}
