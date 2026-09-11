@@ -1143,6 +1143,72 @@ local function startAutoRecall()
     end
 end
 
+-- Interior time rotor animation. Kept completely separate from exterior
+-- movement/fade logic and updated from the existing controller heartbeat.
+local TIME_ROTOR_NAME = "time rotor"
+local TIME_ROTOR_TRAVEL = 6
+local TIME_ROTOR_SPEED = 0.35 -- complete up/down cycles per second
+local timeRotorParts = {}
+local timeRotorStartCFrames = {}
+local timeRotorStartTime = os.clock()
+
+local function rotorNameMatches(block)
+    local wanted = string.lower(TIME_ROTOR_NAME)
+
+    local displayName = getDisplayName(block)
+    if type(displayName) == "string" and string.lower(displayName) == wanted then
+        return true
+    end
+
+    local objectName = getBlockValue(block, "Name")
+    if type(objectName) == "string" and string.lower(objectName) == wanted then
+        return true
+    end
+
+    local raw = nil
+    pcall(function() raw = block.Part end)
+    if raw then
+        local rawName = nil
+        pcall(function() rawName = raw.Name end)
+        if type(rawName) == "string" and string.lower(rawName) == wanted then
+            return true
+        end
+    end
+
+    return false
+end
+
+for _, part in ipairs(workspace:GetDescendants(true)) do
+    if part ~= script and rotorNameMatches(part) then
+        local cf = nil
+        pcall(function() cf = part.CFrame end)
+        if cf then
+            table.insert(timeRotorParts, part)
+            timeRotorStartCFrames[part] = cf
+            pcall(function() part.Anchored = true end)
+        end
+    end
+end
+
+print("TARDIS time rotor blocks:", #timeRotorParts)
+
+local function updateTimeRotor()
+    if #timeRotorParts == 0 then return end
+
+    local elapsed = os.clock() - timeRotorStartTime
+    local offsetY = math.sin(elapsed * math.pi * 2 * TIME_ROTOR_SPEED)
+        * (TIME_ROTOR_TRAVEL / 2)
+
+    for _, part in ipairs(timeRotorParts) do
+        local base = timeRotorStartCFrames[part]
+        if base then
+            pcall(function()
+                part.CFrame = base + Vector3.new(0, offsetY, 0)
+            end)
+        end
+    end
+end
+
 while true do
     local jState = inputJ:GetState() == true
 
@@ -1165,5 +1231,6 @@ while true do
     end
 
     updateTransition()
+    updateTimeRotor()
     task.wait(MAIN_UPDATE_INTERVAL)
 end
