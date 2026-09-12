@@ -1143,14 +1143,19 @@ local function startAutoRecall()
     end
 end
 
--- Interior time rotor animation. Kept completely separate from exterior
--- movement/fade logic and updated from the existing controller heartbeat.
+-- Interior time rotor animation. Kept completely separate from exterior logic.
+-- Raw cylinder Parts are tweened directly so the motion is smooth without
+-- hammering CFrame every frame.
 local TIME_ROTOR_NAME = "timerotor"
 local TIME_ROTOR_TRAVEL = 6
-local TIME_ROTOR_SPEED = 0.35 -- complete up/down cycles per second
+local TIME_ROTOR_TWEEN_TIME = 1.4 -- seconds from bottom to top
 local timeRotorParts = {}
-local timeRotorStartCFrames = {}
-local timeRotorStartTime = os.clock()
+local timeRotorTweens = {}
+local timeRotorFallbackBases = {}
+local timeRotorFallbackStartTime = os.clock()
+local TweenService = nil
+
+pcall(function() TweenService = game:GetService("TweenService") end)
 
 local function rotorNameMatches(block)
     local wanted = string.lower(TIME_ROTOR_NAME)
@@ -1180,9 +1185,6 @@ end
 
 for _, block in ipairs(workspace:GetDescendants(true)) do
     if block ~= script and rotorNameMatches(block) then
-        -- Cylinder blocks can keep DisplayName on the UB wrapper while their
-        -- physical CFrame lives on wrapper.Part. Prefer that raw Part so the
-        -- actual visible cylinder is what gets animated.
         local target = nil
         local cf = nil
         local raw = nil
@@ -1200,23 +1202,67 @@ for _, block in ipairs(workspace:GetDescendants(true)) do
 
         if target and cf and not contains(timeRotorParts, target) then
             table.insert(timeRotorParts, target)
-            timeRotorStartCFrames[target] = cf
+            timeRotorFallbackBases[target] = cf
             pcall(function() target.Anchored = true end)
         end
     end
 end
 
+local timeRotorTweening = false
+
+if TweenService and #timeRotorParts > 0 then
+    local tweenInfo = nil
+    local infoOk = pcall(function()
+        tweenInfo = TweenInfo.new(
+            TIME_ROTOR_TWEEN_TIME,
+            Enum.EasingStyle.Sine,
+            Enum.EasingDirection.InOut,
+            -1,
+            true,
+            0
+        )
+    end)
+
+    if infoOk and tweenInfo then
+        local started = 0
+
+        for _, part in ipairs(timeRotorParts) do
+            local base = timeRotorFallbackBases[part]
+            if base then
+                local tween = nil
+                local ok = pcall(function()
+                    tween = TweenService:Create(part, tweenInfo, {
+                        CFrame = base + Vector3.new(0, TIME_ROTOR_TRAVEL, 0)
+                    })
+                    tween:Play()
+                end)
+
+                if ok and tween then
+                    table.insert(timeRotorTweens, tween)
+                    started = started + 1
+                end
+            end
+        end
+
+        timeRotorTweening = started == #timeRotorParts and started > 0
+    end
+end
+
 print("TARDIS time rotor blocks:", #timeRotorParts)
+print("TARDIS time rotor tweening:", timeRotorTweening)
 
-local function updateTimeRotor()
-    if #timeRotorParts == 0 then return end
+-- Safety fallback only if TweenService is unavailable in the UB/Fiu sandbox.
+local function updateTimeRotorFallback()
+    if timeRotorTweening or #timeRotorParts == 0 then return end
 
-    local elapsed = os.clock() - timeRotorStartTime
-    local offsetY = math.sin(elapsed * math.pi * 2 * TIME_ROTOR_SPEED)
-        * (TIME_ROTOR_TRAVEL / 2)
+    local elapsed = os.clock() - timeRotorFallbackStartTime
+    local cycleSeconds = TIME_ROTOR_TWEEN_TIME * 2
+    local offsetY = (0.5 + 0.5 * math.sin(
+        elapsed * math.pi * 2 / cycleSeconds - math.pi / 2
+    )) * TIME_ROTOR_TRAVEL
 
     for _, part in ipairs(timeRotorParts) do
-        local base = timeRotorStartCFrames[part]
+        local base = timeRotorFallbackBases[part]
         if base then
             pcall(function()
                 part.CFrame = base + Vector3.new(0, offsetY, 0)
@@ -1247,6 +1293,6 @@ while true do
     end
 
     updateTransition()
-    updateTimeRotor()
+    updateTimeRotorFallback()
     task.wait(MAIN_UPDATE_INTERVAL)
 end
