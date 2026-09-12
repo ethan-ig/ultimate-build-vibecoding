@@ -17,6 +17,7 @@ local MAT_SOUND_NAME = "TardisMatSound"
 local INTERIOR_DEMAT_SOUND_NAME = "InteriorTardisDematSound"
 local INTERIOR_MAT_SOUND_NAME = "InteriorTardisMatSound"
 local LIGHT_NAME = "Tardislight"
+local PORTAL_NAME = "tardisportal"
 
 -- Audio is the master clock.
 local VISUAL_START_TIME = 0.20
@@ -242,7 +243,7 @@ local function getPlaybackLoudness(block, actualSound)
 end
 
 -- shellParts determine ground height.
--- moveParts include shell + sounds + roof light.
+-- moveParts include shell + sounds + roof light + portal.
 -- fadeParts include shell + sounds. Roof light gets a stronger custom effect.
 local shellParts = {}
 local moveParts = {}
@@ -282,14 +283,7 @@ addPart(moveParts, tardisLight)
 addPart(fadeParts, dematSound)
 addPart(fadeParts, matSound)
 
-print("TARDIS shell blocks:", #shellParts)
-print("TARDIS moving blocks:", #moveParts)
-print("TARDIS wave-fading blocks:", #fadeParts)
-
--- Click-to-enter is deliberately isolated from all TARDIS movement/fade lists.
-local ENTER_TARGET_NAME = "interiortardisteleportspot"
-
-local function getClickRawPart(block)
+local function getRawPart(block)
     if not block then return nil end
 
     local raw = nil
@@ -300,137 +294,93 @@ local function getClickRawPart(block)
     return nil
 end
 
-local function findEnterTarget()
-    local wanted = string.lower(ENTER_TARGET_NAME)
+local function blockNameMatches(block, name)
+    if not block then return false end
+    local wanted = string.lower(name)
 
-    for _, block in ipairs(workspace:GetDescendants(true)) do
-        if block ~= script then
-            local displayName = getDisplayName(block)
-            if displayName and string.lower(displayName) == wanted then
-                return block
-            end
+    local displayName = getDisplayName(block)
+    if type(displayName) == "string" and string.lower(displayName) == wanted then
+        return true
+    end
 
-            local objectName = getBlockValue(block, "Name")
-            if type(objectName) == "string" and string.lower(objectName) == wanted then
-                return block
-            end
+    local objectName = getBlockValue(block, "Name")
+    if type(objectName) == "string" and string.lower(objectName) == wanted then
+        return true
+    end
 
-            local raw = getClickRawPart(block)
-            if raw then
-                local rawName = nil
-                pcall(function() rawName = raw.Name end)
-                if type(rawName) == "string" and string.lower(rawName) == wanted then
-                    return block
-                end
-            end
+    local raw = getRawPart(block)
+    if raw then
+        local rawName = nil
+        pcall(function() rawName = raw.Name end)
+        if type(rawName) == "string" and string.lower(rawName) == wanted then
+            return true
         end
     end
 
+    return false
+end
+
+local function findBlockFlexible(name)
+    for _, block in ipairs(workspace:GetDescendants(true)) do
+        if block ~= script and blockNameMatches(block, name) then
+            return block
+        end
+    end
     return nil
 end
 
-local enterTarget = findEnterTarget()
+-- Replace the old click-to-enter system with a portal that physically follows
+-- the exterior TARDIS. The portal is never included in fadeParts.
+local tardisPortal = findBlockFlexible(PORTAL_NAME)
+local tardisPortalRaw = getRawPart(tardisPortal)
+local tardisPortalMoveTarget = nil
 
-local function getEnterTargetCFrame()
-    if not enterTarget then
-        enterTarget = findEnterTarget()
-    end
-    if not enterTarget then return nil end
-
+if tardisPortal then
     local cf = nil
-    pcall(function() cf = enterTarget.CFrame end)
-    if cf then return cf end
-
-    local raw = getClickRawPart(enterTarget)
-    if raw then
-        pcall(function() cf = raw.CFrame end)
+    pcall(function() cf = tardisPortal.CFrame end)
+    if cf then
+        tardisPortalMoveTarget = tardisPortal
+    elseif tardisPortalRaw then
+        pcall(function() cf = tardisPortalRaw.CFrame end)
+        if cf then tardisPortalMoveTarget = tardisPortalRaw end
     end
-
-    return cf
 end
 
-local clickableCount = 0
+addPart(moveParts, tardisPortalMoveTarget)
 
+local function forcePortalTransparent()
+    if tardisPortal then
+        setBlockValue(tardisPortal, "Transparency", 1)
+    end
+    if tardisPortalRaw then
+        pcall(function() tardisPortalRaw.Transparency = 1 end)
+    end
+end
+
+forcePortalTransparent()
+
+-- Clean up ClickDetectors created by older versions of this controller.
 for _, part in ipairs(shellParts) do
-    local raw = getClickRawPart(part)
+    local raw = getRawPart(part)
     if raw then
         local detector = nil
-        pcall(function() detector = raw:FindFirstChildOfClass("ClickDetector") end)
-
-        if not detector then
-            pcall(function()
-                detector = Instance.new("ClickDetector")
-                detector.Name = "TardisEnterClick"
-                detector.MaxActivationDistance = 18
-                detector.Parent = raw
-            end)
-        end
-
-        if detector then
-            local connected = pcall(function()
-                detector.MouseClick:Connect(function(player)
-                    if not player then return end
-
-                    local targetCFrame = getEnterTargetCFrame()
-                    if not targetCFrame then return end
-
-                    local character = player.Character
-                    if not character then return end
-
-                    local root = character:FindFirstChild("HumanoidRootPart")
-                    if root then
-                        root.CFrame = targetCFrame * CFrame.new(0, 3, 0)
-                    end
-                end)
-            end)
-
-            if connected then
-                clickableCount = clickableCount + 1
-            end
-        end
+        pcall(function() detector = raw:FindFirstChild("TardisEnterClick") end)
+        if detector then pcall(function() detector:Destroy() end) end
     end
 end
 
--- Make the interior teleport spot a two-way exit back to the current TARDIS.
-local interiorExitClickable = false
-local enterRaw = getClickRawPart(enterTarget)
-
-if enterRaw then
-    local exitDetector = nil
-    pcall(function() exitDetector = enterRaw:FindFirstChild("TardisExitClick") end)
-
-    if not exitDetector then
-        pcall(function()
-            exitDetector = Instance.new("ClickDetector")
-            exitDetector.Name = "TardisExitClick"
-            exitDetector.MaxActivationDistance = 18
-            exitDetector.Parent = enterRaw
-        end)
-    end
-
-    if exitDetector then
-        interiorExitClickable = pcall(function()
-            exitDetector.MouseClick:Connect(function(player)
-                if not player or #shellParts == 0 then return end
-
-                local exteriorCFrame = nil
-                pcall(function() exteriorCFrame = shellParts[1].CFrame end)
-                if not exteriorCFrame then return end
-
-                local character = player.Character
-                if not character then return end
-
-                local root = character:FindFirstChild("HumanoidRootPart")
-                if root then
-                    root.CFrame = exteriorCFrame * CFrame.new(0, 3, -6)
-                end
-            end)
-        end)
-    end
+local oldInteriorTarget = findBlockFlexible("interiortardisteleportspot")
+local oldInteriorRaw = getRawPart(oldInteriorTarget)
+if oldInteriorRaw then
+    local detector = nil
+    pcall(function() detector = oldInteriorRaw:FindFirstChild("TardisExitClick") end)
+    if detector then pcall(function() detector:Destroy() end) end
 end
 
-print("TARDIS clickable blocks:", clickableCount)
-print("TARDIS interior exit clickable:", interiorExitClickable)
+print("TARDIS shell blocks:", #shellParts)
+print("TARDIS moving blocks:", #moveParts)
+print("TARDIS wave-fading blocks:", #fadeParts)
+print("TARDIS portal found:", tardisPortal ~= nil)
 
 local lightOriginalTransparency = 0
 local lightOriginalBrightness = 2
@@ -461,6 +411,13 @@ if startingPivot and matSound then
             matSoundRawOffset = startingPivot:ToObjectSpace(matSoundRaw.CFrame)
         end)
     end
+end
+
+local tardisPortalRawOffset = nil
+if startingPivot and tardisPortalRaw then
+    pcall(function()
+        tardisPortalRawOffset = startingPivot:ToObjectSpace(tardisPortalRaw.CFrame)
+    end)
 end
 
 local defaultRotation = startingPivot
@@ -506,6 +463,16 @@ local function moveTardis(pivot)
             matSoundRaw.CFrame = pivot * matSoundRawOffset
         end)
     end
+
+    -- Same raw-Part safeguard for the portal so it cannot get left behind by
+    -- a wrapper that reports its own CFrame.
+    if tardisPortalRaw and tardisPortalRawOffset then
+        pcall(function()
+            tardisPortalRaw.CFrame = pivot * tardisPortalRawOffset
+        end)
+    end
+
+    forcePortalTransparent()
 end
 
 local function setFadePartsTransparency(value)
@@ -1143,9 +1110,9 @@ local function startAutoRecall()
     end
 end
 
--- Interior time rotor animation. Kept completely separate from exterior logic.
--- Raw cylinder Parts are tweened directly so the motion is smooth without
--- hammering CFrame every frame.
+-- Interior time rotor animation. It runs while dematting, fully dematerialized,
+-- and rematerializing. Once the exterior is fully solid again it pauses exactly
+-- where it is until the next dematerialization cycle.
 local TIME_ROTOR_NAME = "timerotor"
 local TIME_ROTOR_TRAVEL = 6
 local TIME_ROTOR_TWEEN_TIME = 1.4 -- seconds from bottom to top
@@ -1224,7 +1191,7 @@ if TweenService and #timeRotorParts > 0 then
     end)
 
     if infoOk and tweenInfo then
-        local started = 0
+        local created = 0
 
         for _, part in ipairs(timeRotorParts) do
             local base = timeRotorFallbackBases[part]
@@ -1234,18 +1201,44 @@ if TweenService and #timeRotorParts > 0 then
                     tween = TweenService:Create(part, tweenInfo, {
                         CFrame = base + Vector3.new(0, TIME_ROTOR_TRAVEL, 0)
                     })
-                    tween:Play()
                 end)
 
                 if ok and tween then
                     table.insert(timeRotorTweens, tween)
-                    started = started + 1
+                    created = created + 1
                 end
             end
         end
 
-        timeRotorTweening = started == #timeRotorParts and started > 0
+        timeRotorTweening = created == #timeRotorParts and created > 0
     end
+end
+
+local timeRotorRunning = false
+
+local function setTimeRotorRunning(shouldRun)
+    if shouldRun == timeRotorRunning then return end
+    timeRotorRunning = shouldRun
+
+    if timeRotorTweening then
+        for _, tween in ipairs(timeRotorTweens) do
+            pcall(function()
+                if shouldRun then
+                    tween:Play()
+                else
+                    tween:Pause()
+                end
+            end)
+        end
+    elseif shouldRun then
+        timeRotorFallbackStartTime = os.clock()
+    end
+end
+
+local function shouldRunTimeRotor()
+    if hidden then return true end
+    if activeTransition then return true end
+    return currentFade > 0.001
 end
 
 print("TARDIS time rotor blocks:", #timeRotorParts)
@@ -1253,7 +1246,7 @@ print("TARDIS time rotor tweening:", timeRotorTweening)
 
 -- Safety fallback only if TweenService is unavailable in the UB/Fiu sandbox.
 local function updateTimeRotorFallback()
-    if timeRotorTweening or #timeRotorParts == 0 then return end
+    if timeRotorTweening or not timeRotorRunning or #timeRotorParts == 0 then return end
 
     local elapsed = os.clock() - timeRotorFallbackStartTime
     local cycleSeconds = TIME_ROTOR_TWEEN_TIME * 2
@@ -1293,6 +1286,7 @@ while true do
     end
 
     updateTransition()
+    setTimeRotorRunning(shouldRunTimeRotor())
     updateTimeRotorFallback()
     task.wait(MAIN_UPDATE_INTERVAL)
 end
