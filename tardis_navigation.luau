@@ -15,8 +15,14 @@ local NAV_START_HEIGHT = 450
 local NAV_MIN_HEIGHT = 80
 local NAV_MAX_HEIGHT = 1800
 local NAV_ZOOM_STEP = 70
-local NAV_PAN_SCALE = 0.0022
 local UPDATE_INTERVAL = 1 / 60
+local LAND_UPDATE_INTERVAL = 0.08
+local MAX_RAY_DISTANCE = 20000
+
+-- Matches the hidden exterior staging point in the main controller. We only use
+-- this to avoid centering the nav camera there while the TARDIS is dematerialized.
+local HIDDEN_TARDIS_POSITION = Vector3.new(-2000, 1, 2772)
+local HIDDEN_POSITION_RADIUS = 100
 
 local Players = nil
 local UserInputService = nil
@@ -32,7 +38,14 @@ local navigationActive = false
 local navigationHeight = NAV_START_HEIGHT
 local navigationCenter = Vector3.new(0, 0, 0)
 local rightDragging = false
+local rightButtonWasDown = false
+local lastCursorPosition = nil
 local lastSelectedDestination = nil
+local lastKnownExteriorPosition = nil
+local hoverDestination = nil
+local lastLandUpdate = 0
+local lastSelectTime = 0
+local lastZoomTime = 0
 
 local savedCameraType = nil
 local savedCameraCFrame = nil
@@ -42,6 +55,10 @@ local savedFieldOfView = nil
 local navGui = nil
 local navCoordinateLabel = nil
 local navStatusLabel = nil
+
+local landCandidates = {}
+local ignoredInstances = {}
+local navRaycastParams = nil
 
 local function getBlockValue(block, key)
     if not block then return nil end
@@ -64,6 +81,17 @@ local function getDisplayName(block)
     return nil
 end
 
+local function getRawPart(block)
+    if not block then return nil end
+
+    local raw = nil
+    pcall(function() raw = block.Part end)
+    if raw then return raw end
+
+    if typeof(block) == "Instance" then return block end
+    return nil
+end
+
 local function getBlockCFrame(block)
     if not block then return nil end
 
@@ -71,8 +99,7 @@ local function getBlockCFrame(block)
     pcall(function() cf = block.CFrame end)
     if cf then return cf end
 
-    local raw = nil
-    pcall(function() raw = block.Part end)
+    local raw = getRawPart(block)
     if raw then pcall(function() cf = raw.CFrame end) end
     return cf
 end
@@ -91,11 +118,19 @@ local function findExteriorTardisPosition()
     return nil
 end
 
-local function getFallbackCenter()
-    if lastSelectedDestination then
-        return lastSelectedDestination
-    end
+local function isHiddenExteriorPosition(position)
+    if not position then return true end
+    return (position - HIDDEN_TARDIS_POSITION).Magnitude <= HIDDEN_POSITION_RADIUS
+end
 
+local function refreshLastKnownExteriorPosition()
+    local position = findExteriorTardisPosition()
+    if position and not isHiddenExteriorPosition(position) then
+        lastKnownExteriorPosition = position
+    end
+end
+
+local function getPlayerRootPosition()
     local root = nil
     if player then
         pcall(function()
@@ -103,9 +138,18 @@ local function getFallbackCenter()
             if character then root = character:FindFirstChild("HumanoidRootPart") end
         end)
     end
-
     if root then return root.Position end
-    return Vector3.new(0, 0, 0)
+    return nil
+end
+
+local function getNavigationCenter()
+    if lastSelectedDestination then return lastSelectedDestination end
+    if lastKnownExteriorPosition then return lastKnownExteriorPosition end
+
+    refreshLastKnownExteriorPosition()
+    if lastKnownExteriorPosition then return lastKnownExteriorPosition end
+
+    return getPlayerRootPosition() or Vector3.new(0, 0, 0)
 end
 
 local function getCamera()
@@ -126,15 +170,273 @@ local function updateCamera()
         navigationCenter.Z
     )
 
-    -- Looking straight down. This avoids a lookAt singularity at exactly +/-Y.
     local cf = CFrame.new(cameraPosition) * CFrame.Angles(-math.pi / 2, 0, 0)
     pcall(function() camera.CFrame = cf end)
 end
 
-local function destroyNavigationGui()
-    if navGui then
-        pcall(function() navGui:Destroy() end)
+local function getCursorPosition()
+    local position = nil
+
+    if UserInputService then
+        pcall(function() position = UserInputService:GetMouseLocation() end)
     end
+
+    if not position and mouse then
+        local x, y = nil, nil
+        pcall(function()
+            x = mouse.X
+            y = mouse.Y
+        end)
+        if type(x) == "number" and type(y) == "number" then
+            position = Vector2.new(x, y)
+        end
+    end
+
+    return position
+end
+
+local function getCameraRay()
+    if not navigationActive then return nil, nil end
+
+    local camera = getCamera()
+    local cursor = getCursorPosition()
+    if not camera or not cursor then return nil, nil end
+
+    local ray = nil
+    pcall(function() ray = camera:ScreenPointToRay(cursor.X, cursor.Y) end)
+    if not ray then
+        pcall(function() ray = camera:ViewportPointToRay(cursor.X, cursor.Y) end)
+    end
+    if not ray and mouse then
+        pcall(function() ray = mouse.UnitRay end)
+    end
+    if not ray then return nil, nil end
+
+    local origin, direction = nil, nil
+    pcall(function()
+        origin = ray.Origin
+        direction = ray.Direction
+    end)
+    if not origin or not direction or direction.Magnitude <= 0.0001 then
+        return nil, nil
+    end
+
+    direction = direction.Unit
+    return origin, direction
+end
+
+local function nameShouldBeIgnored(block)
+    local displayName = getDisplayName(block)
+    if type(displayName) ~= "string" then return false end
+
+    local name = string.lower(displayName)
+    return name == "tardis"
+        or name == "tardisportal"
+        or name == "tardisdematsound"
+        or name == "tardismatsound"
+        or name == "interiortardisdematsound"
+        or name == "interiortardismatsound"
+end
+
+local function isPlayerCharacterPart(instance)
+    if not instance or not player then return false end
+
+    local character = nil
+    pcall(function() character = player.Character end)
+    if not character then return false end
+
+    local result = false
+    pcall(function() result = instance:IsDescendantOf(character) end)
+    return result
+end
+
+local function getGeometryTarget(block)
+    if not block then return nil end
+
+    local raw = getRawPart(block)
+    if raw then
+        local cf, size = nil, nil
+        pcall(function()
+            cf = raw.CFrame
+            size = raw.Size
+        end)
+        if cf and size then return raw end
+    end
+
+    local cf, size = nil, nil
+    pcall(function()
+        cf = block.CFrame
+        size = block.Size
+    end)
+    if cf and size then return block end
+
+    return nil
+end
+
+local function targetCanCollide(target, wrapper)
+    local canCollide = getBlockValue(wrapper, "CanCollide")
+    if canCollide == nil then
+        pcall(function() canCollide = target.CanCollide end)
+    end
+    return canCollide ~= false
+end
+
+local function rebuildLandCandidates()
+    landCandidates = {}
+    ignoredInstances = {}
+    navRaycastParams = nil
+
+    local descendants = workspace:GetDescendants(true)
+
+    -- First collect exterior/helper parts that should never count as terrain.
+    for _, block in ipairs(descendants) do
+        if block ~= script and nameShouldBeIgnored(block) then
+            local target = getGeometryTarget(block)
+            if target then ignoredInstances[target] = true end
+        end
+    end
+
+    local seen = {}
+    for _, block in ipairs(descendants) do
+        if block ~= script then
+            local target = getGeometryTarget(block)
+            if target
+            and not seen[target]
+            and not ignoredInstances[target]
+            and not isPlayerCharacterPart(target)
+            and targetCanCollide(target, block) then
+                seen[target] = true
+                table.insert(landCandidates, target)
+            end
+        end
+    end
+
+    -- Prefer Roblox's true geometry raycast when the sandbox allows it. This
+    -- handles unions/terrain accurately; the OBB scanner below is the fallback.
+    pcall(function()
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+
+        local exclude = {}
+        local character = player and player.Character or nil
+        if character then table.insert(exclude, character) end
+        for instance, _ in pairs(ignoredInstances) do
+            table.insert(exclude, instance)
+        end
+
+        params.FilterDescendantsInstances = exclude
+        pcall(function() params.RespectCanCollide = true end)
+        navRaycastParams = params
+    end)
+
+    print("TARDIS NAV land candidates:", #landCandidates)
+end
+
+local function updateSlab(originCoord, directionCoord, minCoord, maxCoord, tMin, tMax)
+    local epsilon = 0.000001
+
+    if math.abs(directionCoord) <= epsilon then
+        if originCoord < minCoord or originCoord > maxCoord then
+            return tMin, tMax, false
+        end
+        return tMin, tMax, true
+    end
+
+    local t1 = (minCoord - originCoord) / directionCoord
+    local t2 = (maxCoord - originCoord) / directionCoord
+    if t1 > t2 then
+        local swap = t1
+        t1 = t2
+        t2 = swap
+    end
+
+    if t1 > tMin then tMin = t1 end
+    if t2 < tMax then tMax = t2 end
+    return tMin, tMax, tMin <= tMax
+end
+
+local function rayBoxDistance(target, worldOrigin, worldDirection)
+    local cf, size = nil, nil
+    local ok = pcall(function()
+        cf = target.CFrame
+        size = target.Size
+    end)
+    if not ok or not cf or not size then return nil end
+
+    local localOrigin, localDirection = nil, nil
+    ok = pcall(function()
+        localOrigin = cf:PointToObjectSpace(worldOrigin)
+        localDirection = cf:VectorToObjectSpace(worldDirection)
+    end)
+    if not ok or not localOrigin or not localDirection then return nil end
+
+    local tMin = 0
+    local tMax = MAX_RAY_DISTANCE
+    local hit = true
+
+    tMin, tMax, hit = updateSlab(
+        localOrigin.X, localDirection.X,
+        -size.X / 2, size.X / 2,
+        tMin, tMax
+    )
+    if not hit then return nil end
+
+    tMin, tMax, hit = updateSlab(
+        localOrigin.Y, localDirection.Y,
+        -size.Y / 2, size.Y / 2,
+        tMin, tMax
+    )
+    if not hit then return nil end
+
+    tMin, tMax, hit = updateSlab(
+        localOrigin.Z, localDirection.Z,
+        -size.Z / 2, size.Z / 2,
+        tMin, tMax
+    )
+    if not hit or tMin < 0 or tMin > MAX_RAY_DISTANCE then return nil end
+
+    return tMin
+end
+
+local function getCursorLandPosition()
+    local origin, direction = getCameraRay()
+    if not origin or not direction then return nil end
+
+    -- Accurate path first: real Roblox raycast, including Terrain and actual
+    -- union geometry. If Fiu blocks it, fall back to cached collidable boxes.
+    if navRaycastParams then
+        local result = nil
+        local ok = pcall(function()
+            result = workspace:Raycast(
+                origin,
+                direction * MAX_RAY_DISTANCE,
+                navRaycastParams
+            )
+        end)
+        if ok and result then
+            local position = nil
+            pcall(function() position = result.Position end)
+            if position then return position end
+        end
+    end
+
+    local bestDistance = nil
+    for _, target in ipairs(landCandidates) do
+        local distance = rayBoxDistance(target, origin, direction)
+        if distance and (bestDistance == nil or distance < bestDistance) then
+            bestDistance = distance
+        end
+    end
+
+    if bestDistance then
+        return origin + direction * bestDistance
+    end
+
+    return nil
+end
+
+local function destroyNavigationGui()
+    if navGui then pcall(function() navGui:Destroy() end) end
     navGui = nil
     navCoordinateLabel = nil
     navStatusLabel = nil
@@ -156,10 +458,9 @@ local function makeNavigationGui()
         gui.DisplayOrder = 1000
 
         local panel = Instance.new("Frame")
-        panel.Name = "Panel"
         panel.AnchorPoint = Vector2.new(0.5, 0)
         panel.Position = UDim2.new(0.5, 0, 0, 18)
-        panel.Size = UDim2.new(0, 520, 0, 82)
+        panel.Size = UDim2.new(0, 560, 0, 82)
         panel.BackgroundColor3 = Color3.fromRGB(10, 14, 20)
         panel.BackgroundTransparency = 0.15
         panel.BorderSizePixel = 0
@@ -184,7 +485,7 @@ local function makeNavigationGui()
         coords.TextSize = 15
         coords.TextColor3 = Color3.fromRGB(180, 220, 255)
         coords.TextXAlignment = Enum.TextXAlignment.Left
-        coords.Text = "MOVE MOUSE OVER THE MAP"
+        coords.Text = "SCANNING LAND..."
         coords.Parent = panel
 
         local status = Instance.new("TextLabel")
@@ -225,6 +526,9 @@ local function closeNavigation(reason)
 
     navigationActive = false
     rightDragging = false
+    rightButtonWasDown = false
+    lastCursorPosition = nil
+    hoverDestination = nil
     restoreCamera()
     destroyNavigationGui()
 
@@ -233,8 +537,8 @@ end
 
 local function openNavigation()
     if navigationActive then return end
-    if not player or not mouse then
-        print("TARDIS NAV: LocalPlayer/mouse unavailable")
+    if not player then
+        print("TARDIS NAV: LocalPlayer unavailable")
         return
     end
 
@@ -244,10 +548,8 @@ local function openNavigation()
         return
     end
 
-    local center = findExteriorTardisPosition()
-    if not center then center = getFallbackCenter() end
-
-    navigationCenter = center
+    refreshLastKnownExteriorPosition()
+    navigationCenter = getNavigationCenter()
     navigationHeight = NAV_START_HEIGHT
 
     pcall(function() savedCameraType = camera.CameraType end)
@@ -262,8 +564,11 @@ local function openNavigation()
         camera.FieldOfView = 55
     end)
 
+    rebuildLandCandidates()
     makeNavigationGui()
     updateCamera()
+    lastCursorPosition = getCursorPosition()
+    lastLandUpdate = 0
     print("TARDIS NAV: OPEN")
 end
 
@@ -275,22 +580,101 @@ local function toggleNavigation()
     end
 end
 
-local function getMouseWorldPosition()
-    if not navigationActive or not mouse then return nil end
+local function applyZoom(direction)
+    local now = os.clock()
+    if now - lastZoomTime < 0.025 then return end
+    lastZoomTime = now
 
-    local hit = nil
-    pcall(function() hit = mouse.Hit end)
-    if not hit then return nil end
+    navigationHeight = math.clamp(
+        navigationHeight - direction * NAV_ZOOM_STEP,
+        NAV_MIN_HEIGHT,
+        NAV_MAX_HEIGHT
+    )
+    updateCamera()
+end
 
-    local position = nil
-    pcall(function() position = hit.Position end)
-    return position
+local function getRightButtonDown()
+    local pressed = rightDragging
+
+    if UserInputService then
+        local value = nil
+        pcall(function()
+            value = UserInputService:IsMouseButtonPressed(
+                Enum.UserInputType.MouseButton2
+            )
+        end)
+        if type(value) == "boolean" then pressed = value end
+    end
+
+    return pressed
+end
+
+local function updatePan()
+    if not navigationActive then return end
+
+    local cursor = getCursorPosition()
+    if not cursor then return end
+
+    local pressed = getRightButtonDown()
+    if not pressed then
+        rightButtonWasDown = false
+        lastCursorPosition = cursor
+        return
+    end
+
+    if not rightButtonWasDown or not lastCursorPosition then
+        rightButtonWasDown = true
+        lastCursorPosition = cursor
+        return
+    end
+
+    local delta = cursor - lastCursorPosition
+    lastCursorPosition = cursor
+
+    if math.abs(delta.X) < 0.01 and math.abs(delta.Y) < 0.01 then return end
+
+    local camera = getCamera()
+    if not camera then return end
+
+    local fov = 55
+    local viewportY = 720
+    pcall(function() fov = camera.FieldOfView end)
+    pcall(function() viewportY = math.max(camera.ViewportSize.Y, 1) end)
+
+    local worldPerPixel =
+        (2 * navigationHeight * math.tan(math.rad(fov) / 2)) / viewportY
+
+    local right = camera.CFrame.RightVector
+    local up = camera.CFrame.UpVector
+    local rightXZ = Vector3.new(right.X, 0, right.Z)
+    local upXZ = Vector3.new(up.X, 0, up.Z)
+
+    if rightXZ.Magnitude > 0.001 then rightXZ = rightXZ.Unit end
+    if upXZ.Magnitude > 0.001 then upXZ = upXZ.Unit end
+
+    -- Grab-map behavior: dragging the mouse moves the map with your hand.
+    navigationCenter = navigationCenter
+        - rightXZ * delta.X * worldPerPixel
+        + upXZ * delta.Y * worldPerPixel
+
+    updateCamera()
 end
 
 local function selectMouseDestination()
-    local position = getMouseWorldPosition()
+    if not navigationActive or getRightButtonDown() then return end
+
+    local now = os.clock()
+    if now - lastSelectTime < 0.12 then return end
+    lastSelectTime = now
+
+    local position = getCursorLandPosition() or hoverDestination
     if not position then
-        print("TARDIS NAV: no map point under cursor")
+        print("TARDIS NAV: no collidable land under cursor")
+        if navCoordinateLabel then
+            pcall(function()
+                navCoordinateLabel.Text = "NO COLLIDABLE LAND UNDER CURSOR"
+            end)
+        end
         return
     end
 
@@ -313,9 +697,31 @@ end
 if mouse then
     pcall(function()
         mouse.Button1Down:Connect(function()
-            if navigationActive and not rightDragging then
-                selectMouseDestination()
-            end
+            if navigationActive then selectMouseDestination() end
+        end)
+    end)
+
+    pcall(function()
+        mouse.Button2Down:Connect(function()
+            if navigationActive then rightDragging = true end
+        end)
+    end)
+
+    pcall(function()
+        mouse.Button2Up:Connect(function()
+            rightDragging = false
+        end)
+    end)
+
+    pcall(function()
+        mouse.WheelForward:Connect(function()
+            if navigationActive then applyZoom(1) end
+        end)
+    end)
+
+    pcall(function()
+        mouse.WheelBackward:Connect(function()
+            if navigationActive then applyZoom(-1) end
         end)
     end)
 end
@@ -330,7 +736,10 @@ if UserInputService then
                 return
             end
 
-            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            and not gameProcessed then
+                selectMouseDestination()
+            elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
                 rightDragging = true
             end
         end)
@@ -347,38 +756,27 @@ if UserInputService then
     pcall(function()
         UserInputService.InputChanged:Connect(function(input)
             if not navigationActive then return end
-
             if input.UserInputType == Enum.UserInputType.MouseWheel then
-                local wheel = input.Position.Z
-                navigationHeight = math.clamp(
-                    navigationHeight - wheel * NAV_ZOOM_STEP,
-                    NAV_MIN_HEIGHT,
-                    NAV_MAX_HEIGHT
-                )
-                updateCamera()
-                return
-            end
-
-            if rightDragging
-            and input.UserInputType == Enum.UserInputType.MouseMovement then
-                local scale = math.max(0.08, navigationHeight * NAV_PAN_SCALE)
-                navigationCenter = navigationCenter + Vector3.new(
-                    -input.Delta.X * scale,
-                    0,
-                    input.Delta.Y * scale
-                )
-                updateCamera()
+                applyZoom(input.Position.Z)
             end
         end)
     end)
 end
 
 local lastInputState = false
+local lastExteriorRefresh = 0
 
 print("TARDIS navigation ready")
 print("Wire navigation output A -> TARDIS controller input C")
 
 while true do
+    local now = os.clock()
+
+    if not navigationActive and now - lastExteriorRefresh >= 0.5 then
+        lastExteriorRefresh = now
+        refreshLastKnownExteriorPosition()
+    end
+
     local state = false
     pcall(function() state = inputA:GetState() == true end)
 
@@ -389,18 +787,32 @@ while true do
 
     if navigationActive then
         updateCamera()
+        updatePan()
 
-        local position = getMouseWorldPosition()
-        if position and navCoordinateLabel then
-            local x = math.floor(position.X * 10 + 0.5) / 10
-            local y = math.floor(position.Y * 10 + 0.5) / 10
-            local z = math.floor(position.Z * 10 + 0.5) / 10
-            pcall(function()
-                navCoordinateLabel.Text = string.format(
-                    "X %.1f    Y %.1f    Z %.1f    |    HEIGHT %.0f",
-                    x, y, z, navigationHeight
-                )
-            end)
+        if now - lastLandUpdate >= LAND_UPDATE_INTERVAL then
+            lastLandUpdate = now
+            hoverDestination = getCursorLandPosition()
+
+            if navCoordinateLabel then
+                if hoverDestination then
+                    local x = math.floor(hoverDestination.X * 10 + 0.5) / 10
+                    local y = math.floor(hoverDestination.Y * 10 + 0.5) / 10
+                    local z = math.floor(hoverDestination.Z * 10 + 0.5) / 10
+                    pcall(function()
+                        navCoordinateLabel.Text = string.format(
+                            "LAND: X %.1f    Y %.1f    Z %.1f    |    HEIGHT %.0f",
+                            x, y, z, navigationHeight
+                        )
+                    end)
+                else
+                    pcall(function()
+                        navCoordinateLabel.Text = string.format(
+                            "NO LAND UNDER CURSOR    |    HEIGHT %.0f",
+                            navigationHeight
+                        )
+                    end)
+                end
+            end
         end
     end
 
