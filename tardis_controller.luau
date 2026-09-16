@@ -573,6 +573,7 @@ local function getInputDestination()
 
     local rotation = requested - position
     local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
+    print("C LANDING:", "hintY", position.Y, "groundY", groundY, "pivotY", pivotY)
     return CFrame.new(position.X, pivotY, position.Z) * rotation
 end
 
@@ -711,13 +712,67 @@ findFloorY = function(x, z, maxY)
     return bestY
 end
 
--- Coordinate destinations use Y only as a rough ceiling hint. Scan downward
--- from just above it and choose the highest collidable surface, so stacked
--- roads/floors win over lower baseplates instead of burying the TARDIS.
+local function raycastCoordinateGroundY(x, z, preferredCeiling)
+    local params = nil
+
+    pcall(function()
+        params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+
+        local exclude = {}
+
+        for _, part in ipairs(moveParts) do
+            local raw = getRawPart(part)
+            if raw and typeof(raw) == "Instance" then
+                table.insert(exclude, raw)
+            end
+            if typeof(part) == "Instance" then
+                table.insert(exclude, part)
+            end
+        end
+
+        local Players = game:GetService("Players")
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player.Character then
+                table.insert(exclude, player.Character)
+            end
+        end
+
+        params.FilterDescendantsInstances = exclude
+        pcall(function() params.RespectCanCollide = true end)
+    end)
+
+    local result = nil
+    local origin = Vector3.new(x, preferredCeiling + 2, z)
+    local direction = Vector3.new(0, -20000, 0)
+
+    local ok = pcall(function()
+        result = workspace:Raycast(origin, direction, params)
+    end)
+
+    if ok and result then
+        local position = nil
+        pcall(function() position = result.Position end)
+        if position then
+            return position.Y
+        end
+    end
+
+    return nil
+end
+
+-- Coordinate destinations use Y as a rough ceiling hint. Prefer a real Roblox
+-- downward ray so unions/terrain use their actual visible surface; only fall
+-- back to the older wrapper-box scan if raycasting is unavailable in Fiu.
 findFloorNearY = function(x, z, hintY)
-    local bestY = nil
     local preferredCeiling = hintY + 8
 
+    local rayY = raycastCoordinateGroundY(x, z, preferredCeiling)
+    if rayY ~= nil then
+        return rayY
+    end
+
+    local bestY = nil
     for _, part in ipairs(workspace:GetDescendants(true)) do
         local hitY = floorHitY(part, x, z, preferredCeiling)
         if hitY and (bestY == nil or hitY > bestY) then
