@@ -15,9 +15,18 @@ local NAV_START_HEIGHT = 450
 local NAV_MIN_HEIGHT = 80
 local NAV_MAX_HEIGHT = 1800
 local NAV_ZOOM_STEP = 70
+local NAV_CAMERA_SMOOTHNESS = 12
 local UPDATE_INTERVAL = 1 / 60
 local LAND_UPDATE_INTERVAL = 0.08
 local MAX_RAY_DISTANCE = 20000
+
+-- The main controller scans for coordinate floors up to hintY + 8. Navigation
+-- already knows the exact ground surface, so send a Y hint 7 studs below it.
+-- That makes the controller scan only about 1 stud above the clicked ground and
+-- prevents roofs, props, or the current TARDIS from becoming the landing floor.
+local CONTROLLER_COORDINATE_CEILING_PAD = 8
+local NAV_GROUND_SCAN_HEADROOM = 1
+local NAV_OUTPUT_Y_BIAS = CONTROLLER_COORDINATE_CEILING_PAD - NAV_GROUND_SCAN_HEADROOM
 
 -- Matches the hidden exterior staging point in the main controller. We only use
 -- this to avoid centering the nav camera there while the TARDIS is dematerialized.
@@ -36,7 +45,9 @@ if player then pcall(function() mouse = player:GetMouse() end) end
 
 local navigationActive = false
 local navigationHeight = NAV_START_HEIGHT
+local navigationTargetHeight = NAV_START_HEIGHT
 local navigationCenter = Vector3.new(0, 0, 0)
+local navigationTargetCenter = Vector3.new(0, 0, 0)
 local rightDragging = false
 local rightButtonWasDown = false
 local lastCursorPosition = nil
@@ -46,6 +57,7 @@ local hoverDestination = nil
 local lastLandUpdate = 0
 local lastSelectTime = 0
 local lastZoomTime = 0
+local lastLoopTime = os.clock()
 
 local savedCameraType = nil
 local savedCameraCFrame = nil
@@ -158,7 +170,7 @@ local function getCamera()
     return camera
 end
 
-local function updateCamera()
+local function writeCameraCFrame()
     if not navigationActive then return end
 
     local camera = getCamera()
@@ -172,6 +184,26 @@ local function updateCamera()
 
     local cf = CFrame.new(cameraPosition) * CFrame.Angles(-math.pi / 2, 0, 0)
     pcall(function() camera.CFrame = cf end)
+end
+
+local function updateSmoothCamera(dt)
+    if not navigationActive then return end
+
+    dt = math.clamp(dt or UPDATE_INTERVAL, 0, 0.1)
+    local alpha = 1 - math.exp(-NAV_CAMERA_SMOOTHNESS * dt)
+
+    navigationCenter = navigationCenter
+        + (navigationTargetCenter - navigationCenter) * alpha
+    navigationHeight = navigationHeight
+        + (navigationTargetHeight - navigationHeight) * alpha
+
+    writeCameraCFrame()
+end
+
+local function snapCameraToTarget()
+    navigationCenter = navigationTargetCenter
+    navigationHeight = navigationTargetHeight
+    writeCameraCFrame()
 end
 
 local function getCursorPosition()
@@ -288,7 +320,6 @@ local function rebuildLandCandidates()
 
     local descendants = workspace:GetDescendants(true)
 
-    -- First collect exterior/helper parts that should never count as terrain.
     for _, block in ipairs(descendants) do
         if block ~= script and nameShouldBeIgnored(block) then
             local target = getGeometryTarget(block)
@@ -311,8 +342,6 @@ local function rebuildLandCandidates()
         end
     end
 
-    -- Prefer Roblox's true geometry raycast when the sandbox allows it. This
-    -- handles unions/terrain accurately; the OBB scanner below is the fallback.
     pcall(function()
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
@@ -402,8 +431,6 @@ local function getCursorLandPosition()
     local origin, direction = getCameraRay()
     if not origin or not direction then return nil end
 
-    -- Accurate path first: real Roblox raycast, including Terrain and actual
-    -- union geometry. If Fiu blocks it, fall back to cached collidable boxes.
     if navRaycastParams then
         local result = nil
         local ok = pcall(function()
@@ -549,8 +576,11 @@ local function openNavigation()
     end
 
     refreshLastKnownExteriorPosition()
-    navigationCenter = getNavigationCenter()
+    local center = getNavigationCenter()
+    navigationCenter = center
+    navigationTargetCenter = center
     navigationHeight = NAV_START_HEIGHT
+    navigationTargetHeight = NAV_START_HEIGHT
 
     pcall(function() savedCameraType = camera.CameraType end)
     pcall(function() savedCameraCFrame = camera.CFrame end)
@@ -566,9 +596,10 @@ local function openNavigation()
 
     rebuildLandCandidates()
     makeNavigationGui()
-    updateCamera()
+    snapCameraToTarget()
     lastCursorPosition = getCursorPosition()
     lastLandUpdate = 0
+    lastLoopTime = os.clock()
     print("TARDIS NAV: OPEN")
 end
 
@@ -585,12 +616,11 @@ local function applyZoom(direction)
     if now - lastZoomTime < 0.025 then return end
     lastZoomTime = now
 
-    navigationHeight = math.clamp(
-        navigationHeight - direction * NAV_ZOOM_STEP,
+    navigationTargetHeight = math.clamp(
+        navigationTargetHeight - direction * NAV_ZOOM_STEP,
         NAV_MIN_HEIGHT,
         NAV_MAX_HEIGHT
     )
-    updateCamera()
 end
 
 local function getRightButtonDown()
@@ -609,7 +639,7 @@ local function getRightButtonDown()
     return pressed
 end
 
-local function updatePan()
+local function updatePanInput()
     if not navigationActive then return end
 
     local cursor = getCursorPosition()
@@ -652,12 +682,9 @@ local function updatePan()
     if rightXZ.Magnitude > 0.001 then rightXZ = rightXZ.Unit end
     if upXZ.Magnitude > 0.001 then upXZ = upXZ.Unit end
 
-    -- Grab-map behavior: dragging the mouse moves the map with your hand.
-    navigationCenter = navigationCenter
+    navigationTargetCenter = navigationTargetCenter
         - rightXZ * delta.X * worldPerPixel
         + upXZ * delta.Y * worldPerPixel
-
-    updateCamera()
 end
 
 local function selectMouseDestination()
@@ -678,10 +705,18 @@ local function selectMouseDestination()
         return
     end
 
+    -- Keep the real clicked ground for navigation recentering, but send a lower
+    -- Y hint to C. The main controller then finds the actual surface itself with
+    -- a ceiling only ~1 stud above this exact ground point.
     lastSelectedDestination = Vector3.new(position.X, position.Y, position.Z)
+    local controllerDestination = Vector3.new(
+        position.X,
+        position.Y - NAV_OUTPUT_Y_BIAS,
+        position.Z
+    )
 
     pcall(function()
-        outputA:SetState(lastSelectedDestination)
+        outputA:SetState(controllerDestination)
     end)
 
     print(
@@ -771,6 +806,8 @@ print("Wire navigation output A -> TARDIS controller input C")
 
 while true do
     local now = os.clock()
+    local dt = math.clamp(now - lastLoopTime, 0, 0.1)
+    lastLoopTime = now
 
     if not navigationActive and now - lastExteriorRefresh >= 0.5 then
         lastExteriorRefresh = now
@@ -786,8 +823,8 @@ while true do
     lastInputState = state
 
     if navigationActive then
-        updateCamera()
-        updatePan()
+        updatePanInput()
+        updateSmoothCamera(dt)
 
         if now - lastLandUpdate >= LAND_UPDATE_INTERVAL then
             lastLandUpdate = now
