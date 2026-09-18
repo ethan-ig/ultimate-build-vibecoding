@@ -2,13 +2,22 @@
 -- A: true=materialized, false=dematerialized
 -- B: optional player name target (partial names accepted)
 -- C: normal destination (Vector3/CFrame)
--- J: recall (demat, then remat on local player)
+-- D: fast materialization toggle
+-- E: quick recall to local player (fast demat + fast remat)
+-- F: quick destination cycle (fast demat + B/C fast remat)
+-- J: normal recall (demat, then remat on local player)
 -- No Code outputs are required.
 
 local inputA = script.inputs["a"]
 local inputB = nil
 pcall(function() inputB = script.inputs["b"] end)
 local inputC = script.inputs["c"]
+local inputD = nil
+local inputE = nil
+local inputF = nil
+pcall(function() inputD = script.inputs["d"] end)
+pcall(function() inputE = script.inputs["e"] end)
+pcall(function() inputF = script.inputs["f"] end)
 local inputJ = script.inputs["j"]
 
 local SHELL_NAME = "Tardis"
@@ -46,6 +55,12 @@ local RECALL_GROUND_CLEARANCE = 0.10
 local SOUND_VOLUME = 1
 local SOUND_PITCH = 1
 
+-- Fast transitions are intentionally independent of the normal audio clock.
+-- D only accelerates materialization; E/F force both halves of their cycle fast.
+local FAST_FADE_TIME = 1.15
+local FAST_TAIL_TIME = 0.15
+local FAST_SOUND_PITCH = 2.35
+
 local function getBlockValue(block, key)
     if not block then return nil end
 
@@ -78,6 +93,17 @@ local function getDisplayName(part)
     local value = getBlockValue(part, "DisplayName")
     if type(value) == "string" and value ~= "" then return value end
     return nil
+end
+
+local function getOptionalBoolInput(input)
+    if not input then return false end
+    local state = false
+    pcall(function() state = input:GetState() == true end)
+    return state
+end
+
+local function fastMaterializationEnabled()
+    return getOptionalBoolInput(inputD)
 end
 
 local function findNamedBlock(name)
@@ -164,6 +190,13 @@ local function getMirroredSound(block)
     if block == interiorDematSound then return dematSound end
     if block == interiorMatSound then return matSound end
     return nil
+end
+
+local function setTransitionSoundPitch(block, pitch)
+    if not block then return end
+    setBlockValue(block, "Pitch", pitch)
+    local mirror = getMirroredSound(block)
+    if mirror then setBlockValue(mirror, "Pitch", pitch) end
 end
 
 local function stopSound(block)
@@ -895,6 +928,8 @@ local currentFade = inputState and 0 or 1
 local hidden = not inputState
 local lastInputState = inputState
 local lastJState = false
+local lastEState = false
+local lastFState = false
 local activeTransition = nil
 local autoSequence = false
 
@@ -914,7 +949,8 @@ local function prepareMaterialization(kind)
     setLightEffect(1, 0, false)
 
     local destination
-    if kind == "auto_materialize" then
+    if kind == "auto_materialize"
+    or kind == "quick_recall_materialize" then
         destination = getCharacterDestination()
     else
         destination = getPlayerInputDestination()
@@ -960,9 +996,10 @@ local function updateWaveEnvelope(transition, soundTime)
     return transition.waveEnvelope
 end
 
-local function startTransition(kind, targetFade, sound, actualSound)
+local function startTransition(kind, targetFade, sound, actualSound, fast)
     if activeTransition and activeTransition.sound then
         stopSound(activeTransition.sound)
+        setTransitionSoundPitch(activeTransition.sound, SOUND_PITCH)
     end
     activeTransition = nil
 
@@ -984,7 +1021,9 @@ local function startTransition(kind, targetFade, sound, actualSound)
         seekPosition = VISUAL_START_TIME + linearProgress * (visualEnd - VISUAL_START_TIME)
     end
 
-    playSound(sound, seekPosition)
+    local useFast = fast == true
+    setTransitionSoundPitch(sound, useFast and FAST_SOUND_PITCH or SOUND_PITCH)
+    playSound(sound, useFast and 0 or seekPosition)
 
     activeTransition = {
         kind = kind,
@@ -993,6 +1032,8 @@ local function startTransition(kind, targetFade, sound, actualSound)
         actualSound = actualSound,
         visualEnd = visualEnd,
         requestTime = os.clock(),
+        startFade = currentFade,
+        fast = useFast,
         maxSoundTime = seekPosition,
         visualComplete = false,
         fallback = false,
@@ -1003,12 +1044,13 @@ local function startTransition(kind, targetFade, sound, actualSound)
     }
 end
 
-local function requestDemat(kind)
-    startTransition(kind, 1, dematSound, dematSoundInstance)
+local function requestDemat(kind, forceFast)
+    startTransition(kind, 1, dematSound, dematSoundInstance, forceFast == true)
 end
 
-local function requestMaterialize(kind)
-    startTransition(kind, 0, matSound, matSoundInstance)
+local function requestMaterialize(kind, forceFast)
+    local useFast = forceFast == true or fastMaterializationEnabled()
+    startTransition(kind, 0, matSound, matSoundInstance, useFast)
 end
 
 local function finishTransition(transition)
@@ -1016,6 +1058,7 @@ local function finishTransition(transition)
 
     activeTransition = nil
     stopSound(transition.sound)
+    setTransitionSoundPitch(transition.sound, SOUND_PITCH)
 
     if transition.targetFade >= 1 then
         currentFade = 1
@@ -1026,6 +1069,10 @@ local function finishTransition(transition)
 
         if transition.kind == "auto_demat" then
             requestMaterialize("auto_materialize")
+        elseif transition.kind == "quick_recall_demat" then
+            requestMaterialize("quick_recall_materialize", true)
+        elseif transition.kind == "quick_destination_demat" then
+            requestMaterialize("quick_destination_materialize", true)
         end
     else
         currentFade = 0
@@ -1037,6 +1084,14 @@ local function finishTransition(transition)
             autoSequence = false
             lastInputState = inputA:GetState() == true
             print("J RECALL COMPLETE")
+        elseif transition.kind == "quick_recall_materialize" then
+            autoSequence = false
+            lastInputState = inputA:GetState() == true
+            print("E QUICK RECALL COMPLETE")
+        elseif transition.kind == "quick_destination_materialize" then
+            autoSequence = false
+            lastInputState = inputA:GetState() == true
+            print("F QUICK DESTINATION COMPLETE")
         end
     end
 end
@@ -1046,6 +1101,40 @@ local function updateTransition()
     if not transition then return end
 
     local now = os.clock()
+
+    if transition.fast then
+        local startFade = transition.startFade or currentFade
+        local fadeDistance = math.abs(transition.targetFade - startFade)
+        local duration = math.max(0.08, FAST_FADE_TIME * math.max(fadeDistance, 0.08))
+        local elapsed = now - transition.requestTime
+        local linearProgress = math.clamp(elapsed / duration, 0, 1)
+        local progress = getAggressiveProgress(linearProgress)
+        local baseFade = startFade
+            + (transition.targetFade - startFade) * progress
+        currentFade = baseFade
+
+        local wave = syntheticWave(elapsed * FAST_SOUND_PITCH)
+        local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
+        setLightEffect(waveFade, wave, true)
+
+        if now - lastFadeWrite >= fadeUpdateInterval then
+            lastFadeWrite = now
+            setFadePartsTransparency(waveFade)
+        end
+
+        if linearProgress >= 1 and not transition.visualComplete then
+            transition.visualComplete = true
+            currentFade = transition.targetFade
+            setFadePartsTransparency(transition.targetFade)
+            setLightEffect(transition.targetFade, wave, true)
+        end
+
+        if elapsed >= duration + FAST_TAIL_TIME then
+            finishTransition(transition)
+        end
+        return
+    end
+
     local sound = transition.sound
     local soundTime = tonumber(getBlockValue(sound, "TimePosition"))
     local isPlaying = getBlockValue(sound, "IsPlaying") == true
@@ -1164,6 +1253,38 @@ local function startAutoRecall()
         requestDemat("auto_demat")
     end
 end
+
+local function startQuickRecall()
+    print("E QUICK RECALL START")
+    autoSequence = true
+
+    if hidden or currentFade >= 1 then
+        currentFade = 1
+        setFadePartsTransparency(1)
+        setLightEffect(1, 0, false)
+        hidden = true
+        requestMaterialize("quick_recall_materialize", true)
+    else
+        requestDemat("quick_recall_demat", true)
+    end
+end
+
+local function startQuickDestination()
+    print("F QUICK DESTINATION START")
+    autoSequence = true
+
+    if hidden or currentFade >= 1 then
+        currentFade = 1
+        setFadePartsTransparency(1)
+        setLightEffect(1, 0, false)
+        hidden = true
+        requestMaterialize("quick_destination_materialize", true)
+    else
+        requestDemat("quick_destination_demat", true)
+    end
+end
+
+print("TARDIS fast controls: D=fast materialize, E=quick recall, F=quick B/C cycle")
 
 -- Interior time rotor animation. It runs while dematting, fully dematerialized,
 -- and rematerializing. Once the exterior is fully solid again it pauses exactly
@@ -1320,12 +1441,22 @@ local function updateTimeRotorFallback()
 end
 
 while true do
-    local jState = inputJ:GetState() == true
+    local eState = getOptionalBoolInput(inputE)
+    if eState and not lastEState and not autoSequence then
+        startQuickRecall()
+    end
+    lastEState = eState
 
+    local fState = getOptionalBoolInput(inputF)
+    if fState and not lastFState and not autoSequence then
+        startQuickDestination()
+    end
+    lastFState = fState
+
+    local jState = inputJ:GetState() == true
     if jState and not lastJState and not autoSequence then
         startAutoRecall()
     end
-
     lastJState = jState
 
     if not autoSequence then
