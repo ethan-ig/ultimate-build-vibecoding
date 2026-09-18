@@ -21,9 +21,7 @@ pcall(function() inputF = script.inputs["f"] end)
 local inputJ = script.inputs["j"]
 
 local SHELL_NAME = "Tardis"
-local DEMAT_SOUND_NAME = "TardisDematSound"
 local MAT_SOUND_NAME = "TardisMatSound"
-local INTERIOR_DEMAT_SOUND_NAME = "InteriorTardisDematSound"
 local INTERIOR_MAT_SOUND_NAME = "InteriorTardisMatSound"
 local LIGHT_NAME = "Tardislight"
 local PORTAL_NAME = "tardisportal"
@@ -53,13 +51,18 @@ local LIGHT_PEAK_BRIGHTNESS_MULT = 4.0
 local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
 local RECALL_GROUND_CLEARANCE = 0.10
 local SOUND_VOLUME = 1
-local SOUND_PITCH = 1
 
--- Fast transitions use the complete SoundBlock, just played faster.
--- D accelerates both dematerialization and materialization; E/F always force fast mode.
-local FAST_FADE_TIME = 1.15 -- fallback only when SoundBlock length is unavailable
+-- One exterior SoundBlock + one mirrored interior SoundBlock are reused for every
+-- transition. The controller swaps the asset and pitch immediately before playback.
+local SOUND_PROFILES = {
+    materialize_normal = { id = "142277519", pitch = 1.000 },
+    materialize_quick = { id = "140477091", pitch = 0.735 },
+    demat_normal = { id = "135858826", pitch = 0.633 },
+    demat_quick = { id = "135858448", pitch = 1.000 },
+}
+
+local FAST_FADE_TIME = 1.15 -- fallback only when the SoundBlock clock is unavailable
 local FAST_TAIL_TIME = 0.15
-local FAST_SOUND_PITCH = 2.35
 
 local function getBlockValue(block, key)
     if not block then return nil end
@@ -118,15 +121,11 @@ local function findNamedBlock(name)
     return nil
 end
 
-local dematSound = findNamedBlock(DEMAT_SOUND_NAME)
 local matSound = findNamedBlock(MAT_SOUND_NAME)
-local interiorDematSound = findNamedBlock(INTERIOR_DEMAT_SOUND_NAME)
 local interiorMatSound = findNamedBlock(INTERIOR_MAT_SOUND_NAME)
 local tardisLight = findNamedBlock(LIGHT_NAME)
 
-print(dematSound and "FOUND: TardisDematSound" or "ERROR: missing TardisDematSound")
 print(matSound and "FOUND: TardisMatSound" or "ERROR: missing TardisMatSound")
-print(interiorDematSound and "FOUND: InteriorTardisDematSound" or "WARNING: missing InteriorTardisDematSound")
 print(interiorMatSound and "FOUND: InteriorTardisMatSound" or "WARNING: missing InteriorTardisMatSound")
 print(tardisLight and "FOUND: Tardislight" or "WARNING: missing Tardislight")
 
@@ -175,28 +174,16 @@ local function configureSound(block)
     setBlockValue(block, "Repeat", false)
     setBlockValue(block, "ResetTimePosition", false)
     setBlockValue(block, "Volume", SOUND_VOLUME)
-    setBlockValue(block, "Pitch", SOUND_PITCH)
     setBlockValue(block, "Effects", false)
 end
 
-configureSound(dematSound)
 configureSound(matSound)
-configureSound(interiorDematSound)
 configureSound(interiorMatSound)
 
 local function getMirroredSound(block)
-    if block == dematSound then return interiorDematSound end
     if block == matSound then return interiorMatSound end
-    if block == interiorDematSound then return dematSound end
     if block == interiorMatSound then return matSound end
     return nil
-end
-
-local function setTransitionSoundPitch(block, pitch)
-    if not block then return end
-    setBlockValue(block, "Pitch", pitch)
-    local mirror = getMirroredSound(block)
-    if mirror then setBlockValue(mirror, "Pitch", pitch) end
 end
 
 local function stopSound(block)
@@ -258,11 +245,10 @@ local function findActualSoundInstance(block)
     return nil
 end
 
-local dematSoundInstance = findActualSoundInstance(dematSound)
 local matSoundInstance = findActualSoundInstance(matSound)
+local interiorMatSoundInstance = findActualSoundInstance(interiorMatSound)
 
-print(dematSoundInstance and "DEMAT PlaybackLoudness available" or "DEMAT loudness fallback enabled")
-print(matSoundInstance and "MAT PlaybackLoudness available" or "MAT loudness fallback enabled")
+print(matSoundInstance and "TARDIS transition PlaybackLoudness available" or "TARDIS transition loudness fallback enabled")
 
 local function getPlaybackLoudness(block, actualSound)
     if actualSound then
@@ -310,10 +296,8 @@ for _, part in ipairs(workspace:GetDescendants(true)) do
     end
 end
 
-addPart(moveParts, dematSound)
 addPart(moveParts, matSound)
 addPart(moveParts, tardisLight)
-addPart(fadeParts, dematSound)
 addPart(fadeParts, matSound)
 
 local function getRawPart(block)
@@ -911,6 +895,41 @@ end
 
 local hiddenPivot = CFrame.new(HIDDEN_POSITION) * defaultRotation
 
+local function setActualSoundProfile(actualSound, assetId, pitch)
+    if not actualSound then return end
+    pcall(function() actualSound.SoundId = "rbxassetid://" .. tostring(assetId) end)
+    pcall(function() actualSound.PlaybackSpeed = pitch end)
+end
+
+local function applySoundProfile(profile)
+    if not profile then return end
+
+    local assetId = tostring(profile.id)
+    local soundId = "rbxassetid://" .. assetId
+    local pitch = tonumber(profile.pitch) or 1
+
+    for _, block in ipairs({ matSound, interiorMatSound }) do
+        if block then
+            -- SoundBlock builds have used both numeric-looking and Roblox-style IDs;
+            -- setting SoundId to the canonical Roblox string covers the normal property.
+            setBlockValue(block, "SoundId", soundId)
+            setBlockValue(block, "Pitch", pitch)
+        end
+    end
+
+    setActualSoundProfile(matSoundInstance, assetId, pitch)
+    setActualSoundProfile(interiorMatSoundInstance, assetId, pitch)
+
+    print("TARDIS SOUND:", assetId, "pitch", pitch)
+end
+
+local function getTransitionSoundProfile(targetFade, quick)
+    if targetFade >= 1 then
+        return quick and SOUND_PROFILES.demat_quick or SOUND_PROFILES.demat_normal
+    end
+    return quick and SOUND_PROFILES.materialize_quick or SOUND_PROFILES.materialize_normal
+end
+
 local function getSoundLength(block)
     return tonumber(getBlockValue(block, "TimeLength")) or 0
 end
@@ -996,10 +1015,9 @@ local function updateWaveEnvelope(transition, soundTime)
     return transition.waveEnvelope
 end
 
-local function startTransition(kind, targetFade, sound, actualSound, fast)
+local function startTransition(kind, targetFade, fast)
     if activeTransition and activeTransition.sound then
         stopSound(activeTransition.sound)
-        setTransitionSoundPitch(activeTransition.sound, SOUND_PITCH)
     end
     activeTransition = nil
 
@@ -1008,28 +1026,36 @@ local function startTransition(kind, targetFade, sound, actualSound, fast)
         return
     end
 
-    if sound == dematSound then stopSound(matSound) else stopSound(dematSound) end
+    local useFast = fast == true
+    local profile = getTransitionSoundProfile(targetFade, useFast)
+    applySoundProfile(profile)
 
+    -- Let the SoundBlock/underlying Sound accept the new asset before playback.
+    task.wait()
+
+    local sound = matSound
+    local actualSound = matSoundInstance
     local visualEnd = getVisualEndTime(sound)
     local visualProgress = targetFade >= 1 and currentFade or (1 - currentFade)
     visualProgress = math.clamp(visualProgress, 0, 1)
 
-    -- Undo the aggressive curve when mapping current transparency back to audio time.
+    -- Normal reversals can resume partway through their selected source. Quick
+    -- transitions always start their dedicated quick asset from the beginning.
     local linearProgress = math.pow(visualProgress, 1 / AGGRESSIVE_PROGRESS_POWER)
     local seekPosition = 0
-    if visualProgress > 0.01 then
+    if not useFast and visualProgress > 0.01 then
         seekPosition = VISUAL_START_TIME + linearProgress * (visualEnd - VISUAL_START_TIME)
     end
 
-    local useFast = fast == true
-    setTransitionSoundPitch(sound, useFast and FAST_SOUND_PITCH or SOUND_PITCH)
-    playSound(sound, useFast and 0 or seekPosition)
+    playSound(sound, seekPosition)
 
     activeTransition = {
         kind = kind,
         targetFade = targetFade,
         sound = sound,
         actualSound = actualSound,
+        soundPitch = tonumber(profile.pitch) or 1,
+        soundId = profile.id,
         visualEnd = visualEnd,
         requestTime = os.clock(),
         startFade = currentFade,
@@ -1047,12 +1073,12 @@ end
 
 local function requestDemat(kind, forceFast)
     local useFast = forceFast == true or fastTravelEnabled()
-    startTransition(kind, 1, dematSound, dematSoundInstance, useFast)
+    startTransition(kind, 1, useFast)
 end
 
 local function requestMaterialize(kind, forceFast)
     local useFast = forceFast == true or fastTravelEnabled()
-    startTransition(kind, 0, matSound, matSoundInstance, useFast)
+    startTransition(kind, 0, useFast)
 end
 
 local function finishTransition(transition)
@@ -1060,7 +1086,6 @@ local function finishTransition(transition)
 
     activeTransition = nil
     stopSound(transition.sound)
-    setTransitionSoundPitch(transition.sound, SOUND_PITCH)
 
     if transition.targetFade >= 1 then
         currentFade = 1
@@ -1117,18 +1142,20 @@ local function updateTransition()
             transition.maxSoundTime = soundTime
         end
 
-        -- Pitch shortens the real playback time. Use that complete sped-up audio
-        -- duration as the visual clock so the sound is never chopped off.
-        local spedSoundDuration = nil
+        -- The quick assets have their own requested pitch. Use the complete
+        -- pitched playback duration as the wall-clock fallback if the SoundBlock
+        -- does not expose a reliable IsPlaying/TimePosition clock.
+        local pitchedSoundDuration = nil
+        local soundPitch = math.max(transition.soundPitch or 1, 0.01)
         if timeLength > 0 then
-            spedSoundDuration = timeLength / math.max(FAST_SOUND_PITCH, 0.01)
+            pitchedSoundDuration = timeLength / soundPitch
         end
 
         local startFade = transition.startFade or currentFade
         local fadeDistance = math.abs(transition.targetFade - startFade)
         local duration = FAST_FADE_TIME
-        if spedSoundDuration then
-            duration = math.max(0.08, spedSoundDuration - FAST_TAIL_TIME)
+        if pitchedSoundDuration then
+            duration = math.max(0.08, pitchedSoundDuration - FAST_TAIL_TIME)
         end
         duration = math.max(0.08, duration * math.max(fadeDistance, 0.08))
 
@@ -1138,7 +1165,7 @@ local function updateTransition()
             + (transition.targetFade - startFade) * progress
         currentFade = baseFade
 
-        local waveTime = soundTime or (elapsed * FAST_SOUND_PITCH)
+        local waveTime = soundTime or (elapsed * (transition.soundPitch or 1))
         local wave = updateWaveEnvelope(transition, waveTime)
         local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
         setLightEffect(waveFade, wave, true)
@@ -1172,13 +1199,13 @@ local function updateTransition()
 
         -- Ultimate Build sometimes fails to expose IsPlaying/TimePosition. In that
         -- case wait the full mathematically sped-up duration before stopping it.
-        if spedSoundDuration
-        and elapsed >= spedSoundDuration + 0.05 then
+        if pitchedSoundDuration
+        and elapsed >= pitchedSoundDuration + 0.05 then
             soundFinished = true
         end
 
         -- Last-resort fallback when no SoundBlock length/clock is available.
-        if not spedSoundDuration
+        if not pitchedSoundDuration
         and not transition.fastSawPlaying
         and elapsed >= FAST_FADE_TIME + FAST_TAIL_TIME then
             soundFinished = true
@@ -1339,7 +1366,8 @@ local function startQuickDestination()
     end
 end
 
-print("TARDIS fast controls: D=fast demat+remat, E=quick recall, F=quick B/C cycle")
+print("TARDIS fast controls: D=quick-sound demat+remat, E=quick recall, F=quick B/C cycle")
+print("TARDIS audio: one exterior + one mirrored interior SoundBlock")
 
 -- Interior time rotor animation. It runs while dematting, fully dematerialized,
 -- and rematerializing. Once the exterior is fully solid again it pauses exactly
