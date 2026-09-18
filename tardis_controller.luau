@@ -63,6 +63,8 @@ local SOUND_PROFILES = {
 
 local FAST_FADE_TIME = 1.15 -- fallback only when the SoundBlock clock is unavailable
 local FAST_TAIL_TIME = 0.15
+local FAST_VISUAL_FRACTION = 0.52 -- reach fully dematted/rematted this far through quick audio
+local FAST_PROGRESS_POWER = 0.42 -- stronger visual change earlier in the quick transition
 
 local function getBlockValue(block, key)
     if not block then return nil end
@@ -1155,12 +1157,15 @@ local function updateTransition()
         local fadeDistance = math.abs(transition.targetFade - startFade)
         local duration = FAST_FADE_TIME
         if pitchedSoundDuration then
-            duration = math.max(0.08, pitchedSoundDuration - FAST_TAIL_TIME)
+            -- Quick travel should visibly finish well before the sound does.
+            -- The remainder of the audio plays while the box is held at the
+            -- fully dematted/rematted endpoint.
+            duration = math.max(0.08, pitchedSoundDuration * FAST_VISUAL_FRACTION)
         end
         duration = math.max(0.08, duration * math.max(fadeDistance, 0.08))
 
         local linearProgress = math.clamp(elapsed / duration, 0, 1)
-        local progress = getAggressiveProgress(linearProgress)
+        local progress = math.pow(linearProgress, FAST_PROGRESS_POWER)
         local baseFade = startFade
             + (transition.targetFade - startFade) * progress
         currentFade = baseFade
@@ -1168,6 +1173,14 @@ local function updateTransition()
         local waveTime = soundTime or (elapsed * (transition.soundPitch or 1))
         local wave = updateWaveEnvelope(transition, waveTime)
         local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
+
+        if linearProgress >= 1 then
+            -- Once quick travel reaches its endpoint, pin it there. Do not let
+            -- waveform modulation make the box look partly present again.
+            waveFade = transition.targetFade
+            currentFade = transition.targetFade
+        end
+
         setLightEffect(waveFade, wave, true)
 
         if now - lastFadeWrite >= fadeUpdateInterval then
