@@ -2,7 +2,7 @@
 -- A: true=materialized, false=dematerialized
 -- B: optional player name target (partial names accepted)
 -- C: normal destination (Vector3/CFrame)
--- D: fast materialization toggle
+-- D: fast travel toggle (fast demat + fast remat)
 -- E: quick recall to local player (fast demat + fast remat)
 -- F: quick destination cycle (fast demat + B/C fast remat)
 -- J: normal recall (demat, then remat on local player)
@@ -55,9 +55,9 @@ local RECALL_GROUND_CLEARANCE = 0.10
 local SOUND_VOLUME = 1
 local SOUND_PITCH = 1
 
--- Fast transitions are intentionally independent of the normal audio clock.
--- D only accelerates materialization; E/F force both halves of their cycle fast.
-local FAST_FADE_TIME = 1.15
+-- Fast transitions use the complete SoundBlock, just played faster.
+-- D accelerates both dematerialization and materialization; E/F always force fast mode.
+local FAST_FADE_TIME = 1.15 -- fallback only when SoundBlock length is unavailable
 local FAST_TAIL_TIME = 0.15
 local FAST_SOUND_PITCH = 2.35
 
@@ -102,7 +102,7 @@ local function getOptionalBoolInput(input)
     return state
 end
 
-local function fastMaterializationEnabled()
+local function fastTravelEnabled()
     return getOptionalBoolInput(inputD)
 end
 
@@ -1034,6 +1034,7 @@ local function startTransition(kind, targetFade, sound, actualSound, fast)
         requestTime = os.clock(),
         startFade = currentFade,
         fast = useFast,
+        fastSawPlaying = false,
         maxSoundTime = seekPosition,
         visualComplete = false,
         fallback = false,
@@ -1045,11 +1046,12 @@ local function startTransition(kind, targetFade, sound, actualSound, fast)
 end
 
 local function requestDemat(kind, forceFast)
-    startTransition(kind, 1, dematSound, dematSoundInstance, forceFast == true)
+    local useFast = forceFast == true or fastTravelEnabled()
+    startTransition(kind, 1, dematSound, dematSoundInstance, useFast)
 end
 
 local function requestMaterialize(kind, forceFast)
-    local useFast = forceFast == true or fastMaterializationEnabled()
+    local useFast = forceFast == true or fastTravelEnabled()
     startTransition(kind, 0, matSound, matSoundInstance, useFast)
 end
 
@@ -1103,17 +1105,41 @@ local function updateTransition()
     local now = os.clock()
 
     if transition.fast then
+        local elapsed = now - transition.requestTime
+        local soundTime = tonumber(getBlockValue(transition.sound, "TimePosition"))
+        local isPlaying = getBlockValue(transition.sound, "IsPlaying") == true
+        local timeLength = getSoundLength(transition.sound)
+
+        if isPlaying then
+            transition.fastSawPlaying = true
+        end
+        if soundTime and soundTime > transition.maxSoundTime then
+            transition.maxSoundTime = soundTime
+        end
+
+        -- Pitch shortens the real playback time. Use that complete sped-up audio
+        -- duration as the visual clock so the sound is never chopped off.
+        local spedSoundDuration = nil
+        if timeLength > 0 then
+            spedSoundDuration = timeLength / math.max(FAST_SOUND_PITCH, 0.01)
+        end
+
         local startFade = transition.startFade or currentFade
         local fadeDistance = math.abs(transition.targetFade - startFade)
-        local duration = math.max(0.08, FAST_FADE_TIME * math.max(fadeDistance, 0.08))
-        local elapsed = now - transition.requestTime
+        local duration = FAST_FADE_TIME
+        if spedSoundDuration then
+            duration = math.max(0.08, spedSoundDuration - FAST_TAIL_TIME)
+        end
+        duration = math.max(0.08, duration * math.max(fadeDistance, 0.08))
+
         local linearProgress = math.clamp(elapsed / duration, 0, 1)
         local progress = getAggressiveProgress(linearProgress)
         local baseFade = startFade
             + (transition.targetFade - startFade) * progress
         currentFade = baseFade
 
-        local wave = syntheticWave(elapsed * FAST_SOUND_PITCH)
+        local waveTime = soundTime or (elapsed * FAST_SOUND_PITCH)
+        local wave = updateWaveEnvelope(transition, waveTime)
         local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
         setLightEffect(waveFade, wave, true)
 
@@ -1129,7 +1155,36 @@ local function updateTransition()
             setLightEffect(transition.targetFade, wave, true)
         end
 
-        if elapsed >= duration + FAST_TAIL_TIME then
+        local soundFinished = false
+
+        -- Best signal: the source timeline actually reached the end.
+        if timeLength > 0 and transition.maxSoundTime >= timeLength - 0.05 then
+            soundFinished = true
+        end
+
+        -- If the block exposes IsPlaying reliably, accept a completed stop only
+        -- after we have observed it playing at least once.
+        if transition.fastSawPlaying
+        and not isPlaying
+        and transition.maxSoundTime > 0.01 then
+            soundFinished = true
+        end
+
+        -- Ultimate Build sometimes fails to expose IsPlaying/TimePosition. In that
+        -- case wait the full mathematically sped-up duration before stopping it.
+        if spedSoundDuration
+        and elapsed >= spedSoundDuration + 0.05 then
+            soundFinished = true
+        end
+
+        -- Last-resort fallback when no SoundBlock length/clock is available.
+        if not spedSoundDuration
+        and not transition.fastSawPlaying
+        and elapsed >= FAST_FADE_TIME + FAST_TAIL_TIME then
+            soundFinished = true
+        end
+
+        if transition.visualComplete and soundFinished then
             finishTransition(transition)
         end
         return
@@ -1284,7 +1339,7 @@ local function startQuickDestination()
     end
 end
 
-print("TARDIS fast controls: D=fast materialize, E=quick recall, F=quick B/C cycle")
+print("TARDIS fast controls: D=fast demat+remat, E=quick recall, F=quick B/C cycle")
 
 -- Interior time rotor animation. It runs while dematting, fully dematerialized,
 -- and rematerializing. Once the exterior is fully solid again it pauses exactly
