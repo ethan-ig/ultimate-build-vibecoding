@@ -59,7 +59,10 @@ local SOUND_PROFILES = {
     materialize_quick = { id = "140477091", pitch = 0.735 },
     demat_normal = { id = "135858826", pitch = 0.633 },
     demat_quick = { id = "135858448", pitch = 1.000 },
+    quick_end = { id = "134966578", pitch = 1.000 },
 }
+
+local QUICK_END_STING_SECONDS = 3
 
 local FAST_FADE_TIME = 1.15 -- fallback only when the SoundBlock clock is unavailable
 local FAST_TAIL_TIME = 0.15
@@ -1107,6 +1110,10 @@ local function startTransition(kind, targetFade, fast)
         fastSawPlaying = false,
         fastEndpointApplied = false,
         fastClockLogged = false,
+        quickEndStingActive = false,
+        quickEndStingStart = nil,
+        quickEndStingSawPlaying = false,
+        quickEndStingMaxTime = 0,
         maxSoundTime = seekPosition,
         visualComplete = false,
         fallback = false,
@@ -1169,6 +1176,74 @@ local function finishTransition(transition)
     end
 end
 
+local function startQuickEndSting(transition)
+    if transition.quickEndStingActive then return end
+
+    -- Keep the exterior pinned at its completed quick-travel state while the
+    -- three-second end sting plays.
+    currentFade = transition.targetFade
+    setFadePartsTransparency(transition.targetFade)
+    setLightEffect(transition.targetFade, 0, false)
+
+    stopSound(transition.sound)
+    applySoundProfile(SOUND_PROFILES.quick_end)
+    task.wait()
+    playSound(transition.sound, 0)
+
+    transition.quickEndStingActive = true
+    transition.quickEndStingStart = os.clock()
+    transition.quickEndStingSawPlaying = false
+    transition.quickEndStingMaxTime = 0
+
+    print("QUICK END STING:", SOUND_PROFILES.quick_end.id, "first", QUICK_END_STING_SECONDS, "seconds")
+end
+
+local function updateQuickEndSting(transition, now)
+    if not transition.quickEndStingActive then return false end
+
+    local elapsed = now - (transition.quickEndStingStart or now)
+    local soundTime, _, isPlaying =
+        getTransitionSoundClock(
+            transition.sound,
+            transition.actualSound,
+            SOUND_PROFILES.quick_end.id
+        )
+
+    if isPlaying then
+        transition.quickEndStingSawPlaying = true
+    end
+
+    if soundTime and soundTime > transition.quickEndStingMaxTime then
+        transition.quickEndStingMaxTime = soundTime
+    end
+
+    local finished = false
+
+    -- Preferred path: stop at exactly the first three seconds of the real Sound.
+    if soundTime and soundTime >= QUICK_END_STING_SECONDS then
+        finished = true
+    end
+
+    -- If the sting itself is shorter than three seconds, do not hang the travel.
+    if transition.quickEndStingSawPlaying
+    and not isPlaying
+    and transition.quickEndStingMaxTime > 0.01 then
+        finished = true
+    end
+
+    -- Safety fallback if the engine does not expose this replacement asset's clock.
+    if not soundTime and elapsed >= QUICK_END_STING_SECONDS then
+        finished = true
+    end
+
+    if finished then
+        finishTransition(transition)
+        return true
+    end
+
+    return true
+end
+
 local function updateTransition()
     local transition = activeTransition
     if not transition then return end
@@ -1176,6 +1251,11 @@ local function updateTransition()
     local now = os.clock()
 
     if transition.fast then
+        if transition.quickEndStingActive then
+            updateQuickEndSting(transition, now)
+            return
+        end
+
         local elapsed = now - transition.requestTime
         local soundTime, timeLength, isPlaying, clockSource =
             getTransitionSoundClock(
@@ -1318,7 +1398,7 @@ local function updateTransition()
         end
 
         if transition.visualComplete and soundFinished then
-            finishTransition(transition)
+            startQuickEndSting(transition)
         end
         return
     end
