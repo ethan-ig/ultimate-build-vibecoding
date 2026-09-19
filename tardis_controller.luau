@@ -63,8 +63,10 @@ local SOUND_PROFILES = {
 
 local FAST_FADE_TIME = 1.15 -- fallback only when the SoundBlock clock is unavailable
 local FAST_TAIL_TIME = 0.15
-local FAST_VISUAL_END_FRACTION = 0.90 -- fully gone/solid by 90% of the quick sound
-local FAST_PROGRESS_POWER = 0.42 -- stronger visual change earlier while still following audio
+local FAST_DEMAT_VISUAL_END_FRACTION = 0.70 -- fully gone/teleported by 70% of quick demat audio
+local FAST_MAT_VISUAL_END_FRACTION = 0.90 -- fully solid by 90% of quick materialize audio
+local FAST_DEMAT_PROGRESS_POWER = 0.34 -- demat gets aggressive much earlier
+local FAST_MAT_PROGRESS_POWER = 0.42 -- remat keeps the current feel
 
 local function getBlockValue(block, key)
     if not block then return nil end
@@ -1169,12 +1171,22 @@ local function updateTransition()
             audioProgress = math.clamp(elapsed / FAST_FADE_TIME, 0, 1)
         end
 
+        local visualEndFraction
+        local progressPower
+        if transition.targetFade >= 1 then
+            visualEndFraction = FAST_DEMAT_VISUAL_END_FRACTION
+            progressPower = FAST_DEMAT_PROGRESS_POWER
+        else
+            visualEndFraction = FAST_MAT_VISUAL_END_FRACTION
+            progressPower = FAST_MAT_PROGRESS_POWER
+        end
+
         local linearProgress = math.clamp(
-            audioProgress / FAST_VISUAL_END_FRACTION,
+            audioProgress / visualEndFraction,
             0,
             1
         )
-        local progress = math.pow(linearProgress, FAST_PROGRESS_POWER)
+        local progress = math.pow(linearProgress, progressPower)
         local baseFade = startFade
             + (transition.targetFade - startFade) * progress
         currentFade = baseFade
