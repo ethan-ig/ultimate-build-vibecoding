@@ -943,9 +943,9 @@ local function soundIdMatches(soundId, assetId)
     return string.find(soundId, tostring(assetId), 1, true) ~= nil
 end
 
--- Quick travel must follow the sound that is actually playing, not a stale
+-- Every transition must follow the sound that is actually playing, not a stale
 -- Ultimate Build wrapper clock left over from the previous SoundId.
-local function getFastSoundClock(block, actualSound, expectedAssetId)
+local function getTransitionSoundClock(block, actualSound, expectedAssetId)
     if actualSound then
         local actualId = nil
         local actualTime = nil
@@ -1178,7 +1178,7 @@ local function updateTransition()
     if transition.fast then
         local elapsed = now - transition.requestTime
         local soundTime, timeLength, isPlaying, clockSource =
-            getFastSoundClock(
+            getTransitionSoundClock(
                 transition.sound,
                 transition.actualSound,
                 transition.soundId
@@ -1324,14 +1324,34 @@ local function updateTransition()
     end
 
     local sound = transition.sound
-    local soundTime = tonumber(getBlockValue(sound, "TimePosition"))
-    local isPlaying = getBlockValue(sound, "IsPlaying") == true
-    local timeLength = getSoundLength(sound)
+    local soundTime, timeLength, isPlaying, clockSource =
+        getTransitionSoundClock(
+            transition.sound,
+            transition.actualSound,
+            transition.soundId
+        )
+
+    if not transition.fastClockLogged then
+        if clockSource == "actual"
+        or clockSource == "wrapper"
+        or now - transition.requestTime >= 0.25 then
+            transition.fastClockLogged = true
+            print(
+                "SOUND CLOCK:",
+                clockSource,
+                "id", transition.soundId,
+                "time", soundTime,
+                "length", timeLength,
+                "pitch", transition.soundPitch
+            )
+        end
+    end
 
     if not transition.fallback and soundTime then
         if soundTime > transition.maxSoundTime then transition.maxSoundTime = soundTime end
 
-        if timeLength > VISUAL_START_TIME + SOUND_TAIL_TIME + 0.1 then
+        if timeLength
+        and timeLength > VISUAL_START_TIME + SOUND_TAIL_TIME + 0.1 then
             transition.visualEnd = timeLength - SOUND_TAIL_TIME
         end
 
@@ -1368,7 +1388,9 @@ local function updateTransition()
 
         local soundFinished = false
         if transition.visualComplete then
-            if timeLength > 0 and transition.maxSoundTime >= timeLength - 0.08 then
+            if timeLength
+            and timeLength > 0
+            and transition.maxSoundTime >= timeLength - 0.08 then
                 soundFinished = true
             end
             if not isPlaying and transition.maxSoundTime > VISUAL_START_TIME then
