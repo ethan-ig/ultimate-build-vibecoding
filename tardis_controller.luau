@@ -938,6 +938,46 @@ local function getSoundLength(block)
     return tonumber(getBlockValue(block, "TimeLength")) or 0
 end
 
+local function soundIdMatches(soundId, assetId)
+    if type(soundId) ~= "string" or not assetId then return false end
+    return string.find(soundId, tostring(assetId), 1, true) ~= nil
+end
+
+-- Quick travel must follow the sound that is actually playing, not a stale
+-- Ultimate Build wrapper clock left over from the previous SoundId.
+local function getFastSoundClock(block, actualSound, expectedAssetId)
+    if actualSound then
+        local actualId = nil
+        local actualTime = nil
+        local actualLength = nil
+        local actualPlaying = nil
+
+        pcall(function() actualId = actualSound.SoundId end)
+        pcall(function() actualTime = actualSound.TimePosition end)
+        pcall(function() actualLength = actualSound.TimeLength end)
+        pcall(function() actualPlaying = actualSound.IsPlaying end)
+
+        if soundIdMatches(actualId, expectedAssetId)
+        and type(actualTime) == "number"
+        and type(actualLength) == "number"
+        and actualLength > 0 then
+            return actualTime, actualLength, actualPlaying == true, "actual"
+        end
+    end
+
+    local wrapperTime = tonumber(getBlockValue(block, "TimePosition"))
+    local wrapperLength = tonumber(getBlockValue(block, "TimeLength"))
+    local wrapperPlaying = getBlockValue(block, "IsPlaying") == true
+
+    if wrapperTime ~= nil
+    and wrapperLength ~= nil
+    and wrapperLength > 0 then
+        return wrapperTime, wrapperLength, wrapperPlaying, "wrapper"
+    end
+
+    return nil, nil, false, "wall"
+end
+
 local function getVisualEndTime(block)
     local length = getSoundLength(block)
     if length > VISUAL_START_TIME + SOUND_TAIL_TIME + 0.1 then
@@ -1066,6 +1106,7 @@ local function startTransition(kind, targetFade, fast)
         fast = useFast,
         fastSawPlaying = false,
         fastEndpointApplied = false,
+        fastClockLogged = false,
         maxSoundTime = seekPosition,
         visualComplete = false,
         fallback = false,
@@ -1136,9 +1177,28 @@ local function updateTransition()
 
     if transition.fast then
         local elapsed = now - transition.requestTime
-        local soundTime = tonumber(getBlockValue(transition.sound, "TimePosition"))
-        local isPlaying = getBlockValue(transition.sound, "IsPlaying") == true
-        local timeLength = getSoundLength(transition.sound)
+        local soundTime, timeLength, isPlaying, clockSource =
+            getFastSoundClock(
+                transition.sound,
+                transition.actualSound,
+                transition.soundId
+            )
+
+        if not transition.fastClockLogged then
+            if clockSource == "actual"
+            or clockSource == "wrapper"
+            or elapsed >= 0.25 then
+                transition.fastClockLogged = true
+                print(
+                    "FAST SOUND CLOCK:",
+                    clockSource,
+                    "id", transition.soundId,
+                    "time", soundTime,
+                    "length", timeLength,
+                    "pitch", transition.soundPitch
+                )
+            end
+        end
 
         if isPlaying then
             transition.fastSawPlaying = true
@@ -1152,7 +1212,7 @@ local function updateTransition()
         -- does not expose a reliable IsPlaying/TimePosition clock.
         local pitchedSoundDuration = nil
         local soundPitch = math.max(transition.soundPitch or 1, 0.01)
-        if timeLength > 0 then
+        if timeLength and timeLength > 0 then
             pitchedSoundDuration = timeLength / soundPitch
         end
 
@@ -1163,7 +1223,7 @@ local function updateTransition()
         -- timeline (TimePosition / TimeLength); only use wall-clock math if that
         -- clock is unavailable. Full visual completion happens near the end.
         local audioProgress = nil
-        if timeLength > 0 and soundTime and soundTime >= 0 then
+        if timeLength and timeLength > 0 and soundTime and soundTime >= 0 then
             audioProgress = math.clamp(soundTime / timeLength, 0, 1)
         elseif pitchedSoundDuration then
             audioProgress = math.clamp(elapsed / pitchedSoundDuration, 0, 1)
@@ -1229,7 +1289,9 @@ local function updateTransition()
         local soundFinished = false
 
         -- Best signal: the source timeline actually reached the end.
-        if timeLength > 0 and transition.maxSoundTime >= timeLength - 0.05 then
+        if timeLength
+        and timeLength > 0
+        and transition.maxSoundTime >= timeLength - 0.05 then
             soundFinished = true
         end
 
