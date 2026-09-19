@@ -63,8 +63,8 @@ local SOUND_PROFILES = {
 
 local FAST_FADE_TIME = 1.15 -- fallback only when the SoundBlock clock is unavailable
 local FAST_TAIL_TIME = 0.15
-local FAST_VISUAL_FRACTION = 0.52 -- reach fully dematted/rematted this far through quick audio
-local FAST_PROGRESS_POWER = 0.42 -- stronger visual change earlier in the quick transition
+local FAST_VISUAL_END_FRACTION = 0.90 -- fully gone/solid by 90% of the quick sound
+local FAST_PROGRESS_POWER = 0.42 -- stronger visual change earlier while still following audio
 
 local function getBlockValue(block, key)
     if not block then return nil end
@@ -1063,6 +1063,7 @@ local function startTransition(kind, targetFade, fast)
         startFade = currentFade,
         fast = useFast,
         fastSawPlaying = false,
+        fastEndpointApplied = false,
         maxSoundTime = seekPosition,
         visualComplete = false,
         fallback = false,
@@ -1155,16 +1156,24 @@ local function updateTransition()
 
         local startFade = transition.startFade or currentFade
         local fadeDistance = math.abs(transition.targetFade - startFade)
-        local duration = FAST_FADE_TIME
-        if pitchedSoundDuration then
-            -- Quick travel should visibly finish well before the sound does.
-            -- The remainder of the audio plays while the box is held at the
-            -- fully dematted/rematted endpoint.
-            duration = math.max(0.08, pitchedSoundDuration * FAST_VISUAL_FRACTION)
-        end
-        duration = math.max(0.08, duration * math.max(fadeDistance, 0.08))
 
-        local linearProgress = math.clamp(elapsed / duration, 0, 1)
+        -- Drive quick visuals from the sound itself. Prefer the SoundBlock source
+        -- timeline (TimePosition / TimeLength); only use wall-clock math if that
+        -- clock is unavailable. Full visual completion happens near the end.
+        local audioProgress = nil
+        if timeLength > 0 and soundTime and soundTime >= 0 then
+            audioProgress = math.clamp(soundTime / timeLength, 0, 1)
+        elseif pitchedSoundDuration then
+            audioProgress = math.clamp(elapsed / pitchedSoundDuration, 0, 1)
+        else
+            audioProgress = math.clamp(elapsed / FAST_FADE_TIME, 0, 1)
+        end
+
+        local linearProgress = math.clamp(
+            audioProgress / FAST_VISUAL_END_FRACTION,
+            0,
+            1
+        )
         local progress = math.pow(linearProgress, FAST_PROGRESS_POWER)
         local baseFade = startFade
             + (transition.targetFade - startFade) * progress
@@ -1193,6 +1202,16 @@ local function updateTransition()
             currentFade = transition.targetFade
             setFadePartsTransparency(transition.targetFade)
             setLightEffect(transition.targetFade, wave, true)
+
+            -- For a quick demat, teleport the exterior away as soon as it is fully
+            -- invisible near the end of the sound. The final audio tail can then
+            -- finish naturally before any chained rematerialization begins.
+            if transition.targetFade >= 1
+            and not transition.fastEndpointApplied then
+                transition.fastEndpointApplied = true
+                moveTardis(hiddenPivot)
+                hidden = true
+            end
         end
 
         local soundFinished = false
