@@ -155,6 +155,7 @@ local savedCamera = nil
 local deferredCameraRestore = false
 local savedLampBrightness = nil
 local lastVisualPosition = nil
+local lastWrittenCF = nil
 local keyDown = {}
 local lastToggle = false
 local lastTick = os.clock()
@@ -704,6 +705,7 @@ local function startFlight()
     cameraPose = pivot
     cameraSpeed, cameraBoosting = 0, false
     lastVisualPosition = position
+    lastWrittenCF = nil
     lastMovementWrite = -math.huge
     lastGuardCheck, lastSpeedRead, lastLampWrite = 0, 0, 0
     guardOK = true
@@ -969,8 +971,7 @@ local function updateFlight(now, dt)
             local goalOrientation = CFrame.lookAt(Vector3.zero, direction, up)
             orientation = orientation:Lerp(goalOrientation,
                 1 - math.exp(-AUTO_TURN_RESPONSE * dt))
-            pitch = math.deg(math.asin(math.clamp(orientation.LookVector.Y, -1, 1)))
-            pitch = math.rad(pitch)
+            pitch = math.asin(math.clamp(orientation.LookVector.Y, -1, 1))
             targetRoll = math.clamp(
                 orientation.LookVector:Cross(direction).Y * BANK_ANGLE * 3,
                 -BANK_ANGLE, BANK_ANGLE)
@@ -1036,13 +1037,15 @@ local function updateFlight(now, dt)
 
     -- Expensive exterior writes have their own budget, separate from flight
     -- integration and the camera. Inactive flight costs no CFrame writes.
-    if now - lastMovementWrite >= moveInterval and
-       ((cf.Position - lastVisualPosition).Magnitude > 0.002 or
-        velocity.Magnitude > 0.03 or math.abs(visualRoll) > 0.002 or
-        autopilotActive or lastMovementWrite < 0) then
+    local poseChanged = not lastWrittenCF
+        or (cf.Position - lastWrittenCF.Position).Magnitude > 0.002
+        or cf.LookVector:Dot(lastWrittenCF.LookVector) < 0.999995
+        or cf.UpVector:Dot(lastWrittenCF.UpVector) < 0.999995
+    if now - lastMovementWrite >= moveInterval and poseChanged then
         lastMovementWrite = now
         placeExterior(cf)
         lastVisualPosition = cf.Position
+        lastWrittenCF = cf
     end
 
     if roofLight and savedLampBrightness and now - lastLampWrite >= 0.1 then
