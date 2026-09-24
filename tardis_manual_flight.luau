@@ -198,7 +198,7 @@ local function scanExterior()
     matSound, portal, roofLight = nil, nil, nil
     primary = nil
 
-    local descendants = workspace:GetDescendants(true)
+    local descendants = workspace:GetDescendants()
     for _, block in ipairs(descendants) do
         if block ~= script then
             local name = blockName(block)
