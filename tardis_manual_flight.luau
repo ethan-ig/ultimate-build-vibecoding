@@ -38,7 +38,8 @@ local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
 local HIDDEN_RADIUS = 100
 
 local TICK = 1 / 60
-local MAX_PART_WRITES_PER_SECOND = 2600
+-- Render-frame updates have no artificial shell write budget.
+-- The original capped writes caused visible CFrame stepping.
 local AUTO_ACCELERATION = 90
 local AUTO_BRAKE = 165
 local AUTO_ARRIVAL_RADIUS = 1.2
@@ -59,7 +60,7 @@ local MAX_PITCH = math.rad(50)
 local BANK_ANGLE = math.rad(18)
 local ROLL_ANGLE = math.rad(22)
 local VISUAL_SMOOTHNESS = 5
-local CAMERA_SMOOTHNESS = 5.5
+local CAMERA_SMOOTHNESS = 11
 local COLLISION_MARGIN = 3
 
 local Players = nil
@@ -131,10 +132,12 @@ end
 
 local shell, extras, offsets, rawSafeguards = {}, {}, {}, {}
 local bulkParts, bulkOffsets, wrapperOnly = {}, {}, {}
+local bulkTargets = {}
+local transitionSoundInstance = nil
 local useBulk, bulkChecked = true, false
-local moveInterval, lastMovementWrite = 1 / 45, -math.huge
-local lastGuardCheck, lastSpeedRead = 0, 0
-local guardOK, lastSpeedInput = true, nil
+local lastMovementWrite = -math.huge
+local lastGuardCheck, lastSpeedRead, lastTargetRead = 0, 0, 0
+local lastSpeedInput = nil
 local matSound, portal, roofLight = nil, nil, nil
 local primary = nil
 local pivot, baseRotation = nil, nil
@@ -148,8 +151,10 @@ local targetPosition, lastInputTarget = nil, nil
 local speedLimit = 80
 local autoStatus = "STANDBY"
 local cameraPose, cameraSpeed, cameraBoosting = nil, 0, false
-local renderConnection, renderBindingName = nil, nil
-local renderDriven = false
+local renderConnection, renderBindingName, heartbeatConnection = nil, nil, nil
+local renderDriven, frameDriven = false, false
+local frameCounter, frameCounterStart = 0, 0
+local lastReportedFPS = 0
 local lastLampWrite = 0
 local savedCamera = nil
 local deferredCameraRestore = false
@@ -166,7 +171,7 @@ local fxAttachmentA, fxAttachmentB, fxTrail = nil, nil, nil
 local gui, speedText, telemetryText, statusText = nil, nil, nil, nil
 local boostBar, cameraText, controlText = nil, nil, nil
 local limitText, targetStatusText, targetBoxes = nil, nil, {}
-local beginAutopilot, adjustSpeed, abortAutopilot, updateFlightCamera
+local beginAutopilot, adjustSpeed, abortAutopilot, updateFlightCamera, updateFlight
 local lastAutoInput = false
 
 local function signalActive(value)
@@ -185,8 +190,9 @@ end
 
 local function scanExterior()
     shell, extras, offsets, rawSafeguards = {}, {}, {}, {}
-    bulkParts, bulkOffsets, wrapperOnly = {}, {}, {}
+    bulkParts, bulkOffsets, wrapperOnly, bulkTargets = {}, {}, {}, {}
     useBulk, bulkChecked = true, false
+    transitionSoundInstance = nil
     matSound, portal, roofLight = nil, nil, nil
     primary = nil
 
@@ -236,11 +242,11 @@ local function scanExterior()
             table.insert(wrapperOnly, block)
         end
     end
-    -- Keep a useful frame rate even with lots of individual exterior parts.
-    -- The visual transforms are throttled, but camera and flight math are not.
-    local hz = math.clamp(math.floor(MAX_PART_WRITES_PER_SECOND / math.max(#extras, 1)), 24, 55)
-    moveInterval = 1 / hz
-    print("TARDIS FLIGHT:", #extras, "moving blocks;", hz, "movement Hz;", #bulkParts, "native parts")
+    print("TARDIS FLIGHT:", #extras, "moving blocks;", #bulkParts, "native parts; frame-synced movement")
+    local source = rawPart(matSound)
+    if source then
+        pcall(function() transitionSoundInstance = source:FindFirstChildWhichIsA("Sound", true) end)
+    end
 
     -- Some FIU wrappers move their CFrame without moving the actual Sound
     -- emitter or portal Part. Mirror the controller's raw-Part safeguards.
@@ -267,15 +273,10 @@ end
 
 local function transitionSoundPlaying()
     if not matSound then return false end
-    local raw = rawPart(matSound)
-    if raw then
-        local sound = nil
-        pcall(function() sound = raw:FindFirstChildWhichIsA("Sound", true) end)
-        if sound then
-            local playing = false
-            pcall(function() playing = sound.IsPlaying == true end)
-            return playing
-        end
+    if transitionSoundInstance then
+        local playing = false
+        pcall(function() playing = transitionSoundInstance.IsPlaying == true end)
+        if playing then return true end
     end
     return getValue(matSound, "IsPlaying") == true
 end
@@ -297,12 +298,11 @@ local function placeExterior(cf)
     -- move, and permanently fall back if it disagrees.
     local movedInBulk = false
     if useBulk and #bulkParts >= 2 then
-        local targets = {}
         for i, raw in ipairs(bulkParts) do
-            targets[i] = cf * bulkOffsets[raw]
+            bulkTargets[i] = cf * bulkOffsets[raw]
         end
         movedInBulk = pcall(function()
-            workspace:BulkMoveTo(bulkParts, targets, Enum.BulkMoveMode.FireCFrameChanged)
+            workspace:BulkMoveTo(bulkParts, bulkTargets, Enum.BulkMoveMode.FireCFrameChanged)
         end)
         if not movedInBulk then
             useBulk = false
@@ -339,11 +339,6 @@ local function placeExterior(cf)
         end
     end
 
-    if portal then
-        setValue(portal, "Transparency", 1)
-        local raw = rawPart(portal)
-        if raw then pcall(function() raw.Transparency = 1 end) end
-    end
 end
 
 local function restoreLamp()
@@ -617,12 +612,13 @@ end
 
 local function stopCameraLoop()
     if renderConnection then pcall(function() renderConnection:Disconnect() end) end
-    renderConnection = nil
+    if heartbeatConnection then pcall(function() heartbeatConnection:Disconnect() end) end
+    renderConnection, heartbeatConnection = nil, nil
     if renderBindingName and RunService then
         pcall(function() RunService:UnbindFromRenderStep(renderBindingName) end)
     end
     renderBindingName = nil
-    renderDriven = false
+    renderDriven, frameDriven = false, false
 end
 
 local function restoreCamera()
@@ -707,8 +703,8 @@ local function startFlight()
     lastVisualPosition = position
     lastWrittenCF = nil
     lastMovementWrite = -math.huge
-    lastGuardCheck, lastSpeedRead, lastLampWrite = 0, 0, 0
-    guardOK = true
+    lastGuardCheck, lastSpeedRead, lastTargetRead, lastLampWrite = 0, 0, 0, 0
+    frameCounter, frameCounterStart, lastReportedFPS = 0, os.clock(), 0
     viewMode = "CHASE"
     savedLampBrightness = tonumber(getValue(roofLight, "Brightness"))
     keyDown = {}
@@ -716,33 +712,63 @@ local function startFlight()
     signalActive(true)
     createFX()
     buildGUI()
-    -- Keep the camera on the render loop when the FIU sandbox allows it.
-    -- Slow shell writes cannot then block camera updates in the script loop.
-    if RunService then
-        local callback = function(renderDt)
-            if flightActive and cameraPose then
-                updateFlightCamera(cameraPose, cameraSpeed, cameraBoosting,
-                    math.clamp(renderDt, 0, 0.08))
-            end
+    if portal then
+        setValue(portal, "Transparency", 1)
+        local raw = rawPart(portal)
+        if raw then pcall(function() raw.Transparency = 1 end) end
+    end
+
+    -- The entire movement calculation + CFrame write now happens on the
+    -- RENDER frame, immediately before the chase camera. Previously only
+    -- camera rendered each frame while the ship stepped in a task.wait loop.
+    local function renderFrame(dt)
+        if not flightActive then return end
+        dt = math.clamp(dt or TICK, 0, 0.08)
+        local now = os.clock()
+        updateFlight(now, dt)
+        if flightActive and cameraPose then
+            updateFlightCamera(cameraPose, cameraSpeed, cameraBoosting, dt)
         end
-        local ok = pcall(function()
-            renderBindingName = "TardisManualCamera_" .. tostring(script)
-            RunService:BindToRenderStep(renderBindingName, Enum.RenderPriority.Camera.Value + 1, callback)
+    end
+
+    if RunService then
+        local bound = pcall(function()
+            renderBindingName = "TardisFlightFrame_" .. tostring(script)
+            RunService:BindToRenderStep(
+                renderBindingName,
+                Enum.RenderPriority.Camera.Value + 1,
+                renderFrame
+            )
         end)
-        if ok then
-            renderDriven = true
+        if bound then
+            renderDriven, frameDriven = true, true
         else
             renderBindingName = nil
             local connected, connection = pcall(function()
-                return RunService.RenderStepped:Connect(callback)
+                return RunService.RenderStepped:Connect(renderFrame)
             end)
             if connected and connection then
                 renderConnection = connection
-                renderDriven = true
+                renderDriven, frameDriven = true, true
+            else
+                -- If this FIU version restricts render events, Heartbeat is
+                -- still a per-frame signal, unlike task.wait's scheduling.
+                local hbOK, hb = pcall(function()
+                    return RunService.Heartbeat:Connect(function(dt)
+                        if flightActive then
+                            updateFlight(os.clock(), math.clamp(dt or TICK, 0, 0.08))
+                        end
+                    end)
+                end)
+                if hbOK and hb then
+                    heartbeatConnection, frameDriven = hb, true
+                end
             end
         end
     end
-    print("TARDIS FLIGHT: ENGAGED; auto target B/C or HUD; +/- cruise", renderDriven and "render camera" or "loop camera")
+    print("TARDIS FLIGHT ENGINE:", renderDriven and "RENDER FRAME" or
+        (frameDriven and "HEARTBEAT" or "TASK FALLBACK"),
+        "parts", #extras, "bulk", #bulkParts)
 end
 
 local function pressed(key)
@@ -891,19 +917,18 @@ updateFlightCamera = function(cf, speed, boosting, dt)
     end)
 end
 
-local function updateFlight(now, dt)
-    if hasNavGui() then
-        stopFlight("NAVIGATION HANDOFF", true, false)
-        return
-    end
-    -- Sound signals are checked immediately; the expensive multi-part
-    -- transparency/ownership checks run just 8 times a second.
+updateFlight = function(now, dt)
+    -- Keep the expensive workspace/player GUI checks off the hot render path.
     if transitionSoundPlaying() then
         stopFlight("CONTROLLER / TRANSITION HANDOFF", false, true)
         return
     end
     if now - lastGuardCheck >= 0.12 then
         lastGuardCheck = now
+        if hasNavGui() then
+            stopFlight("NAVIGATION HANDOFF", true, false)
+            return
+        end
         if not fullyMaterialized() then
             stopFlight("CONTROLLER / TRANSITION HANDOFF", false, true)
             return
@@ -915,7 +940,10 @@ local function updateFlight(now, dt)
         end
     end
 
-    readInputTarget()
+    if now - lastTargetRead >= 0.1 then
+        lastTargetRead = now
+        readInputTarget()
+    end
     if now - lastSpeedRead >= 0.2 then
         lastSpeedRead = now
         if speedInput then
@@ -1035,17 +1063,26 @@ local function updateFlight(now, dt)
     cameraPose = cf
     cameraSpeed, cameraBoosting = velocity.Magnitude, boosting and not autopilotActive
 
-    -- Expensive exterior writes have their own budget, separate from flight
-    -- integration and the camera. Inactive flight costs no CFrame writes.
+    -- Every displayed frame gets the exact same pose as the chase camera.
+    -- Do not skip frames just because an artificial 24-55 Hz budget elapsed.
     local poseChanged = not lastWrittenCF
-        or (cf.Position - lastWrittenCF.Position).Magnitude > 0.002
-        or cf.LookVector:Dot(lastWrittenCF.LookVector) < 0.999995
-        or cf.UpVector:Dot(lastWrittenCF.UpVector) < 0.999995
-    if now - lastMovementWrite >= moveInterval and poseChanged then
-        lastMovementWrite = now
+        or (cf.Position - lastWrittenCF.Position).Magnitude > 0.0002
+        or cf.LookVector:Dot(lastWrittenCF.LookVector) < 0.9999999
+        or cf.UpVector:Dot(lastWrittenCF.UpVector) < 0.9999999
+    if poseChanged then
         placeExterior(cf)
         lastVisualPosition = cf.Position
         lastWrittenCF = cf
+        lastMovementWrite = now
+    end
+
+    frameCounter = frameCounter + 1
+    if now - frameCounterStart >= 5 then
+        lastReportedFPS = math.floor(frameCounter / math.max(0.001, now - frameCounterStart) + 0.5)
+        print("TARDIS FLIGHT FPS:", lastReportedFPS,
+            "mode", renderDriven and "render" or (frameDriven and "heartbeat" or "task"),
+            "parts", #extras, "bulk", useBulk, "speed", math.floor(velocity.Magnitude + 0.5))
+        frameCounter, frameCounterStart = 0, now
     end
 
     if roofLight and savedLampBrightness and now - lastLampWrite >= 0.1 then
@@ -1103,7 +1140,7 @@ if UserInputService then
 end
 
 signalActive(false)
-print("TARDIS MANUAL FLIGHT V2 READY / A toggle / B target / C auto / D speed / No controller edits")
+print("TARDIS MANUAL FLIGHT V3 READY / frame-synced CFrame / A toggle / B target / C auto / D speed")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, 0, 0.08)
@@ -1132,6 +1169,6 @@ while true do
     if deferredCameraRestore and not hasNavGui() then
         restoreCamera()
     end
-    if flightActive then updateFlight(now, dt) end
+    if flightActive and not frameDriven then updateFlight(now, dt) end
     task.wait(TICK)
 end
