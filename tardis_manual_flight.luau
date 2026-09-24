@@ -60,6 +60,7 @@ local MAX_PITCH = math.rad(50)
 local BANK_ANGLE = math.rad(18)
 local ROLL_ANGLE = math.rad(22)
 local VISUAL_SMOOTHNESS = 5
+local POSE_INTERPOLATION_RESPONSE = 40 -- fast visual smoothing without a large position lag
 local CAMERA_SMOOTHNESS = 11
 local COLLISION_MARGIN = 3
 
@@ -153,6 +154,7 @@ local autoStatus = "STANDBY"
 local cameraPose, cameraSpeed, cameraBoosting = nil, 0, false
 local renderConnection, renderBindingName, heartbeatConnection = nil, nil, nil
 local renderDriven, frameDriven = false, false
+local lastFrameCallback = 0
 local frameCounter, frameCounterStart = 0, 0
 local lastReportedFPS = 0
 local lastLampWrite = 0
@@ -275,8 +277,8 @@ local function transitionSoundPlaying()
     if not matSound then return false end
     if transitionSoundInstance then
         local playing = false
-        pcall(function() playing = transitionSoundInstance.IsPlaying == true end)
-        if playing then return true end
+        local ok = pcall(function() playing = transitionSoundInstance.IsPlaying == true end)
+        if ok then return playing end
     end
     return getValue(matSound, "IsPlaying") == true
 end
@@ -705,6 +707,7 @@ local function startFlight()
     lastMovementWrite = -math.huge
     lastGuardCheck, lastSpeedRead, lastTargetRead, lastLampWrite = 0, 0, 0, 0
     frameCounter, frameCounterStart, lastReportedFPS = 0, os.clock(), 0
+    lastFrameCallback = os.clock()
     viewMode = "CHASE"
     savedLampBrightness = tonumber(getValue(roofLight, "Brightness"))
     keyDown = {}
@@ -725,6 +728,7 @@ local function startFlight()
         if not flightActive then return end
         dt = math.clamp(dt or TICK, 0, 0.08)
         local now = os.clock()
+        lastFrameCallback = now
         updateFlight(now, dt)
         if flightActive and cameraPose then
             updateFlightCamera(cameraPose, cameraSpeed, cameraBoosting, dt)
@@ -756,7 +760,8 @@ local function startFlight()
                 local hbOK, hb = pcall(function()
                     return RunService.Heartbeat:Connect(function(dt)
                         if flightActive then
-                            updateFlight(os.clock(), math.clamp(dt or TICK, 0, 0.08))
+                            lastFrameCallback = os.clock()
+                            updateFlight(lastFrameCallback, math.clamp(dt or TICK, 0, 0.08))
                         end
                     end)
                 end)
@@ -1060,19 +1065,24 @@ updateFlight = function(now, dt)
         * math.clamp(velocity.Magnitude / 20, 0, 1)
     local cf = CFrame.new(position + Vector3.new(0, bob, 0))
         * orientation * CFrame.Angles(0, 0, visualRoll)
-    cameraPose = cf
+
+    -- Interpolate translation AND rotation, then feed this single visual pose
+    -- to both the exterior and camera. Frame-rate-independent smoothing also
+    -- conceals small variations in FIU scheduling without snapping the shell.
+    local displayCF = lastWrittenCF and lastWrittenCF:Lerp(
+        cf, 1 - math.exp(-POSE_INTERPOLATION_RESPONSE * dt)
+    ) or cf
+    cameraPose = displayCF
     cameraSpeed, cameraBoosting = velocity.Magnitude, boosting and not autopilotActive
 
-    -- Every displayed frame gets the exact same pose as the chase camera.
-    -- Do not skip frames just because an artificial 24-55 Hz budget elapsed.
     local poseChanged = not lastWrittenCF
-        or (cf.Position - lastWrittenCF.Position).Magnitude > 0.0002
-        or cf.LookVector:Dot(lastWrittenCF.LookVector) < 0.9999999
-        or cf.UpVector:Dot(lastWrittenCF.UpVector) < 0.9999999
+        or (displayCF.Position - lastWrittenCF.Position).Magnitude > 0.0002
+        or displayCF.LookVector:Dot(lastWrittenCF.LookVector) < 0.9999999
+        or displayCF.UpVector:Dot(lastWrittenCF.UpVector) < 0.9999999
     if poseChanged then
-        placeExterior(cf)
-        lastVisualPosition = cf.Position
-        lastWrittenCF = cf
+        placeExterior(displayCF)
+        lastVisualPosition = displayCF.Position
+        lastWrittenCF = displayCF
         lastMovementWrite = now
     end
 
@@ -1096,7 +1106,7 @@ updateFlight = function(now, dt)
     end
 
     if not renderDriven then
-        updateFlightCamera(cf, velocity.Magnitude, boosting, dt)
+        updateFlightCamera(displayCF, velocity.Magnitude, boosting, dt)
     end
     updateHUD(now, velocity.Magnitude,
         boosting and math.min(MAX_BOOST_SPEED, speedLimit * BOOST_MULTIPLIER)
@@ -1140,7 +1150,7 @@ if UserInputService then
 end
 
 signalActive(false)
-print("TARDIS MANUAL FLIGHT V3 READY / frame-synced CFrame / A toggle / B target / C auto / D speed")
+print("TARDIS MANUAL FLIGHT V3 READY / interpolated frame-synced CFrame / A toggle / B target / C auto / D speed")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, 0, 0.08)
@@ -1168,6 +1178,12 @@ while true do
 
     if deferredCameraRestore and not hasNavGui() then
         restoreCamera()
+    end
+    -- Some Ultimate Build sandboxes accept BindToRenderStep without
+    -- actually delivering callbacks. Recover automatically instead of freezing.
+    if flightActive and frameDriven and now - lastFrameCallback > 0.8 then
+        print("TARDIS FLIGHT: render events stalled; switching to task fallback")
+        stopCameraLoop()
     end
     if flightActive and not frameDriven then updateFlight(now, dt) end
     task.wait(TICK)
