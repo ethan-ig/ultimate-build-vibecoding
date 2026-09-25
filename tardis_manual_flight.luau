@@ -55,6 +55,7 @@ local renderConnection, heartbeatConnection = nil, nil
 local lastHeartBeat = 0
 local lastTargetRead, lastOutput, lastSafety = 0, 0, 0
 local lastTick = os.clock()
+local takeoffUntil = 0
 
 local function safeOutput(port, value)
     if port then pcall(function() port:SetState(value) end) end
@@ -217,6 +218,7 @@ local function startFlight()
         cam.FieldOfView = 70
     end) end
     desiredVelocity = Vector3.zero
+    takeoffUntil = os.clock() + 0.8
     flying, autopilot, cameraEnabled = true, false, true
     lastCameraFrame = nil
     cameraHeading = root.CFrame.LookVector
@@ -346,6 +348,11 @@ local function updatePhysics(dt)
         requested = root.CFrame.LookVector * (go * top)
             + Vector3.new(0, lift * top * 0.70, 0)
         if requested.Magnitude > top then requested = requested.Unit * top end
+        -- Clear the ground before starting the cinematic spin. No teleport:
+        -- the physics motor performs a short, gentle vertical takeoff.
+        if now < takeoffUntil and lift == 0 and go == 0 then
+            requested = Vector3.new(0, 20, 0)
+        end
     end
     if braking then requested = Vector3.zero end
 
