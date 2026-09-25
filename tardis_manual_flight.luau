@@ -46,6 +46,8 @@ local lastInputA, lastInputC = false, false
 local lastTargetRead, lastPositionWrite, lastGuard, lastHeartbeat = 0, 0, 0, 0
 local takeoffUntil, lastTick = 0, os.clock()
 local motionStart, motionPosition, stalledChecks = 0, nil, 0
+local kinematicFallback, kinematicPose = false, nil
+local kinematicStallChecks = 0
 local heartbeatConnection, renderConnection = nil, nil
 local gui, statusLabel, speedLabel, coords = nil, nil, nil, {}
 local lastGuiAttempt, lastGuiError = 0, nil
@@ -204,6 +206,7 @@ local function dropFlight(reason)
     if not flying then return end
     flying, autopilot = false, false
     desiredVelocity, keyDown = Vector3.zero, {}
+    kinematicFallback, kinematicPose = false, nil
     disableMotors()
     if root then
         pcall(function() root:SetAttribute("TardisFlightActive", false) end)
@@ -233,6 +236,7 @@ local function takeoff()
     end
 
     velocityFallback = not buildMotors()
+    kinematicFallback, kinematicPose, kinematicStallChecks = false, nil, 0
     desiredVelocity = Vector3.zero
     local look = root.CFrame.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
@@ -260,6 +264,9 @@ local function takeoff()
     print("TARDIS PHYSICS START:", "mass", tostring(root.AssemblyMass),
         "anchored", tostring(root.Anchored),
         "mode", velocityFallback and "direct velocity" or "constraints")
+    local ownerOK, owner = pcall(function() return root:GetNetworkOwner() end)
+    print("TARDIS NETWORK OWNER:", ownerOK and
+        (owner and tostring(owner.Name) or "server") or "unavailable to FIU")
     status("ENGAGED / " .. (velocityFallback and "velocity" or "motors"))
     return true
 end
@@ -567,7 +574,28 @@ local function updatePhysics(dt)
             status("MOTOR UPDATE FAILED / direct velocity")
         end
     end
-    if velocityFallback then
+    if kinematicFallback then
+        -- In some FIU environments velocity *properties* update but their
+        -- physics owner never integrates a change in position. Move the ONE
+        -- welded root instead, never all 155 separate shell pieces. It stays
+        -- unanchored: dropping flight simply stops all kinematic writes.
+        -- This can be client-local if the server does not grant ownership.
+        if not kinematicPose then kinematicPose = root.CFrame end
+        local orientation = kinematicPose - kinematicPose.Position
+        local yaw = CFrame.Angles(0, rotation.Y * dt, 0)
+        local wobble = CFrame.Angles(rotation.X * dt, 0, rotation.Z * dt)
+        orientation = yaw * orientation * wobble
+        kinematicPose = CFrame.new(kinematicPose.Position + desiredVelocity * dt)
+            * orientation
+        local ok, err = pcall(function()
+            root.CFrame = kinematicPose
+        end)
+        if not ok then
+            print("TARDIS ROOT CFRAME FAILED:", tostring(err))
+            dropFlight("ROOT CFRAME WRITE BLOCKED")
+            return
+        end
+    elseif velocityFallback then
         local ok, err = pcall(function()
             root.AssemblyLinearVelocity = desiredVelocity
             root.AssemblyAngularVelocity = rotation
@@ -588,17 +616,36 @@ local function updatePhysics(dt)
                 velocityFallback = true
                 disableMotors()
                 status("CONSTRAINTS STALLED / trying direct velocity")
-            elseif stalledChecks >= 2 then
-                status("NOT MOVING / joints or physics authority")
+            elseif not kinematicFallback then
+                -- Repeated zero displacement with a finite mass and a
+                -- nonzero AssemblyLinearVelocity is not successful flight.
+                -- Stop relying on the velocity setter and try one root CFrame.
+                kinematicFallback = true
+                kinematicPose = root.CFrame
+                kinematicStallChecks = 0
+                disableMotors()
+                print("TARDIS FALLBACK: single-root CFrame flight; physics velocity not advancing position")
+                status("PHYSICS NOT ADVANCING / ROOT CFRAME TEST")
+            else
+                kinematicStallChecks = kinematicStallChecks + 1
+                if kinematicStallChecks >= 2 then
+                    status("ROOT CFRAME NOT PERSISTING / FIU AUTHORITY BLOCKED")
+                    print("TARDIS ROOT CFRAME TEST FAILED: position still unchanged; do not assume client flight replicates")
+                end
             end
         else
             stalledChecks = 0
+            kinematicStallChecks = 0
+            if kinematicFallback then
+                status("ROOT CFRAME MOVING / CHECK ANOTHER PLAYER CAN SEE IT")
+            end
         end
         print("TARDIS MOTION CHECK:", "moved", actualDistance,
             "requested", desiredVelocity.Magnitude,
             "actual", root.AssemblyLinearVelocity.Magnitude,
             "mass", tostring(root.AssemblyMass),
-            "direct", tostring(velocityFallback))
+            "direct", tostring(velocityFallback),
+            "rootCFrame", tostring(kinematicFallback))
         motionStart, motionPosition = now, root.Position
     end
     if outputB and now - lastPositionWrite >= .1 then
