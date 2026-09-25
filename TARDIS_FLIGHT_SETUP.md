@@ -36,15 +36,16 @@ to run instead of silently reverting to jerky individual CFrame movement.
 
 A compact, static coordinate-and-controls GUI replaces the old animated HUD.
 Its TAKEOFF button works without any input-A wiring; GO uses three editable
-world-coordinate fields. A single `LinearVelocity` and `AngularVelocity`
-move the entire unanchored welded assembly. If FIU refuses the constraint API
-or the constraints do not translate the box, flight attempts direct assembly
-velocity and prints `TARDIS MOTION CHECK` diagnostics. If even direct velocity
-reports a speed but actual position is unchanged, it tests moving a single
-welded root by CFrame each frame, NOT 155 individual parts. This is a
-compatibility test, not a guarantee of server replication. If it also does not
-move or snaps back, FIU lacks motion authority; a server-owned movement
-mechanism or Ultimate Build's supported movement API is required. The exterior constantly spins
+world-coordinate fields. Flight V5.0 bypasses the ineffective local velocity
+path. It predicts movement on the client for responsive piloting and requests
+the same CFrame through Ultimate Build's exposed block wrapper at 20 Hz,
+rather than relying on the raw BasePart's client-only CFrame. The exterior
+remains one heavy unanchored welded assembly; stopping flight stops motion
+writes so it can fall. Whether the FIU wrapper assignment reaches the server
+must be confirmed from another player/client, including that **every shell
+part** follows, not just the root. If it does not, this game must provide a
+server-authorized movement block or server-side script. The optional flight
+output C publishes the desired CFrame for a native mover that accepts it. The exterior constantly spins
 with a slight wobble while flight is active. Flight V4.4 uses Roblox's native
 `CameraType.Custom` orbit/zoom camera, following a small invisible local
 camera target. Move the mouse to orbit, use the wheel to zoom, and press V to
@@ -59,7 +60,8 @@ leave the camera behind. The camera proxy is separate from the welded rig.
 | Input C | Pulse TRUE to toggle autopilot |
 | Input D | Optional numeric speed limit (10–265) |
 | Output A | Flight active boolean |
-| Output B | Live actual exterior position Vector3 |
+| Output B | Desired exterior position Vector3 |
+| Output C | Optional desired full CFrame, connect only to a native movement block with a documented CFrame input |
 
 Keyboard: W/S forward/back; A/D steer travel independently of the spin;
 Q/E descend/ascend; Shift boost; Space brake/hover; + and - adjust speed by 10;
@@ -99,10 +101,10 @@ destination is still available to the normal teleport controller.
 1. On starting the controller, find `TARDIS RIG READY` in logs and verify
    `AssemblyMass` is finite. If `RIG INCOMPLETE` appears, do not test flight.
 2. Check materialize, demat, quick travel, portal, roof light and time rotor.
-3. Engage flight using the GUI TAKEOFF button (no input A required), verify physical rotation and W/S/Q/E.
+3. Engage flight using GUI TAKEOFF (no input A required), verify motion and controls.
 4. Enter GUI coordinates, e.g. `500, 150, 500`, click GO and check braking/hover. Input B/C remain optional for map wiring.
 5. Use map destination; verify output C is ground-adjusted and output A is ground-biased.
-6. Press X while airborne; verify the box tumbles/falls and rests on terrain.
+6. Test with a second client. Confirm **the whole exterior** moves, not only the root, and check movement after reconnecting. Then press X to verify the box can fall.
 7. Dematerialize while flying; flight motors should disarm immediately.
 8. Ensure no two old/new controller copies are running simultaneously.
 
