@@ -495,7 +495,7 @@ local function addRigMember(block, shouldCollide, density)
     if not rigMemberSet[raw] then
         rigMemberSet[raw] = true
         table.insert(rigMembers, raw)
-        pcall(function()
+        local success = pcall(function()
             raw.Anchored = false
             raw.Massless = false
             raw.CanCollide = shouldCollide
@@ -503,6 +503,13 @@ local function addRigMember(block, shouldCollide, density)
                 density, shouldCollide and 1.3 or 0.3, 0, 100, 100
             )
         end)
+        if not success then
+            print("TARDIS RIG: failed physical properties on", raw.Name)
+            return false
+        end
+        local verified = false
+        pcall(function() verified = raw.Anchored == false end)
+        if not verified then return false end
     end
     return true
 end
@@ -519,8 +526,12 @@ if #shellParts > 0 and startingPivot then
                 print("TARDIS RIG: a shell part has no physical BasePart")
             end
         end
-        for _, accessory in ipairs({matSound, tardisLight, tardisPortal}) do
-            if accessory and not addRigMember(accessory, false, 2) then
+        local accessories = {}
+        for _, item in pairs({sound = matSound, lamp = tardisLight, portal = tardisPortal}) do
+            if item then table.insert(accessories, item) end
+        end
+        for _, accessory in ipairs(accessories) do
+            if not addRigMember(accessory, false, 2) then
                 rigReady = false
                 print("TARDIS RIG: missing physical accessory", getDisplayName(accessory))
             end
@@ -1182,6 +1193,12 @@ local function startTransition(kind, targetFade, fast)
     -- Disable flight propulsion before any transition touches the assembly.
     setRigFlag("TardisTransitioning", true)
     if rigRoot then pcall(function()
+        -- Do not wait for the pilot's next poll. Physically release both motors
+        -- before demat/recall can move the shell.
+        local linearMotor = rigRoot:FindFirstChild("TardisFlightVelocity")
+        local angularMotor = rigRoot:FindFirstChild("TardisFlightSpin")
+        if linearMotor then linearMotor.Enabled = false end
+        if angularMotor then angularMotor.Enabled = false end
         rigRoot.AssemblyLinearVelocity = Vector3.zero
         rigRoot.AssemblyAngularVelocity = Vector3.zero
     end) end
