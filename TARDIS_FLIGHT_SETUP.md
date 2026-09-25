@@ -34,8 +34,13 @@ to run instead of silently reverting to jerky individual CFrame movement.
 
 ## 2. Flight: `tardis_manual_flight.luau`
 
-No HUD or ScreenGui. A single `LinearVelocity` and `AngularVelocity`
-move the entire unanchored welded assembly. The exterior constantly spins
+A compact, static coordinate-and-controls GUI replaces the old animated HUD.
+Its TAKEOFF button works without any input-A wiring; GO uses three editable
+world-coordinate fields. A single `LinearVelocity` and `AngularVelocity`
+move the entire unanchored welded assembly. If FIU refuses the constraint API
+or the constraints do not translate the box, flight attempts direct assembly
+velocity and prints `TARDIS MOTION CHECK` diagnostics. Neither mode animates
+individual shell CFrames. The exterior constantly spins
 with a slight wobble while flight is active. The camera holds a stable viewing
 direction rather than circling with the spinning box.
 
@@ -48,9 +53,14 @@ direction rather than circling with the spinning box.
 | Output A | Flight active boolean |
 | Output B | Live actual exterior position Vector3 |
 
-Keyboard: W/S forward/back; A/D adjust spin; Q/E descend/ascend; Shift boost;
-Space brake/hover; + and - adjust speed by 10; G toggle autopilot; V camera;
-X or Escape drop out of flight.
+Keyboard: W/S forward/back; A/D steer travel independently of the spin;
+Q/E descend/ascend; Shift boost; Space brake/hover; + and - adjust speed by 10;
+G toggles autopilot; V toggles camera; X or Escape drops out of flight.
+
+The GUI is visible even when flight is off. Click TAKEOFF, type X/Y/Z, click GO;
+use HOVER/ABORT or DROP at any time. The status line reports rig failures and
+whether physical motors, direct assembly velocity or network authority may be
+preventing movement.
 
 With autopilot active, normal steering thrust or Space cancels autopilot.
 The target stays set until a new one is supplied. When the ship arrives, the
@@ -81,8 +91,8 @@ destination is still available to the normal teleport controller.
 1. On starting the controller, find `TARDIS RIG READY` in logs and verify
    `AssemblyMass` is finite. If `RIG INCOMPLETE` appears, do not test flight.
 2. Check materialize, demat, quick travel, portal, roof light and time rotor.
-3. Engage flight with A, verify physical rotation and W/S/Q/E.
-4. Enter input B as e.g. `500, 150, 500`, pulse C, check braking and hover.
+3. Engage flight using the GUI TAKEOFF button (no input A required), verify physical rotation and W/S/Q/E.
+4. Enter GUI coordinates, e.g. `500, 150, 500`, click GO and check braking/hover. Input B/C remain optional for map wiring.
 5. Use map destination; verify output C is ground-adjusted and output A is ground-biased.
 6. Press X while airborne; verify the box tumbles/falls and rests on terrain.
 7. Dematerialize while flying; flight motors should disarm immediately.
