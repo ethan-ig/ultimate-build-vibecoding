@@ -1,6 +1,7 @@
--- TARDIS FLIGHT 4.4 | Ultimate Build FIU
+-- TARDIS FLIGHT 5.0 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
--- No per-frame GUI updates; never animates individual shell CFrames.
+-- No per-frame GUI updates; only one welded root CFrame is driven.
+-- The FIU wrapper receives throttled authoritative-position requests.
 -- Requires the matching controller's unanchored welded exterior.
 --
 -- Input A: optional TRUE pulse to take off / drop.
@@ -29,6 +30,7 @@ local MIN_SPEED, MAX_SPEED, SPEED_STEP = 10, 265, 10
 local ACCELERATION, BRAKING, ARRIVAL_RADIUS = 55, 105, 2.8
 local SPIN_RATE, STEER_SPIN, TURN_RATE, WOBBLE = 0.9, 0.4, math.rad(70), 0.11
 local UPDATE = 1 / 30
+local REPLICATION_INTERVAL = 1 / 20 -- One FIU wrapper write per 50 ms, not 155 parts
 local NAV_GUI = "TardisNavigationGui"
 local RunService, Players, UserInputService = nil, nil, nil
 pcall(function() RunService = game:GetService("RunService") end)
@@ -37,7 +39,9 @@ pcall(function() UserInputService = game:GetService("UserInputService") end)
 local player = nil
 if Players then pcall(function() player = Players.LocalPlayer end) end
 
-local root, attachment, linear, angular = nil, nil, nil, nil
+local root, rootWrapper, attachment, linear, angular = nil, nil, nil, nil
+local lastReplicationWrite, replicationWrites = 0, 0
+local replicationWriteFailures = 0
 local flying, autopilot, velocityFallback = false, false, false
 local cameraEnabled, savedCamera, cameraTarget = true, nil, nil
 local lastCameraCheck = 0
@@ -97,11 +101,24 @@ local function navigationOpen()
 end
 
 local function findRoot()
+    local selectedRoot, selectedWrapper = nil, nil
     for _, object in ipairs(workspace:GetDescendants()) do
         local part = basePart(object)
-        if part and attr(part, "TardisRigRoot") == true then return part end
+        if part and attr(part, "TardisRigRoot") == true then
+            selectedRoot = part
+            -- An ordinary raw BasePart write is client-local here. We need
+            -- the Ultimate Build exposed block whose .Part points at it.
+            -- The original controller moved these same block.CFrame values.
+            if object ~= part then
+                local readOK, wrapperCF = pcall(function() return object.CFrame end)
+                if readOK and typeof(wrapperCF) == "CFrame" then
+                    selectedWrapper = object
+                    break
+                end
+            end
+        end
     end
-    return nil
+    return selectedRoot, selectedWrapper
 end
 
 local function rigReady()
@@ -295,17 +312,38 @@ end
 
 local function takeoff()
     if flying then return true end
-    root = findRoot()
+    root, rootWrapper = findRoot()
     local ok, reason = rigReady()
     if not ok then
         status("CAN'T TAKE OFF: " .. tostring(reason))
         return false
     end
+    if not rootWrapper then
+        status("NO FIU ROOT WRAPPER / raw CFrame is local only")
+        print("TARDIS SYNC: root has no block wrapper. Cannot claim server replication.")
+        return false
+    end
 
-    velocityFallback = not buildMotors()
-    kinematicFallback, kinematicPose, kinematicStallChecks = false, nil, 0
+    local wrapperOK, initialPose = pcall(function() return rootWrapper.CFrame end)
+    if not wrapperOK or typeof(initialPose) ~= "CFrame" then
+        status("FIU ROOT CFRAME UNREADABLE")
+        return false
+    end
+    local testOK, testErr = pcall(function() rootWrapper.CFrame = initialPose end)
+    if not testOK then
+        status("FIU ROOT CFRAME WRITE REJECTED: " .. tostring(testErr))
+        return false
+    end
+
+    -- Velocity constraints were updating their properties while the assembly
+    -- stood completely still. Start with the FIU's part wrapper instead of
+    -- cycling through methods we have already proved ineffective.
+    clearMotors()
+    velocityFallback, kinematicFallback = true, true
+    kinematicPose, kinematicStallChecks = initialPose, 0
+    lastReplicationWrite, replicationWrites, replicationWriteFailures = 0, 0, 0
     desiredVelocity = Vector3.zero
-    local look = root.CFrame.LookVector
+    local look = initialPose.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
     travelHeading = flat.Magnitude > .01 and flat.Unit or Vector3.new(0, 0, -1)
     lastCameraCheck = 0
@@ -314,27 +352,14 @@ local function takeoff()
     flying, autopilot, cameraEnabled = true, false, true
     pcall(function() root:SetAttribute("TardisFlightActive", true) end)
     engageCamera()
-    if not velocityFallback then
-        local enabled, err = pcall(function()
-            linear.VectorVelocity = Vector3.new(0, 20, 0)
-            angular.AngularVelocity = Vector3.new(0, SPIN_RATE, 0)
-            linear.Enabled = true
-            angular.Enabled = true
-        end)
-        if not enabled then
-            print("TARDIS MOTOR ENABLE FAILED:", tostring(err))
-            velocityFallback = true
-            disableMotors()
-        end
-    end
     output(outputA, true)
+    print("TARDIS REPLICATION: sending FIU wrapper CFrame, not raw Part.CFrame")
     print("TARDIS PHYSICS START:", "mass", tostring(root.AssemblyMass),
-        "anchored", tostring(root.Anchored),
-        "mode", velocityFallback and "direct velocity" or "constraints")
+        "anchored", tostring(root.Anchored), "mode", "FIU WRAPPER CFRAME")
     local ownerOK, owner = pcall(function() return root:GetNetworkOwner() end)
     print("TARDIS NETWORK OWNER:", ownerOK and
         (owner and tostring(owner.Name) or "server") or "unavailable to FIU")
-    status("ENGAGED / " .. (velocityFallback and "velocity" or "motors"))
+    status("FIU CFRAME FLIGHT / VERIFY WITH SECOND PLAYER")
     return true
 end
 
@@ -629,18 +654,6 @@ local function updatePhysics(dt)
         SPIN_RATE + steer * STEER_SPIN,
         WOBBLE * math.cos(now * .65)
     )
-    if not velocityFallback then
-        local ok, err = pcall(function()
-            linear.VectorVelocity = desiredVelocity
-            angular.AngularVelocity = rotation
-        end)
-        if not ok then
-            print("TARDIS MOTOR UPDATE ERROR:", tostring(err))
-            disableMotors()
-            velocityFallback = true
-            status("MOTOR UPDATE FAILED / direct velocity")
-        end
-    end
     if kinematicFallback then
         -- In some FIU environments velocity *properties* update but their
         -- physics owner never integrates a change in position. Move the ONE
@@ -654,13 +667,30 @@ local function updatePhysics(dt)
         orientation = yaw * orientation * wobble
         kinematicPose = CFrame.new(kinematicPose.Position + desiredVelocity * dt)
             * orientation
-        local ok, err = pcall(function()
+        -- Local prediction preserves pilot/camera responsiveness, while
+        -- the FIU block wrapper is the requested replicated movement path.
+        local previewOK, previewErr = pcall(function()
             root.CFrame = kinematicPose
         end)
-        if not ok then
-            print("TARDIS ROOT CFRAME FAILED:", tostring(err))
-            dropFlight("ROOT CFRAME WRITE BLOCKED")
-            return
+        if not previewOK then
+            print("TARDIS LOCAL PREVIEW FAILED:", tostring(previewErr))
+        end
+
+        if now - lastReplicationWrite >= REPLICATION_INTERVAL then
+            lastReplicationWrite = now
+            local writeOK, writeErr = pcall(function()
+                rootWrapper.CFrame = kinematicPose
+            end)
+            if not writeOK then
+                replicationWriteFailures = replicationWriteFailures + 1
+                print("TARDIS FIU WRAPPER WRITE FAILED:", tostring(writeErr))
+                dropFlight("WRAPPER CFRAME WRITE REJECTED")
+                return
+            end
+            replicationWrites = replicationWrites + 1
+            if replicationWrites == 1 then
+                print("TARDIS FIU WRAPPER WRITE ACCEPTED / spectator verification required")
+            end
         end
     elseif velocityFallback then
         local ok, err = pcall(function()
@@ -711,8 +741,8 @@ local function updatePhysics(dt)
             "requested", desiredVelocity.Magnitude,
             "actual", root.AssemblyLinearVelocity.Magnitude,
             "mass", tostring(root.AssemblyMass),
-            "direct", tostring(velocityFallback),
-            "rootCFrame", tostring(kinematicFallback))
+            "FIUWrapperWrites", replicationWrites,
+            "writeErrors", replicationWriteFailures)
         motionStart, motionPosition = now, root.Position
     end
     if outputB and now - lastPositionWrite >= .1 then
@@ -797,7 +827,7 @@ end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 4.4 READY / native Roblox orbit camera / compact GUI")
+print("TARDIS FLIGHT 5.0 READY / FIU wrapper CFrame sync / native Roblox camera")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
