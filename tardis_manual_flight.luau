@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 4.2 | Ultimate Build FIU
+-- TARDIS FLIGHT 4.3 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates; never animates individual shell CFrames.
 -- Requires the matching controller's unanchored welded exterior.
@@ -49,6 +49,9 @@ local motionStart, motionPosition, stalledChecks = 0, nil, 0
 local kinematicFallback, kinematicPose = false, nil
 local kinematicStallChecks = 0
 local heartbeatConnection, renderConnection = nil, nil
+local lastRenderCallback = 0
+local lastCameraWrite = 0
+local cameraBound = false
 local gui, statusLabel, speedLabel, coords = nil, nil, nil, {}
 local lastGuiAttempt, lastGuiError = 0, nil
 local statusMessage = "READY"
@@ -186,7 +189,10 @@ end
 
 local function engageCamera()
     local cam = camera()
-    if not cam then return end
+    if not cam then
+        status("CAMERA UNAVAILABLE / check CurrentCamera")
+        return
+    end
     if not savedCamera then
         pcall(function()
             savedCamera = {
@@ -196,10 +202,11 @@ local function engageCamera()
             }
         end)
     end
-    pcall(function()
+    local ok, err = pcall(function()
         cam.CameraType = Enum.CameraType.Scriptable
         cam.FieldOfView = 70
     end)
+    if not ok then status("CAMERA SETUP FAILED: " .. tostring(err)) end
 end
 
 local function dropFlight(reason)
@@ -242,6 +249,8 @@ local function takeoff()
     local flat = Vector3.new(look.X, 0, look.Z)
     travelHeading = flat.Magnitude > .01 and flat.Unit or Vector3.new(0, 0, -1)
     cameraHeading = travelHeading
+    cameraPose = nil
+    lastCameraWrite = 0
     takeoffUntil = os.clock() + .8
     motionStart, motionPosition, stalledChecks = os.clock(), root.Position, 0
     flying, autopilot, cameraEnabled = true, false, true
@@ -657,10 +666,19 @@ end
 local function updateCamera(dt)
     if not flying or not cameraEnabled or navigationOpen() then return end
     local cam = camera()
-    if not cam or not root then return end
-    local cf = root.CFrame
-    local velocity = root.AssemblyLinearVelocity
-    if not cameraHeading then cameraHeading = cf.LookVector end
+    if not cam or not root then
+        status("CAMERA UNAVAILABLE")
+        return
+    end
+
+    -- In FIU the client may accept root.CFrame writes while root.Position and
+    -- root.CFrame reads remain stale. Follow the pose we actually commanded
+    -- in that fallback mode. The box stays centered in the chase camera.
+    local cf = (kinematicFallback and kinematicPose) or root.CFrame
+    local velocity = kinematicFallback and desiredVelocity or root.AssemblyLinearVelocity
+    if not cf then return end
+
+    if not cameraHeading then cameraHeading = travelHeading end
     if velocity.Magnitude > 8 then
         local v = cameraHeading:Lerp(velocity.Unit,
             1 - math.exp(-3 * math.clamp(dt or UPDATE, 0, .1)))
@@ -670,13 +688,19 @@ local function updateCamera(dt)
         cf.Position - cameraHeading * 24 + Vector3.new(0, 11, 0),
         cf.Position + Vector3.new(0, 2, 0)
     )
-    local alpha = 1 - math.exp(-8 * math.clamp(dt or UPDATE, 0, .1))
+    local alpha = 1 - math.exp(-9 * math.clamp(dt or UPDATE, 0, .1))
     cameraPose = cameraPose and cameraPose:Lerp(desired, alpha) or desired
-    pcall(function()
+
+    local ok, err = pcall(function()
         cam.CameraType = Enum.CameraType.Scriptable
         cam.CFrame = cameraPose
         cam.FieldOfView = 70 + math.min(12, velocity.Magnitude / 22)
     end)
+    if not ok then
+        status("CAMERA WRITE FAILED: " .. tostring(err))
+    else
+        lastCameraWrite = os.clock()
+    end
 end
 
 if UserInputService then pcall(function()
@@ -711,17 +735,38 @@ if RunService then
         end)
     end)
     if ok then heartbeatConnection = conn end
-    local renderOK, renderConn = pcall(function()
-        return RunService.RenderStepped:Connect(function(dt)
-            updateCamera(dt)
-        end)
+    -- Run immediately AFTER Roblox's default camera update so its CameraType
+    -- cannot overwrite our Scriptable pose on the same frame.
+    local renderFrame = function(dt)
+        lastRenderCallback = os.clock()
+        if not kinematicFallback then updateCamera(dt) end
+    end
+    local bound = pcall(function()
+        RunService:BindToRenderStep(
+            "TardisFlightChaseCamera",
+            Enum.RenderPriority.Camera.Value + 1,
+            renderFrame
+        )
     end)
-    if renderOK then renderConnection = renderConn end
+    if bound then
+        cameraBound = true
+        print("TARDIS CAMERA: post-camera render binding active")
+    else
+        local renderOK, renderConn = pcall(function()
+            return RunService.RenderStepped:Connect(renderFrame)
+        end)
+        if renderOK then
+            renderConnection = renderConn
+            print("TARDIS CAMERA: RenderStepped listener active")
+        else
+            print("TARDIS CAMERA: render hooks unavailable, using task follow")
+        end
+    end
 end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 4.2 READY / root motion fallback / compact GUI")
+print("TARDIS FLIGHT 4.3 READY / root-synced chase camera / compact GUI")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
@@ -747,6 +792,10 @@ while true do
     if flying and (not heartbeatConnection or now - lastHeartbeat > .6) then
         updatePhysics(dt)
     end
-    if flying and not renderConnection then updateCamera(dt) end
+    -- Always follow the commanded pose for kinematic flight. Also recover if
+    -- FIU creates a render connection but never invokes its callback.
+    if flying and (kinematicFallback or now - lastRenderCallback > .15) then
+        updateCamera(dt)
+    end
     task.wait(UPDATE)
 end
