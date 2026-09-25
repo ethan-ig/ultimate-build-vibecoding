@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 4.3 | Ultimate Build FIU
+-- TARDIS FLIGHT 4.4 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates; never animates individual shell CFrames.
 -- Requires the matching controller's unanchored welded exterior.
@@ -10,6 +10,7 @@
 -- Output A: active boolean. Output B: actual root world Vector3.
 --
 -- GUI: TAKEOFF / GO / HOVER / DROP / +/- speed, X Y Z target fields.
+-- Native Roblox Custom camera: mouse orbit, scroll zoom, no scripted camera CFrame.
 -- Keyboard W/S: thrust, A/D: steer, Q/E: up/down, Shift: boost,
 -- Space: hover, +/-: speed, G: autopilot, V: camera, X: drop.
 -- Box spins with gentle wobble independently of travel heading.
@@ -38,7 +39,8 @@ if Players then pcall(function() player = Players.LocalPlayer end) end
 
 local root, attachment, linear, angular = nil, nil, nil, nil
 local flying, autopilot, velocityFallback = false, false, false
-local cameraEnabled, savedCamera, cameraPose, cameraHeading = true, nil, nil, nil
+local cameraEnabled, savedCamera, cameraTarget = true, nil, nil
+local lastCameraCheck = 0
 local keyDown, target, speedLimit, desiredVelocity = {}, nil, 80, Vector3.zero
 local travelHeading = Vector3.new(0, 0, -1)
 local previousTarget, previousSpeed = nil, nil
@@ -48,10 +50,8 @@ local takeoffUntil, lastTick = 0, os.clock()
 local motionStart, motionPosition, stalledChecks = 0, nil, 0
 local kinematicFallback, kinematicPose = false, nil
 local kinematicStallChecks = 0
-local heartbeatConnection, renderConnection = nil, nil
-local lastRenderCallback = 0
-local lastCameraWrite = 0
-local cameraBound = false
+local heartbeatConnection = nil
+local updateCamera
 local gui, statusLabel, speedLabel, coords = nil, nil, nil, {}
 local lastGuiAttempt, lastGuiError = 0, nil
 local statusMessage = "READY"
@@ -176,20 +176,51 @@ local function buildMotors()
     return true
 end
 
+local function playerCameraSubject()
+    if not player then return nil end
+    local found = nil
+    pcall(function()
+        local character = player.Character
+        if character then
+            found = character:FindFirstChildOfClass("Humanoid")
+                or character:FindFirstChild("HumanoidRootPart")
+        end
+    end)
+    return found
+end
+
 local function restoreCamera()
-    if not savedCamera then return end
     local cam = camera()
-    if cam then pcall(function()
-        if savedCamera.subject then cam.CameraSubject = savedCamera.subject end
-        if savedCamera.fov then cam.FieldOfView = savedCamera.fov end
-        cam.CameraType = savedCamera.kind or Enum.CameraType.Custom
-    end) end
-    savedCamera, cameraPose = nil, nil
+    if cam and savedCamera then
+        local previous = savedCamera
+        local subject = previous.subject
+        -- If an earlier run left its camera proxy behind, return to the
+        -- player's character instead of following an orphaned invisible Part.
+        local isOldProxy = false
+        pcall(function()
+            isOldProxy = subject and subject.Name == "TardisFlightCameraTarget"
+        end)
+        if not subject or isOldProxy then
+            subject = playerCameraSubject()
+        end
+        local ok, err = pcall(function()
+            if subject then cam.CameraSubject = subject end
+            if previous.fov then cam.FieldOfView = previous.fov end
+            cam.CameraType = previous.kind == Enum.CameraType.Scriptable
+                and Enum.CameraType.Custom or (previous.kind or Enum.CameraType.Custom)
+        end)
+        if not ok then print("TARDIS CAMERA RESTORE:", tostring(err)) end
+    end
+    savedCamera = nil
+    if cameraTarget then
+        pcall(function() cameraTarget:Destroy() end)
+        cameraTarget = nil
+    end
 end
 
 local function engageCamera()
     local cam = camera()
-    if not cam then
+    if not cam or not root then
         status("CAMERA UNAVAILABLE / check CurrentCamera")
         return
     end
@@ -202,11 +233,40 @@ local function engageCamera()
             }
         end)
     end
+    if not cameraTarget then
+        local ok, err = pcall(function()
+            -- Keep this proxy independent from the TARDIS weld assembly. It
+            -- follows POSITION only, so exterior spin never rotates the view.
+            local old = workspace:FindFirstChild("TardisFlightCameraTarget")
+            if old then old:Destroy() end
+            local part = Instance.new("Part")
+            part.Name = "TardisFlightCameraTarget"
+            part.Size = Vector3.new(.2, .2, .2)
+            part.Transparency = 1
+            part.Anchored = true
+            part.CanCollide = false
+            pcall(function() part.CanTouch = false end)
+            pcall(function() part.CanQuery = false end)
+            local pose = (kinematicFallback and kinematicPose) or root.CFrame
+            part.CFrame = CFrame.new(pose.Position + Vector3.new(0, 2, 0))
+            part.Parent = workspace
+            cameraTarget = part
+        end)
+        if not ok then
+            status("CAMERA TARGET FAILED: " .. tostring(err))
+            return
+        end
+    end
     local ok, err = pcall(function()
-        cam.CameraType = Enum.CameraType.Scriptable
-        cam.FieldOfView = 70
+        cam.CameraSubject = cameraTarget
+        cam.CameraType = Enum.CameraType.Custom
     end)
-    if not ok then status("CAMERA SETUP FAILED: " .. tostring(err)) end
+    if not ok then
+        status("CAMERA SETUP FAILED: " .. tostring(err))
+    else
+        print("TARDIS CAMERA: ROBLOX CUSTOM / free orbit + mouse zoom")
+        lastCameraCheck = os.clock()
+    end
 end
 
 local function dropFlight(reason)
@@ -248,9 +308,7 @@ local function takeoff()
     local look = root.CFrame.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
     travelHeading = flat.Magnitude > .01 and flat.Unit or Vector3.new(0, 0, -1)
-    cameraHeading = travelHeading
-    cameraPose = nil
-    lastCameraWrite = 0
+    lastCameraCheck = 0
     takeoffUntil = os.clock() + .8
     motionStart, motionPosition, stalledChecks = os.clock(), root.Position, 0
     flying, autopilot, cameraEnabled = true, false, true
@@ -659,47 +717,47 @@ local function updatePhysics(dt)
     end
     if outputB and now - lastPositionWrite >= .1 then
         lastPositionWrite = now
-        output(outputB, root.Position)
+        output(outputB, kinematicFallback and kinematicPose.Position or root.Position)
     end
+    -- Update the follow subject on the physics tick, independently from
+    -- Roblox's native render-frame orbit and scroll-wheel zoom.
+    if cameraEnabled then updateCamera() end
 end
 
-local function updateCamera(dt)
-    if not flying or not cameraEnabled or navigationOpen() then return end
-    local cam = camera()
-    if not cam or not root then
-        status("CAMERA UNAVAILABLE")
+updateCamera = function()
+    if not flying or not cameraEnabled or not cameraTarget or not root then return end
+    local pose = (kinematicFallback and kinematicPose) or root.CFrame
+    if not pose then return end
+    local ok, err = pcall(function()
+        cameraTarget.CFrame = CFrame.new(pose.Position + Vector3.new(0, 2, 0))
+    end)
+    if not ok then
+        status("CAMERA FOLLOW FAILED: " .. tostring(err))
         return
     end
 
-    -- In FIU the client may accept root.CFrame writes while root.Position and
-    -- root.CFrame reads remain stale. Follow the pose we actually commanded
-    -- in that fallback mode. The box stays centered in the chase camera.
-    local cf = (kinematicFallback and kinematicPose) or root.CFrame
-    local velocity = kinematicFallback and desiredVelocity or root.AssemblyLinearVelocity
-    if not cf then return end
-
-    if not cameraHeading then cameraHeading = travelHeading end
-    if velocity.Magnitude > 8 then
-        local v = cameraHeading:Lerp(velocity.Unit,
-            1 - math.exp(-3 * math.clamp(dt or UPDATE, 0, .1)))
-        if v.Magnitude > .01 then cameraHeading = v.Unit end
-    end
-    local desired = CFrame.lookAt(
-        cf.Position - cameraHeading * 24 + Vector3.new(0, 11, 0),
-        cf.Position + Vector3.new(0, 2, 0)
-    )
-    local alpha = 1 - math.exp(-9 * math.clamp(dt or UPDATE, 0, .1))
-    cameraPose = cameraPose and cameraPose:Lerp(desired, alpha) or desired
-
-    local ok, err = pcall(function()
-        cam.CameraType = Enum.CameraType.Scriptable
-        cam.CFrame = cameraPose
-        cam.FieldOfView = 70 + math.min(12, velocity.Magnitude / 22)
-    end)
-    if not ok then
-        status("CAMERA WRITE FAILED: " .. tostring(err))
-    else
-        lastCameraWrite = os.clock()
+    -- Navigation temporarily owns the view. Once it closes, reinstate the
+    -- native orbit camera WITHOUT forcing any camera CFrame or mouse angle.
+    local now = os.clock()
+    if now - lastCameraCheck > .5 and not navigationOpen() then
+        lastCameraCheck = now
+        local cam = camera()
+        if cam then
+            local needsFollow = false
+            pcall(function()
+                needsFollow = cam.CameraSubject ~= cameraTarget
+                    or cam.CameraType ~= Enum.CameraType.Custom
+            end)
+            if needsFollow then
+                local changed, changeErr = pcall(function()
+                    cam.CameraSubject = cameraTarget
+                    cam.CameraType = Enum.CameraType.Custom
+                end)
+                if not changed then
+                    status("CAMERA SUBJECT FAILED: " .. tostring(changeErr))
+                end
+            end
+        end
     end
 end
 
@@ -735,38 +793,11 @@ if RunService then
         end)
     end)
     if ok then heartbeatConnection = conn end
-    -- Run immediately AFTER Roblox's default camera update so its CameraType
-    -- cannot overwrite our Scriptable pose on the same frame.
-    local renderFrame = function(dt)
-        lastRenderCallback = os.clock()
-        if not kinematicFallback then updateCamera(dt) end
-    end
-    local bound = pcall(function()
-        RunService:BindToRenderStep(
-            "TardisFlightChaseCamera",
-            Enum.RenderPriority.Camera.Value + 1,
-            renderFrame
-        )
-    end)
-    if bound then
-        cameraBound = true
-        print("TARDIS CAMERA: post-camera render binding active")
-    else
-        local renderOK, renderConn = pcall(function()
-            return RunService.RenderStepped:Connect(renderFrame)
-        end)
-        if renderOK then
-            renderConnection = renderConn
-            print("TARDIS CAMERA: RenderStepped listener active")
-        else
-            print("TARDIS CAMERA: render hooks unavailable, using task follow")
-        end
-    end
 end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 4.3 READY / root-synced chase camera / compact GUI")
+print("TARDIS FLIGHT 4.4 READY / native Roblox orbit camera / compact GUI")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
@@ -792,10 +823,8 @@ while true do
     if flying and (not heartbeatConnection or now - lastHeartbeat > .6) then
         updatePhysics(dt)
     end
-    -- Always follow the commanded pose for kinematic flight. Also recover if
-    -- FIU creates a render connection but never invokes its callback.
-    if flying and (kinematicFallback or now - lastRenderCallback > .15) then
-        updateCamera(dt)
-    end
+    -- Refresh proxy even if the FIU Heartbeat callback stalls; Roblox's
+    -- default CameraModule handles every rendered camera frame itself.
+    if flying and cameraEnabled then updateCamera() end
     task.wait(UPDATE)
 end
