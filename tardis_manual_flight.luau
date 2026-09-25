@@ -50,7 +50,7 @@ local speedLimit, target = 80, nil
 local desiredVelocity = Vector3.zero
 local keyDown, lastA, lastC = {}, false, false
 local previousB, previousD = nil, nil
-local savedCamera, lastCameraFrame = nil, nil
+local savedCamera, lastCameraFrame, cameraHeading = nil, nil, nil
 local renderConnection, heartbeatConnection = nil, nil
 local lastHeartBeat = 0
 local lastTargetRead, lastOutput, lastSafety = 0, 0, 0
@@ -219,6 +219,7 @@ local function startFlight()
     desiredVelocity = Vector3.zero
     flying, autopilot, cameraEnabled = true, false, true
     lastCameraFrame = nil
+    cameraHeading = root.CFrame.LookVector
     thrust.VectorVelocity = Vector3.zero
     spin.AngularVelocity = Vector3.new(0, NORMAL_SPIN, 0)
     thrust.Enabled, spin.Enabled = true, true
@@ -368,12 +369,21 @@ local function updateCamera(dt)
     local cam = getCamera()
     if not cam or not root then return end
     local cf = root.CFrame
-    local speed = root.AssemblyLinearVelocity.Magnitude
+    local actualVelocity = root.AssemblyLinearVelocity
+    local speed = actualVelocity.Magnitude
+    local alpha = 1 - math.exp(-8 * math.clamp(dt or UPDATE, 0, 0.1))
+    -- Let the POLICE BOX spin in the shot. Do not orbit the camera with
+    -- its rotating LookVector, which makes the whole world appear to spin.
+    if not cameraHeading then cameraHeading = cf.LookVector end
+    if speed > 8 then
+        local mixed = cameraHeading:Lerp(actualVelocity.Unit,
+            1 - math.exp(-3 * math.clamp(dt or UPDATE, 0, 0.1)))
+        if mixed.Magnitude > 0.01 then cameraHeading = mixed.Unit end
+    end
     local desired = CFrame.lookAt(
-        cf.Position - cf.LookVector * 22 + Vector3.new(0, 11, 0),
+        cf.Position - cameraHeading * 24 + Vector3.new(0, 11, 0),
         cf.Position + Vector3.new(0, 2, 0)
     )
-    local alpha = 1 - math.exp(-8 * math.clamp(dt or UPDATE, 0, 0.1))
     lastCameraFrame = lastCameraFrame and lastCameraFrame:Lerp(desired, alpha) or desired
     pcall(function()
         cam.CameraType = Enum.CameraType.Scriptable
