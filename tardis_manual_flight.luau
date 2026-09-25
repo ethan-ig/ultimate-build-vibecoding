@@ -33,7 +33,8 @@ local MIN_SPEED, MAX_SPEED, SPEED_STEP = 10, 265, 10
 local ACCELERATION, BRAKING = 55, 105
 local ARRIVAL_RADIUS = 2.8
 local NORMAL_SPIN = 0.90 -- radians/sec, about 1 revolution per 7 seconds
-local STEER_SPIN = 1.10
+local STEER_SPIN = 0.40
+local TURN_SPEED = math.rad(70)
 local WOBBLE = 0.11
 local UPDATE = 1 / 30
 local NAV_GUI = "TardisNavigationGui"
@@ -48,6 +49,7 @@ local root, attachment, thrust, spin = nil, nil, nil, nil
 local flying, autopilot, cameraEnabled = false, false, true
 local speedLimit, target = 80, nil
 local desiredVelocity = Vector3.zero
+local flightHeading = Vector3.new(0, 0, -1)
 local keyDown, lastA, lastC = {}, false, false
 local previousB, previousD = nil, nil
 local savedCamera, lastCameraFrame, cameraHeading = nil, nil, nil
@@ -221,7 +223,10 @@ local function startFlight()
     takeoffUntil = os.clock() + 0.8
     flying, autopilot, cameraEnabled = true, false, true
     lastCameraFrame = nil
-    cameraHeading = root.CFrame.LookVector
+    local look = root.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    flightHeading = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+    cameraHeading = flightHeading
     thrust.VectorVelocity = Vector3.zero
     spin.AngularVelocity = Vector3.new(0, NORMAL_SPIN, 0)
     thrust.Enabled, spin.Enabled = true, true
@@ -323,6 +328,12 @@ local function updatePhysics(dt)
         - (held(Enum.KeyCode.A) and 1 or 0)
     local braking = held(Enum.KeyCode.Space)
     local boosting = held(Enum.KeyCode.LeftShift) or held(Enum.KeyCode.RightShift)
+    -- A/D steer the travel bearing independently of the visually spinning
+    -- box. Holding W therefore flies straight instead of tracing a tiny circle.
+    if steer ~= 0 then
+        flightHeading = CFrame.Angles(0, -steer * TURN_SPEED * dt, 0)
+            :VectorToWorldSpace(flightHeading)
+    end
 
     if autopilot and (go ~= 0 or lift ~= 0 or braking) then
         autopilot = false
@@ -344,8 +355,8 @@ local function updatePhysics(dt)
             requested = delta.Unit * safeSpeed
         end
     else
-        -- Spin makes the manual forward direction naturally corkscrew.
-        requested = root.CFrame.LookVector * (go * top)
+        -- Visual spin is independent of the direction of travel.
+        requested = flightHeading * (go * top)
             + Vector3.new(0, lift * top * 0.70, 0)
         if requested.Magnitude > top then requested = requested.Unit * top end
         -- Clear the ground before starting the cinematic spin. No teleport:
