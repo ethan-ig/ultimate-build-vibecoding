@@ -42,6 +42,7 @@ local cameraEnabled, savedCamera, cameraPose, cameraHeading = true, nil, nil, ni
 local keyDown, target, speedLimit, desiredVelocity = {}, nil, 80, Vector3.zero
 local travelHeading = Vector3.new(0, 0, -1)
 local previousTarget, previousSpeed = nil, nil
+local guiTargetLocked = false
 local lastInputA, lastInputC = false, false
 local lastTargetRead, lastPositionWrite, lastGuard, lastHeartbeat = 0, 0, 0, 0
 local takeoffUntil, lastTick = 0, os.clock()
@@ -289,7 +290,9 @@ local function readWiredInputs(now)
         pcall(function() v = inputB:GetState() end)
         local p = parseTarget(v)
         if p and (not previousTarget or (p - previousTarget).Magnitude > .01) then
-            previousTarget, target = p, p
+            previousTarget = p
+            if not guiTargetLocked then target = p end
+            guiTargetLocked = false
             if coords[1] then
                 for i, n in ipairs({p.X, p.Y, p.Z}) do
                     local field = coords[i]
@@ -342,9 +345,15 @@ end
 -- GUI is created ONCE. No continuously changing telemetry or animated bars.
 -- The small panel remains available when dropped so TAKEOFF needs no input A.
 local function rounded(parent, radius)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, radius)
-    corner.Parent = parent
+    pcall(function()
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, radius)
+        corner.Parent = parent
+    end)
+end
+
+local function offsetUDim(x, y)
+    return UDim2.new(0, x, 0, y)
 end
 
 local function uiText(parent, text, pos, size, textSize, tint, strong)
@@ -363,7 +372,7 @@ end
 
 local function uiButton(parent, text, x, y, width, action)
     local button = Instance.new("TextButton")
-    button.Size, button.Position = UDim2.fromOffset(width, 32), UDim2.fromOffset(x, y)
+    button.Size, button.Position = offsetUDim(width, 32), offsetUDim(x, y)
     button.BackgroundColor3 = Color3.fromRGB(28, 75, 106)
     button.BorderSizePixel = 0
     button.TextColor3 = Color3.fromRGB(235, 250, 255)
@@ -372,7 +381,10 @@ local function uiButton(parent, text, x, y, width, action)
     button.Font = Enum.Font.GothamBold
     button.Parent = parent
     rounded(button, 6)
-    button.Activated:Connect(action)
+    local activated = pcall(function() button.Activated:Connect(action) end)
+    if not activated then
+        button.MouseButton1Click:Connect(action)
+    end
     return button
 end
 
@@ -384,7 +396,15 @@ end
 local function goFromGUI()
     local p = readGUI()
     if not p then status("INVALID X / Y / Z"); return end
+    -- Snapshot any existing wired target so an old input-B value does not
+    -- immediately overwrite the coordinates the pilot just typed.
+    if inputB then
+        local wired = nil
+        pcall(function() wired = inputB:GetState() end)
+        previousTarget = parseTarget(wired) or previousTarget
+    end
     target = p
+    guiTargetLocked = true
     startAuto()
 end
 
@@ -408,26 +428,28 @@ local function buildGUI()
 
         local frame = Instance.new("Frame")
         frame.Position = UDim2.new(1, -358, 0, 18)
-        frame.Size = UDim2.fromOffset(340, 239)
+        frame.Size = offsetUDim(340, 239)
         frame.BackgroundColor3 = Color3.fromRGB(9, 20, 35)
         frame.BackgroundTransparency = .10
         frame.BorderSizePixel = 0
         frame.Parent = screen
         rounded(frame, 9)
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = Color3.fromRGB(55, 168, 207)
-        stroke.Thickness = 1
-        stroke.Transparency = .25
-        stroke.Parent = frame
+        pcall(function()
+            local stroke = Instance.new("UIStroke")
+            stroke.Color = Color3.fromRGB(55, 168, 207)
+            stroke.Thickness = 1
+            stroke.Transparency = .25
+            stroke.Parent = frame
+        end)
 
-        uiText(frame, "TYPE 40  /  FLIGHT", UDim2.fromOffset(12, 7),
-            UDim2.fromOffset(310, 25), 16, Color3.fromRGB(110, 225, 250), true)
-        uiText(frame, "DESTINATION (WORLD X / Y / Z)", UDim2.fromOffset(12, 39),
-            UDim2.fromOffset(311, 18), 11)
+        uiText(frame, "TYPE 40  /  FLIGHT", offsetUDim(12, 7),
+            offsetUDim(310, 25), 16, Color3.fromRGB(110, 225, 250), true)
+        uiText(frame, "DESTINATION (WORLD X / Y / Z)", offsetUDim(12, 39),
+            offsetUDim(311, 18), 11)
         for i, name in ipairs({"X", "Y", "Z"}) do
             local field = Instance.new("TextBox")
-            field.Position = UDim2.fromOffset(12 + (i - 1) * 107, 62)
-            field.Size = UDim2.fromOffset(100, 29)
+            field.Position = offsetUDim(12 + (i - 1) * 107, 62)
+            field.Size = offsetUDim(100, 29)
             field.BackgroundColor3 = Color3.fromRGB(22, 44, 66)
             field.BorderSizePixel = 0
             field.Font = Enum.Font.Code
@@ -447,10 +469,10 @@ local function buildGUI()
         uiButton(frame, "GO", 119, 102, 102, goFromGUI)
         uiButton(frame, "DROP", 227, 102, 100,
             function() dropFlight("DROP / gravity released") end)
-        uiText(frame, "CRUISE SPEED", UDim2.fromOffset(12, 148),
-            UDim2.fromOffset(145, 22), 12)
-        speedLabel = uiText(frame, tostring(speedLimit), UDim2.fromOffset(180, 146),
-            UDim2.fromOffset(47, 24), 18, Color3.fromRGB(110, 225, 250), true)
+        uiText(frame, "CRUISE SPEED", offsetUDim(12, 148),
+            offsetUDim(145, 22), 12)
+        speedLabel = uiText(frame, tostring(speedLimit), offsetUDim(180, 146),
+            offsetUDim(47, 24), 18, Color3.fromRGB(110, 225, 250), true)
         uiButton(frame, "-", 231, 144, 42, function() changeSpeed(-SPEED_STEP) end)
         uiButton(frame, "+", 281, 144, 42, function() changeSpeed(SPEED_STEP) end)
         uiButton(frame, "HOVER / ABORT", 12, 185, 126, function()
@@ -458,8 +480,8 @@ local function buildGUI()
             desiredVelocity = Vector3.zero
             status("HOVER / autopilot off")
         end)
-        statusLabel = uiText(frame, statusMessage, UDim2.fromOffset(147, 185),
-            UDim2.fromOffset(181, 48), 11, Color3.fromRGB(140, 230, 196))
+        statusLabel = uiText(frame, statusMessage, offsetUDim(147, 185),
+            offsetUDim(181, 48), 11, Color3.fromRGB(140, 230, 196))
     end)
     if not ok then
         print("TARDIS FLIGHT GUI ERROR:", tostring(err))
@@ -500,8 +522,8 @@ local function updatePhysics(dt)
     local boost = held(Enum.KeyCode.LeftShift) or held(Enum.KeyCode.RightShift)
 
     if steer ~= 0 then
-        travelHeading = CFrame.Angles(0, -steer * TURN_RATE * dt)
-            :VectorToWorldSpace(travelHeading)
+        local bearingTurn = CFrame.Angles(0, -steer * TURN_RATE * dt)
+        travelHeading = bearingTurn:VectorToWorldSpace(travelHeading)
     end
     if autopilot and (go ~= 0 or lift ~= 0 or brake) then
         autopilot = false
