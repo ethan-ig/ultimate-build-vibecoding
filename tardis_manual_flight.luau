@@ -1,7 +1,8 @@
--- TARDIS FLIGHT 5.1 | Ultimate Build FIU
+-- TARDIS FLIGHT 6.0 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
--- No per-frame GUI updates; only one welded root CFrame is driven.
--- The FIU wrapper receives throttled authoritative-position requests.
+-- No per-frame GUI updates. Replicated movement writes go to EVERY exterior
+-- Ultimate Build part proxy using the same CFrame setter as the hovering cubes.
+-- Local root prediction handles in-between frames and the camera.
 -- Requires the matching controller's unanchored welded exterior.
 --
 -- Input A: optional TRUE pulse to take off / drop.
@@ -32,7 +33,9 @@ local MIN_SPEED, MAX_SPEED, SPEED_STEP = 10, 265, 10
 local ACCELERATION, BRAKING, ARRIVAL_RADIUS = 55, 105, 2.8
 local SPIN_RATE, STEER_SPIN, TURN_RATE, WOBBLE = 0.9, 0.4, math.rad(70), 0.11
 local UPDATE = 1 / 30
-local REPLICATION_INTERVAL = 1 / 20 -- One FIU wrapper write per 50 ms, not 155 parts
+local MAX_REPLICATION_RATE = 12 -- Upper bound, adjusted for shell count
+local MAX_PROXY_WRITES_PER_SECOND = 2200
+local REPLICATION_INTERVAL = 1 / MAX_REPLICATION_RATE
 local NAV_GUI = "TardisNavigationGui"
 local RunService, Players, UserInputService = nil, nil, nil
 pcall(function() RunService = game:GetService("RunService") end)
@@ -42,8 +45,10 @@ local player = nil
 if Players then pcall(function() player = Players.LocalPlayer end) end
 
 local root, rootWrapper, attachment, linear, angular = nil, nil, nil, nil
+local exteriorProxies, exteriorOffsets = {}, {}
 local lastReplicationWrite, replicationWrites = 0, 0
-local replicationWriteFailures = 0
+local replicationWriteFailures, lastFailureLog = 0, 0
+local lastSuccessfulWriteCount, lastProxySummary = 0, 0
 local flying, autopilot, velocityFallback = false, false, false
 local cameraEnabled, savedCamera, cameraTarget = true, nil, nil
 local lastCameraCheck = 0
@@ -127,6 +132,99 @@ local function findRoot()
         end
     end
     return selectedRoot, selectedWrapper
+end
+
+-- Matches the original admin cubes' proxy movement path. The controller
+-- uses the same DisplayName matching for its 155 exterior parts. We do not
+-- clone or destroy the build: drive the EXISTING editable UB block proxies.
+local function proxyDisplayName(object)
+    if not object then return nil end
+    local value = nil
+    pcall(function() value = object.attributes["Display name"] end)
+    if type(value) == "string" and value ~= "" then return value end
+    pcall(function() value = object.DisplayName end)
+    if type(value) == "string" and value ~= "" then return value end
+    pcall(function() value = object:GetAttribute("Display name") end)
+    if type(value) == "string" and value ~= "" then return value end
+    return nil
+end
+
+local function prepareExteriorProxies(pivot)
+    exteriorProxies, exteriorOffsets = {}, {}
+    local seenRaw = {}
+    local function add(object)
+        if not object or object == script then return end
+        local readOK, cf = pcall(function() return object.CFrame end)
+        if not readOK or typeof(cf) ~= "CFrame" then return end
+        local raw = basePart(object) or object
+        if seenRaw[raw] then return end
+        seenRaw[raw] = true
+        table.insert(exteriorProxies, object)
+        exteriorOffsets[object] = pivot:ToObjectSpace(cf)
+    end
+
+    add(rootWrapper)
+    local shellCount, accessoryCount = 0, 0
+    for _, block in ipairs(workspace:GetDescendants()) do
+        local name = proxyDisplayName(block)
+        if type(name) == "string" then
+            name = string.lower(name)
+            if name == "tardis" then
+                add(block)
+                shellCount = shellCount + 1
+            elseif name == "tardismatsound" or name == "tardislight"
+                or name == "tardisportal" then
+                add(block)
+                accessoryCount = accessoryCount + 1
+            end
+        end
+    end
+
+    if #exteriorProxies < 2 then
+        print("TARDIS PROXY SCAN: only", #exteriorProxies,
+            "blocks. Refusing root-only local flight.")
+        return false
+    end
+    local actualRate = math.min(MAX_REPLICATION_RATE,
+        math.max(1, math.floor(MAX_PROXY_WRITES_PER_SECOND / #exteriorProxies)))
+    REPLICATION_INTERVAL = 1 / actualRate
+    print("TARDIS PROXY SCAN:", #exteriorProxies, "distinct blocks;",
+        shellCount, "shell matches;", accessoryCount, "accessories;",
+        actualRate, "replication Hz")
+    return true
+end
+
+local function replicateExterior(pivot, now)
+    if now - lastReplicationWrite < REPLICATION_INTERVAL then return true end
+    lastReplicationWrite = now
+    local failed, wrote = 0, 0
+    for _, proxy in ipairs(exteriorProxies) do
+        local offset = exteriorOffsets[proxy]
+        if offset then
+            -- Exact setter from the replicated chat cubes: proxy.CFrame = ...
+            local ok, err = pcall(function() proxy.CFrame = pivot * offset end)
+            if ok then
+                wrote = wrote + 1
+            else
+                failed = failed + 1
+                if failed <= 3 and now - lastFailureLog > 2 then
+                    print("TARDIS PROXY WRITE REJECTED:", tostring(err))
+                    lastFailureLog = now
+                end
+            end
+        end
+    end
+    replicationWrites = replicationWrites + wrote
+    replicationWriteFailures = replicationWriteFailures + failed
+    lastSuccessfulWriteCount = wrote
+    if now - lastProxySummary > 5 then
+        lastProxySummary = now
+        print("TARDIS PROXY MOVEMENT:", wrote, "/", #exteriorProxies,
+            "wrote this tick; total failures", replicationWriteFailures)
+    end
+    -- If more than 20% of the exterior cannot be moved, stop. Never claim
+    -- that moving one root represents successful flight of the whole build.
+    return failed <= math.floor(#exteriorProxies * .2)
 end
 
 local function rigReady()
@@ -384,8 +482,7 @@ local function takeoff()
         return false
     end
     if not rootWrapper then
-        status("NO FIU ROOT WRAPPER / raw CFrame is local only")
-        print("TARDIS SYNC: root has no block wrapper. Cannot claim server replication.")
+        status("NO FIU ROOT WRAPPER")
         return false
     end
 
@@ -400,13 +497,17 @@ local function takeoff()
         return false
     end
 
-    -- Velocity constraints were updating their properties while the assembly
-    -- stood completely still. Start with the FIU's part wrapper instead of
-    -- cycling through methods we have already proved ineffective.
+    -- A single raw/root wrapper moved only locally in earlier builds.
+    -- Capture every named exterior proxy and its exact pivot-relative pose.
+    if not prepareExteriorProxies(initialPose) then
+        status("EXTERIOR PROXY SCAN FAILED / no root-only fallback")
+        return false
+    end
     clearMotors()
     velocityFallback, kinematicFallback = true, true
     kinematicPose, kinematicStallChecks = initialPose, 0
     lastReplicationWrite, replicationWrites, replicationWriteFailures = 0, 0, 0
+    lastSuccessfulWriteCount, lastProxySummary, lastFailureLog = 0, 0, 0
     desiredVelocity = Vector3.zero
     local look = initialPose.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
@@ -418,13 +519,13 @@ local function takeoff()
     pcall(function() root:SetAttribute("TardisFlightActive", true) end)
     engageCamera()
     output(outputA, true)
-    print("TARDIS REPLICATION: sending FIU wrapper CFrame, not raw Part.CFrame")
+    print("TARDIS REPLICATION: matching hovering cubes, all exterior proxy CFrames")
     print("TARDIS PHYSICS START:", "mass", tostring(root.AssemblyMass),
-        "anchored", tostring(root.Anchored), "mode", "FIU WRAPPER CFRAME")
+        "anchored", tostring(root.Anchored), "mode", "FULL EXTERIOR PROXIES")
     local ownerOK, owner = pcall(function() return root:GetNetworkOwner() end)
     print("TARDIS NETWORK OWNER:", ownerOK and
         (owner and tostring(owner.Name) or "server") or "unavailable to FIU")
-    status("FIU CFRAME FLIGHT / VERIFY WITH SECOND PLAYER")
+    status("FULL EXTERIOR PROXY FLIGHT")
     return true
 end
 
@@ -741,26 +842,12 @@ local function updatePhysics(dt)
             print("TARDIS LOCAL PREVIEW FAILED:", tostring(previewErr))
         end
 
-        if now - lastReplicationWrite >= REPLICATION_INTERVAL then
-            lastReplicationWrite = now
-            local writeOK, writeErr = pcall(function()
-                rootWrapper.CFrame = kinematicPose
-            end)
-            if not writeOK then
-                replicationWriteFailures = replicationWriteFailures + 1
-                print("TARDIS FIU WRAPPER WRITE FAILED:", tostring(writeErr))
-                dropFlight("WRAPPER CFRAME WRITE REJECTED")
-                return
-            end
-            replicationWrites = replicationWrites + 1
-            -- Optional native movement-block bridge. Do not rely on this
-            -- signal alone to prove replication; wire C only to a supported
-            -- in-game movement block that accepts a CFrame.
-            output(outputC, kinematicPose)
-            if replicationWrites == 1 then
-                print("TARDIS FIU WRAPPER WRITE ACCEPTED / spectator must confirm entire exterior")
-            end
+        if not replicateExterior(kinematicPose, now) then
+            dropFlight("EXTERIOR PROXY WRITES REJECTED")
+            return
         end
+        -- Optional native movement block bridge.
+        output(outputC, kinematicPose)
     elseif velocityFallback then
         local ok, err = pcall(function()
             root.AssemblyLinearVelocity = desiredVelocity
@@ -806,12 +893,12 @@ local function updatePhysics(dt)
                 status("ROOT CFRAME MOVING / CHECK ANOTHER PLAYER CAN SEE IT")
             end
         end
-        print("TARDIS MOTION CHECK:", "moved", actualDistance,
+        print("TARDIS MOTION CHECK:", "local root moved", actualDistance,
             "requested", desiredVelocity.Magnitude,
-            "actual", root.AssemblyLinearVelocity.Magnitude,
-            "mass", tostring(root.AssemblyMass),
-            "FIUWrapperWrites", replicationWrites,
-            "writeErrors", replicationWriteFailures)
+            "proxy count", #exteriorProxies,
+            "last proxy writes", lastSuccessfulWriteCount,
+            "total writes", replicationWrites,
+            "write errors", replicationWriteFailures)
         motionStart, motionPosition = now, root.Position
     end
     if outputB and now - lastPositionWrite >= .1 then
@@ -946,7 +1033,7 @@ end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 5.1.1 READY / FIU sync / native or mouse-orbit camera")
+print("TARDIS FLIGHT 6.0 READY / all UB exterior proxies / coordinate GUI")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
