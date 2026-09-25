@@ -597,9 +597,62 @@ if #shellParts > 0 and startingPivot then
             end
         end
 
+        -- Physics assembly mass can be stale immediately after changing
+        -- Anchored and creating welds. Let the joint graph settle before
+        -- deciding whether the shell is movable.
+        if rigReady then task.wait(0.10) end
         local massOK, mass = pcall(function() return rigRoot.AssemblyMass end)
         if rigReady and (not massOK or mass == math.huge or
                 type(mass) ~= "number" or mass ~= mass or mass <= 0) then
+            -- An infinite AssemblyMass normally means some rigidly connected
+            -- part remains anchored. Detect that part instead of removing
+            -- the safety check or unanchoring unrelated game geometry.
+            local function readableName(part)
+                local okName, fullName = pcall(function() return part:GetFullName() end)
+                if okName and type(fullName) == "string" then return fullName end
+                local okShort, shortName = pcall(function() return part.Name end)
+                return okShort and tostring(shortName) or "<unnamed>"
+            end
+
+            print("TARDIS RIG MASS DIAGNOSTIC:", tostring(mass),
+                "root anchored", tostring(rigRoot.Anchored),
+                "registered exterior parts", #rigMembers)
+            local rootOK, chosenRoot = pcall(function()
+                return rigRoot.AssemblyRootPart
+            end)
+            if rootOK and chosenRoot then
+                print("TARDIS ASSEMBLY ROOT:", readableName(chosenRoot),
+                    "anchored", tostring(chosenRoot.Anchored))
+            end
+
+            local foundAnchor = false
+            local connectedOK, connected = pcall(function()
+                return rigRoot:GetConnectedParts(true)
+            end)
+            if connectedOK and type(connected) == "table" then
+                local seen = {}
+                local function checkConnected(part)
+                    if not part or seen[part] then return end
+                    seen[part] = true
+                    local anchorOK, anchored = pcall(function() return part.Anchored end)
+                    if anchorOK and anchored == true then
+                        foundAnchor = true
+                        local ownership = rigMemberSet[part]
+                            and "registered exterior" or "EXTERNAL CONNECTION"
+                        rigFailure("CONNECTED ANCHOR",
+                            readableName(part) .. " / " .. ownership)
+                    end
+                end
+                checkConnected(rigRoot)
+                for _, part in ipairs(connected) do checkConnected(part) end
+                if not foundAnchor then
+                    print("TARDIS RIG: connected scan found no anchored parts;",
+                        "possible stale physics data or FIU simulation mismatch")
+                end
+            else
+                print("TARDIS RIG: GetConnectedParts unavailable:",
+                    tostring(connected))
+            end
             rigFailure("ASSEMBLY MASS",
                 massOK and ("invalid mass " .. tostring(mass)) or "cannot read AssemblyMass")
         end
