@@ -105,11 +105,23 @@ local function getDisplayName(part)
     return nil
 end
 
+-- FIU Input:GetState() can reject if an input is missing/unavailable while
+-- the Code Block is initializing. Do not treat a failed read as FALSE: that
+-- would accidentally dematerialize and move a heavy, unanchored exterior.
+local function readBoolInput(input, previous)
+    if not input then return previous, false end
+    local success, value = pcall(function()
+        return input:GetState()
+    end)
+    if success and type(value) == "boolean" then
+        return value, true
+    end
+    return previous, false
+end
+
 local function getOptionalBoolInput(input)
-    if not input then return false end
-    local state = false
-    pcall(function() state = input:GetState() == true end)
-    return state
+    local value = readBoolInput(input, false)
+    return value == true
 end
 
 local function fastTravelEnabled()
@@ -714,7 +726,12 @@ local findFloorY
 local findFloorNearY
 
 local function getInputDestination()
-    local value = inputC:GetState()
+    local value = nil
+    local readOK = pcall(function() value = inputC:GetState() end)
+    if not readOK then
+        print("TARDIS INPUT C: destination not readable")
+        return nil
+    end
     local requested = nil
 
     if typeof(value) == "Vector3" then
@@ -1128,7 +1145,14 @@ local function getVisualEndTime(block)
     return VISUAL_START_TIME + FALLBACK_FADE_TIME
 end
 
-local inputState = inputA:GetState() == true
+-- Preserve the physical shell on startup if A is not ready. In particular,
+-- a rejected GetState must never cause a blind trip to the hidden platform.
+local initiallyHidden = startingPivot
+    and (startingPivot.Position - HIDDEN_POSITION).Magnitude < 100 or false
+local inputState, inputAReady = readBoolInput(inputA, not initiallyHidden)
+if not inputAReady then
+    print("TARDIS INPUT A: not readable at startup; preserving exterior position")
+end
 local currentFade = inputState and 0 or 1
 local hidden = not inputState
 local lastInputState = inputState
@@ -1318,15 +1342,15 @@ local function finishTransition(transition)
 
         if transition.kind == "auto_materialize" then
             autoSequence = false
-            lastInputState = inputA:GetState() == true
+            lastInputState = readBoolInput(inputA, lastInputState)
             print("J RECALL COMPLETE")
         elseif transition.kind == "quick_recall_materialize" then
             autoSequence = false
-            lastInputState = inputA:GetState() == true
+            lastInputState = readBoolInput(inputA, lastInputState)
             print("E QUICK RECALL COMPLETE")
         elseif transition.kind == "quick_destination_materialize" then
             autoSequence = false
-            lastInputState = inputA:GetState() == true
+            lastInputState = readBoolInput(inputA, lastInputState)
             print("F QUICK DESTINATION COMPLETE")
         end
     end
@@ -1903,15 +1927,15 @@ while true do
     end
     lastFState = fState
 
-    local jState = inputJ:GetState() == true
+    local jState = getOptionalBoolInput(inputJ)
     if jState and not lastJState and not autoSequence then
         startAutoRecall()
     end
     lastJState = jState
 
     if not autoSequence then
-        local newState = inputA:GetState() == true
-        if newState ~= lastInputState then
+        local newState, readable = readBoolInput(inputA, lastInputState)
+        if readable and newState ~= lastInputState then
             lastInputState = newState
             if newState then
                 requestMaterialize("manual_materialize")
