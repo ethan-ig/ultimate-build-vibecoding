@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 6.1 | Ultimate Build FIU
+-- TARDIS FLIGHT 6.2 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates. Replicated movement writes go to EVERY exterior
 -- Ultimate Build part proxy using the same CFrame setter as the hovering cubes.
@@ -789,7 +789,28 @@ local function buildGUI()
     return true
 end
 
-local function held(key) return keyDown[key] == true end
+local function typingIntoTextBox()
+    if not UserInputService then return false end
+    local ok, focused = pcall(function()
+        return UserInputService:GetFocusedTextBox()
+    end)
+    return ok and focused ~= nil
+end
+
+local function held(key)
+    if typingIntoTextBox() then return false end
+    -- InputBegan may be marked processed by Roblox's normal character
+    -- controls. Poll the physical key itself so W/S/Q/E still steer flight.
+    if UserInputService then
+        local ok, down = pcall(function()
+            return UserInputService:IsKeyDown(key)
+        end)
+        if ok and type(down) == "boolean" then return down end
+    end
+    -- Older FIU versions might not expose IsKeyDown. The InputBegan/
+    -- InputEnded fallback below still works even if processed is true.
+    return keyDown[key] == true
+end
 local function approach(current, goal, maxStep)
     local diff = goal - current
     if diff.Magnitude <= maxStep then return goal end
@@ -869,15 +890,12 @@ local function updatePhysics(dt)
         orientation = yaw * orientation * wobble
         kinematicPose = CFrame.new(kinematicPose.Position + desiredVelocity * dt)
             * orientation
-        -- Local prediction preserves pilot/camera responsiveness, while
-        -- the FIU block wrapper is the requested replicated movement path.
-        local previewOK, previewErr = pcall(function()
-            root.CFrame = kinematicPose
-        end)
-        if not previewOK then
-            print("TARDIS LOCAL PREVIEW FAILED:", tostring(previewErr))
-        end
-
+        -- IMPORTANT: do NOT write root.CFrame here. Because every shell is
+        -- welded to that raw root, a local root move also updates the local
+        -- CFrames of every other block BEFORE the FIU proxy setters run.
+        -- FIU can then treat a proxy.CFrame assignment as unchanged and skip
+        -- the replicated edit. Let the proven UB proxy setter move the build;
+        -- camera stays smooth by following kinematicPose independently.
         if not replicateExterior(kinematicPose, now) then
             dropFlight("EXTERIOR PROXY WRITES REJECTED")
             return
@@ -932,6 +950,8 @@ local function updatePhysics(dt)
         end
         print("TARDIS MOTION CHECK:", "local root moved", actualDistance,
             "requested", desiredVelocity.Magnitude,
+            "pilot target", tostring(kinematicPose and kinematicPose.Position),
+            "root proxy position", tostring(rootWrapper and rootWrapper.Position),
             "proxy count", #exteriorProxies,
             "last proxy writes", lastSuccessfulWriteCount,
             "total writes", replicationWrites,
@@ -1005,8 +1025,20 @@ end
 
 if UserInputService then pcall(function()
     UserInputService.InputBegan:Connect(function(input, processed)
-        if not flying or processed then return end
+        if not flying then return end
         local key = input.KeyCode
+        -- Roblox may consume WASD for regular player movement and set
+        -- processed=true. Keep those keys for the flight fallback unless
+        -- the pilot is actually typing in a TextBox.
+        if key == Enum.KeyCode.W or key == Enum.KeyCode.A
+            or key == Enum.KeyCode.S or key == Enum.KeyCode.D
+            or key == Enum.KeyCode.Q or key == Enum.KeyCode.E
+            or key == Enum.KeyCode.Space or key == Enum.KeyCode.LeftShift
+            or key == Enum.KeyCode.RightShift then
+            if not typingIntoTextBox() then keyDown[key] = true end
+            return
+        end
+        if processed then return end
         if key == Enum.KeyCode.X or key == Enum.KeyCode.Escape then
             dropFlight("DROP / gravity released")
         elseif key == Enum.KeyCode.G then
@@ -1070,7 +1102,7 @@ end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 6.1 READY / controller-matched proxy scan / coordinate GUI")
+print("TARDIS FLIGHT 6.2 READY / replicated flight controls + proxy-only motion")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
