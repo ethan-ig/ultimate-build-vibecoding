@@ -46,12 +46,15 @@ must be confirmed from another player/client, including that **every shell
 part** follows, not just the root. If it does not, this game must provide a
 server-authorized movement block or server-side script. The optional flight
 output C publishes the desired CFrame for a native mover that accepts it. The exterior constantly spins
-with a slight wobble while flight is active. Flight V4.4 uses Roblox's native
-`CameraType.Custom` orbit/zoom camera, following a small invisible local
-camera target. Move the mouse to orbit, use the wheel to zoom, and press V to
-switch back to the player or return to the TARDIS. The target copies the
-commanded root position in the FIU CFrame fallback, so stale root reads do not
-leave the camera behind. The camera proxy is separate from the welded rig.
+with a slight wobble while flight is active. Flight V5.1 tries Roblox's
+native `CameraType.Custom` camera with a real underlying BasePart as the follow
+subject. In this FIU environment, CameraSubject sometimes rejects its
+table-based proxies. When that happens, the script switches ONCE to a
+Scriptable orbit camera with right-mouse drag and scroll-wheel zoom instead
+of repeatedly submitting the invalid table. Press V to switch between the
+player and TARDIS views. The camera uses the commanded flight position so
+stale root reads do not leave it behind. The camera proxy is independent
+from the welded rig.
 
 | Port | Meaning |
 |---|---|
