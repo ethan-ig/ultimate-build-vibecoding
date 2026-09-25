@@ -496,7 +496,9 @@ local function addRigMember(block, shouldCollide, density)
         rigMemberSet[raw] = true
         table.insert(rigMembers, raw)
         local success = pcall(function()
-            raw.Anchored = false
+            -- Keep the original anchor state until every weld succeeds.
+            -- If the sandbox rejects a weld, an incomplete rig must not
+            -- scatter the user's unjoined exterior across the map.
             raw.Massless = false
             raw.CanCollide = shouldCollide
             raw.CustomPhysicalProperties = PhysicalProperties.new(
@@ -507,9 +509,6 @@ local function addRigMember(block, shouldCollide, density)
             print("TARDIS RIG: failed physical properties on", raw.Name)
             return false
         end
-        local verified = false
-        pcall(function() verified = raw.Anchored == false end)
-        if not verified then return false end
     end
     return true
 end
@@ -553,6 +552,16 @@ if #shellParts > 0 and startingPivot then
                     end
                 end)
                 if not success then rigReady = false end
+            end
+        end
+
+        if rigReady then
+            for _, member in ipairs(rigMembers) do
+                local okUnanchor = pcall(function() member.Anchored = false end)
+                if not okUnanchor or member.Anchored ~= false then
+                    rigReady = false
+                    print("TARDIS RIG: could not unanchor", member.Name)
+                end
             end
         end
 
