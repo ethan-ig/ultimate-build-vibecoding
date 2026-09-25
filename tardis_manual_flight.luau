@@ -149,7 +149,7 @@ local function buildMotors()
         spin.Name = "TardisFlightSpin"
         spin.Attachment0 = attachment
         spin.RelativeTo = Enum.ActuatorRelativeTo.World
-        spin.MaxTorque = math.huge
+        spin.MaxTorque = 1e12
         spin.AngularVelocity = Vector3.zero
         spin.Enabled = false
         spin.Parent = root
