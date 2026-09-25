@@ -1,6 +1,9 @@
 -- TARDIS navigation selector
 -- Input A: pulse true to open/cancel navigation mode
--- Output A: selected world Vector3; connect this to TARDIS controller input C
+-- Output A: ground-biased destination; connect to controller input C.
+-- Output B (optional): pulse TRUE to start the flight block's autopilot.
+-- Output C (optional): flight root pivot above clicked ground; connect to flight input B.
+-- Wire navigation output B -> flight input C. Keep normal teleport wiring.
 --
 -- Controls while navigation mode is open:
 --   Left click  = choose destination
@@ -10,6 +13,9 @@
 
 local inputA = script.inputs["a"]
 local outputA = script.outputs["a"]
+local outputB, outputC = nil, nil
+pcall(function() outputB = script.outputs["b"] end)
+pcall(function() outputC = script.outputs["c"] end)
 
 local NAV_START_HEIGHT = 450
 local NAV_MIN_HEIGHT = 80
@@ -117,7 +123,7 @@ local function getBlockCFrame(block)
 end
 
 local function findExteriorTardisPosition()
-    for _, block in ipairs(workspace:GetDescendants(true)) do
+    for _, block in ipairs(workspace:GetDescendants()) do
         if block ~= script then
             local displayName = getDisplayName(block)
             if type(displayName) == "string"
@@ -318,7 +324,7 @@ local function rebuildLandCandidates()
     ignoredInstances = {}
     navRaycastParams = nil
 
-    local descendants = workspace:GetDescendants(true)
+    local descendants = workspace:GetDescendants()
 
     for _, block in ipairs(descendants) do
         if block ~= script and nameShouldBeIgnored(block) then
@@ -687,6 +693,23 @@ local function updatePanInput()
         + upXZ * delta.Y * worldPerPixel
 end
 
+local function pilotGroundOffset()
+    -- Convert the map's ground hit into the elevation of the physical
+    -- exterior root. The controller has already measured its lowest shell.
+    for _, object in ipairs(workspace:GetDescendants()) do
+        local raw = getRawPart(object)
+        if raw then
+            local marker, offset = nil, nil
+            pcall(function()
+                marker = raw:GetAttribute("TardisRigRoot")
+                offset = raw:GetAttribute("TardisPilotGroundOffset")
+            end)
+            if marker == true and type(offset) == "number" then return offset end
+        end
+    end
+    return 8 -- Only used if the controller has not initialized its rig.
+end
+
 local function selectMouseDestination()
     if not navigationActive or getRightButtonDown() then return end
 
@@ -715,9 +738,16 @@ local function selectMouseDestination()
         position.Z
     )
 
-    pcall(function()
-        outputA:SetState(controllerDestination)
-    end)
+    pcall(function() outputA:SetState(controllerDestination) end)
+    -- The pilot's root must hover ABOVE the ground by the measured bottom
+    -- offset; otherwise a root-centered autopilot tries to bury the box.
+    -- The normal controller still gets its original lowered Y scan hint.
+    if outputC then pcall(function()
+        local groundOffset = pilotGroundOffset()
+        outputC:SetState(Vector3.new(
+            position.X, position.Y + groundOffset, position.Z
+        ))
+    end) end
 
     print(
         "TARDIS NAV DESTINATION:",
@@ -727,6 +757,13 @@ local function selectMouseDestination()
     )
 
     closeNavigation("DESTINATION SET")
+    -- Close the map camera before pulsing the flight block. A 0.20 s
+    -- pulse can be read by a 30 Hz FIU code block without timing races.
+    if outputB then
+        pcall(function() outputB:SetState(true) end)
+        task.wait(0.20)
+        pcall(function() outputB:SetState(false) end)
+    end
 end
 
 if mouse then
@@ -802,7 +839,7 @@ local lastInputState = false
 local lastExteriorRefresh = 0
 
 print("TARDIS navigation ready")
-print("Wire navigation output A -> TARDIS controller input C")
+print("NAV WIRING: A -> controller C; C -> flight B; B -> flight C")
 
 while true do
     local now = os.clock()

@@ -117,7 +117,7 @@ local function fastTravelEnabled()
 end
 
 local function findNamedBlock(name)
-    for _, part in ipairs(workspace:GetDescendants(true)) do
+    for _, part in ipairs(workspace:GetDescendants()) do
         if part ~= script then
             local displayName = getDisplayName(part)
             if displayName and string.lower(displayName) == string.lower(name) then
@@ -289,7 +289,7 @@ local function addPart(list, part)
     if ok then table.insert(list, part) end
 end
 
-for _, part in ipairs(workspace:GetDescendants(true)) do
+for _, part in ipairs(workspace:GetDescendants()) do
     if part ~= script then
         local displayName = getDisplayName(part)
         if displayName and string.lower(displayName) == string.lower(SHELL_NAME) then
@@ -345,7 +345,7 @@ local function blockNameMatches(block, name)
 end
 
 local function findBlockFlexible(name)
-    for _, block in ipairs(workspace:GetDescendants(true)) do
+    for _, block in ipairs(workspace:GetDescendants()) do
         if block ~= script and blockNameMatches(block, name) then
             return block
         end
@@ -471,31 +471,170 @@ if startingPivot then
     end
 end
 
-local function moveTardis(pivot)
-    for _, part in ipairs(moveParts) do
-        local offset = relativeCFrames[part]
-        if offset then
-            pcall(function() part.CFrame = pivot * offset end)
+-- PHYSICS RIG: the exterior is always unanchored. All physical shell
+-- pieces, roof lamp, exterior sound emitter and portal are welded to ONE root.
+-- In flight, only that root receives velocity/angular-velocity constraints.
+-- The time rotor and interior are independent and are never part of this rig.
+local rigRoot, rigReady, rigRootOffset = nil, false, nil
+local rigMembers = {}
+local rigMemberSet = {}
+local function asBasePart(block)
+    local raw = getRawPart(block)
+    local valid = false
+    if raw then pcall(function() valid = raw:IsA("BasePart") end) end
+    return valid and raw or nil
+end
+
+local function setRigFlag(name, value)
+    if rigRoot then pcall(function() rigRoot:SetAttribute(name, value) end) end
+end
+
+local function addRigMember(block, shouldCollide, density)
+    local raw = asBasePart(block)
+    if not raw then return false end
+    if not rigMemberSet[raw] then
+        rigMemberSet[raw] = true
+        table.insert(rigMembers, raw)
+        local success = pcall(function()
+            -- Keep the original anchor state until every weld succeeds.
+            -- If the sandbox rejects a weld, an incomplete rig must not
+            -- scatter the user's unjoined exterior across the map.
+            raw.Massless = false
+            raw.CanCollide = shouldCollide
+            raw.CustomPhysicalProperties = PhysicalProperties.new(
+                density, shouldCollide and 1.3 or 0.3, 0, 100, 100
+            )
+        end)
+        if not success then
+            print("TARDIS RIG: failed physical properties on", raw.Name)
+            return false
         end
     end
+    return true
+end
 
-    -- Keep the exterior materialization SoundBlock's actual raw Part glued to
-    -- the box too. Its wrapper can report a moved CFrame while the emitter Part
-    -- stays behind in Ultimate Build, so enforce the stored TARDIS-relative pose.
-    if matSoundRaw and matSoundRawOffset then
-        pcall(function()
-            matSoundRaw.CFrame = pivot * matSoundRawOffset
+if #shellParts > 0 and startingPivot then
+    rigRoot = asBasePart(shellParts[1])
+    if rigRoot then
+        rigReady = true
+        rigRootOffset = startingPivot:ToObjectSpace(rigRoot.CFrame)
+
+        for _, shell in ipairs(shellParts) do
+            if not addRigMember(shell, true, shell == shellParts[1] and 65 or 12) then
+                rigReady = false
+                print("TARDIS RIG: a shell part has no physical BasePart")
+            end
+        end
+        local accessories = {}
+        for _, item in pairs({sound = matSound, lamp = tardisLight, portal = tardisPortal}) do
+            if item then table.insert(accessories, item) end
+        end
+        for _, accessory in ipairs(accessories) do
+            if not addRigMember(accessory, false, 2) then
+                rigReady = false
+                print("TARDIS RIG: missing physical accessory", getDisplayName(accessory))
+            end
+        end
+
+        for i, part in ipairs(rigMembers) do
+            if part ~= rigRoot then
+                local success = pcall(function()
+                    local name = "TardisRigidWeld_" .. tostring(i)
+                    local weld = rigRoot:FindFirstChild(name)
+                    if not weld then
+                        weld = Instance.new("WeldConstraint")
+                        weld.Name = name
+                        weld.Part0 = rigRoot
+                        weld.Part1 = part
+                        weld.Parent = rigRoot
+                    else
+                        weld.Part0, weld.Part1 = rigRoot, part
+                    end
+                end)
+                if not success then rigReady = false end
+            end
+        end
+
+        if rigReady then
+            for _, member in ipairs(rigMembers) do
+                local okUnanchor = pcall(function() member.Anchored = false end)
+                if not okUnanchor or member.Anchored ~= false then
+                    rigReady = false
+                    print("TARDIS RIG: could not unanchor", member.Name)
+                end
+            end
+        end
+
+        local massOK, mass = pcall(function() return rigRoot.AssemblyMass end)
+        if massOK and mass == math.huge then
+            rigReady = false
+            print("TARDIS RIG: assembly is connected to another anchored part")
+        end
+        local flagsOK = pcall(function()
+            rigRoot:SetAttribute("TardisRigRoot", true)
+            rigRoot:SetAttribute("TardisRigReady", rigReady)
+            rigRoot:SetAttribute("TardisTransitioning", false)
+            rigRoot:SetAttribute("TardisFlightActive", false)
+            rigRoot:SetAttribute("TardisPilotGroundOffset",
+                -tardisBottomOffset + rigRootOffset.Position.Y + 0.8)
         end)
+        if not flagsOK then
+            rigReady = false
+            print("TARDIS RIG: FIU does not expose required Instance attributes")
+        end
+        if rigReady then
+            print("TARDIS RIG READY: one unanchored assembly;", #rigMembers,
+                "physical parts; mass", rigRoot.AssemblyMass)
+        else
+            print("TARDIS RIG INCOMPLETE: manual physics flight will refuse to arm")
+        end
     end
+end
 
-    -- Same raw-Part safeguard for the portal so it cannot get left behind by
-    -- a wrapper that reports its own CFrame.
-    if tardisPortalRaw and tardisPortalRawOffset then
+-- Because a hidden unanchored box would fall out of the world, create an
+-- invisible stationary support under the OFF-MAP staging position. The box
+-- itself is never anchored; ordinary landings have no artificial support.
+if rigReady then
+    pcall(function()
+        local old = workspace:FindFirstChild("TardisHiddenSupport")
+        if old then old:Destroy() end
+        local pad = Instance.new("Part")
+        pad.Name = "TardisHiddenSupport"
+        pad.Size = Vector3.new(48, 2, 48)
+        pad.CFrame = CFrame.new(
+            HIDDEN_POSITION + Vector3.new(0, tardisBottomOffset - 1, 0)
+        )
+        pad.Transparency = 1
+        pad.Anchored = true
+        pad.CanCollide = true
+        pad.CanQuery = false
+        pad.Parent = workspace
+    end)
+end
+
+local function moveTardis(pivot)
+    if rigReady and rigRoot then
+        -- One CFrame write moves the welded assembly; no shell-by-shell
+        -- desync, and no per-frame CFrame flight.
         pcall(function()
-            tardisPortalRaw.CFrame = pivot * tardisPortalRawOffset
+            rigRoot.AssemblyLinearVelocity = Vector3.zero
+            rigRoot.AssemblyAngularVelocity = Vector3.zero
+            rigRoot.CFrame = pivot * rigRootOffset
         end)
+    else
+        -- Compatibility for a game sandbox that rejects physical welds.
+        -- This path is only used for legacy demat/materialize, never flight.
+        for _, part in ipairs(moveParts) do
+            local offset = relativeCFrames[part]
+            if offset then pcall(function() part.CFrame = pivot * offset end) end
+        end
+        if matSoundRaw and matSoundRawOffset then
+            pcall(function() matSoundRaw.CFrame = pivot * matSoundRawOffset end)
+        end
+        if tardisPortalRaw and tardisPortalRawOffset then
+            pcall(function() tardisPortalRaw.CFrame = pivot * tardisPortalRawOffset end)
+        end
     end
-
     forcePortalTransparent()
 end
 
@@ -726,7 +865,7 @@ end
 findFloorY = function(x, z, maxY)
     local bestY = nil
 
-    for _, part in ipairs(workspace:GetDescendants(true)) do
+    for _, part in ipairs(workspace:GetDescendants()) do
         local hitY = floorHitY(part, x, z, maxY)
         if hitY and (bestY == nil or hitY > bestY) then
             bestY = hitY
@@ -797,7 +936,7 @@ findFloorNearY = function(x, z, hintY)
     end
 
     local bestY = nil
-    for _, part in ipairs(workspace:GetDescendants(true)) do
+    for _, part in ipairs(workspace:GetDescendants()) do
         local hitY = floorHitY(part, x, z, preferredCeiling)
         if hitY and (bestY == nil or hitY > bestY) then
             bestY = hitY
@@ -998,6 +1137,7 @@ local lastEState = false
 local lastFState = false
 local activeTransition = nil
 local autoSequence = false
+setRigFlag("TardisTransitioning", not inputState)
 
 if inputState then
     setFadePartsTransparency(0)
@@ -1067,9 +1207,23 @@ local function startTransition(kind, targetFade, fast)
         stopSound(activeTransition.sound)
     end
     activeTransition = nil
+    -- Disable flight propulsion before any transition touches the assembly.
+    setRigFlag("TardisTransitioning", true)
+    setRigFlag("TardisFlightActive", false)
+    if rigRoot then pcall(function()
+        -- Do not wait for the pilot's next poll. Physically release both motors
+        -- before demat/recall can move the shell.
+        local linearMotor = rigRoot:FindFirstChild("TardisFlightVelocity")
+        local angularMotor = rigRoot:FindFirstChild("TardisFlightSpin")
+        if linearMotor then linearMotor.Enabled = false end
+        if angularMotor then angularMotor.Enabled = false end
+        rigRoot.AssemblyLinearVelocity = Vector3.zero
+        rigRoot.AssemblyAngularVelocity = Vector3.zero
+    end) end
 
     if targetFade <= 0 and not prepareMaterialization(kind) then
         print("Materialization destination unavailable")
+        setRigFlag("TardisTransitioning", hidden)
         return
     end
 
@@ -1146,6 +1300,7 @@ local function finishTransition(transition)
         setLightEffect(1, 0, false)
         moveTardis(hiddenPivot)
         hidden = true
+        setRigFlag("TardisTransitioning", true)
 
         if transition.kind == "auto_demat" then
             requestMaterialize("auto_materialize")
@@ -1159,6 +1314,7 @@ local function finishTransition(transition)
         setFadePartsTransparency(0)
         setLightEffect(0, 0, false)
         hidden = false
+        setRigFlag("TardisTransitioning", false)
 
         if transition.kind == "auto_materialize" then
             autoSequence = false
@@ -1617,7 +1773,7 @@ local function rotorNameMatches(block)
     return false
 end
 
-for _, block in ipairs(workspace:GetDescendants(true)) do
+for _, block in ipairs(workspace:GetDescendants()) do
     if block ~= script and rotorNameMatches(block) then
         local target = nil
         local cf = nil
@@ -1705,6 +1861,9 @@ end
 local function shouldRunTimeRotor()
     if hidden then return true end
     if activeTransition then return true end
+    -- Physical piloting is a legitimate flight state, even though the shell
+    -- stays materialized. The rotor should animate the entire time.
+    if getBlockValue(rigRoot, "TardisFlightActive") == true then return true end
     return currentFade > 0.001
 end
 
