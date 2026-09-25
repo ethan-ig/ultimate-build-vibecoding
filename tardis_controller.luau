@@ -1209,6 +1209,7 @@ local function startTransition(kind, targetFade, fast)
     activeTransition = nil
     -- Disable flight propulsion before any transition touches the assembly.
     setRigFlag("TardisTransitioning", true)
+    setRigFlag("TardisFlightActive", false)
     if rigRoot then pcall(function()
         -- Do not wait for the pilot's next poll. Physically release both motors
         -- before demat/recall can move the shell.
