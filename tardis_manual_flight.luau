@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 4.1 | Ultimate Build FIU
+-- TARDIS FLIGHT 4.2 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates; never animates individual shell CFrames.
 -- Requires the matching controller's unanchored welded exterior.
@@ -721,7 +721,7 @@ end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 4.1 READY / compact coordinate GUI / actual motion diagnostics")
+print("TARDIS FLIGHT 4.2 READY / root motion fallback / compact GUI")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
