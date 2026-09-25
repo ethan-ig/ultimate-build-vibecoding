@@ -556,10 +556,17 @@ if #shellParts > 0 and startingPivot then
             end
         end
 
+        local massOK, mass = pcall(function() return rigRoot.AssemblyMass end)
+        if massOK and mass == math.huge then
+            rigReady = false
+            print("TARDIS RIG: assembly is connected to another anchored part")
+        end
         local flagsOK = pcall(function()
             rigRoot:SetAttribute("TardisRigRoot", true)
             rigRoot:SetAttribute("TardisRigReady", rigReady)
             rigRoot:SetAttribute("TardisTransitioning", false)
+            rigRoot:SetAttribute("TardisPilotGroundOffset",
+                -tardisBottomOffset + rigRootOffset.Position.Y + 0.8)
         end)
         if not flagsOK then
             rigReady = false
