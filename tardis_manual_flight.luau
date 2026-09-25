@@ -795,9 +795,10 @@ local function updatePhysics(dt)
     if boost and not autopilot then top = math.min(MAX_SPEED, top * 1.7) end
     local wanted = Vector3.zero
     if autopilot and target then
-        local delta = target - root.Position
+        -- Raw root.Position can be stale under FIU CFrame flight.
+        local delta = target - kinematicPose.Position
         local distance = delta.Magnitude
-        if distance < ARRIVAL_RADIUS and root.AssemblyLinearVelocity.Magnitude < 4 then
+        if distance < ARRIVAL_RADIUS and desiredVelocity.Magnitude < 4 then
             autopilot = false
             status("ARRIVED / HOVER")
         elseif distance > .001 then
@@ -860,7 +861,8 @@ local function updatePhysics(dt)
         end
     end
 
-    -- Do not confuse successfully setting a motor with actually moving.
+    -- Client raw-part reads may remain stale even when UB proxy movement is
+    -- accepted, so report it as LOCAL raw-root displacement, not server proof.
     if now - motionStart >= 1.3 and motionPosition then
         local actualDistance = (root.Position - motionPosition).Magnitude
         if desiredVelocity.Magnitude > 8 and actualDistance < .35 then
@@ -878,19 +880,19 @@ local function updatePhysics(dt)
                 kinematicStallChecks = 0
                 disableMotors()
                 print("TARDIS FALLBACK: single-root CFrame flight; physics velocity not advancing position")
-                status("PHYSICS NOT ADVANCING / ROOT CFRAME TEST")
+                status("PHYSICS NOT ADVANCING / UB PROXY FLIGHT")
             else
                 kinematicStallChecks = kinematicStallChecks + 1
                 if kinematicStallChecks >= 2 then
-                    status("ROOT CFRAME NOT PERSISTING / FIU AUTHORITY BLOCKED")
-                    print("TARDIS ROOT CFRAME TEST FAILED: position still unchanged; do not assume client flight replicates")
+                    status("RAW ROOT READ STALE / CHECK EXTERIOR ON SECOND CLIENT")
+                    print("TARDIS PROXY STATUS: raw Position unchanged; use spectator and proxy count to verify movement")
                 end
             end
         else
             stalledChecks = 0
             kinematicStallChecks = 0
-            if kinematicFallback then
-                status("ROOT CFRAME MOVING / CHECK ANOTHER PLAYER CAN SEE IT")
+            if kinematicFallback and lastSuccessfulWriteCount == #exteriorProxies then
+                status("EXTERIOR PROXIES MOVING / CHECK SECOND CLIENT")
             end
         end
         print("TARDIS MOTION CHECK:", "local root moved", actualDistance,
