@@ -8,7 +8,7 @@
 -- Input D: optional numeric speed limit, 10..265 studs/sec.
 -- Output A: flight engaged boolean. Output B: actual world position Vector3.
 --
--- W/S thrust forward/back | A/D steer the spin | Q/E down/up
+-- W/S thrust forward/back | A/D steer travel bearing | Q/E down/up
 -- Shift boost | Space brake/hover | +/- adjust speed by 10
 -- G autopilot start/abort | V chase camera on/off | X DROP
 --
@@ -331,8 +331,8 @@ local function updatePhysics(dt)
     -- A/D steer the travel bearing independently of the visually spinning
     -- box. Holding W therefore flies straight instead of tracing a tiny circle.
     if steer ~= 0 then
-        flightHeading = CFrame.Angles(0, -steer * TURN_SPEED * dt, 0)
-            :VectorToWorldSpace(flightHeading)
+        local turn = CFrame.Angles(0, -steer * TURN_SPEED * dt, 0)
+        flightHeading = turn:VectorToWorldSpace(flightHeading)
     end
 
     if autopilot and (go ~= 0 or lift ~= 0 or braking) then
