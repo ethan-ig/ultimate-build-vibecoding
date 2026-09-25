@@ -113,3 +113,25 @@ destination is still available to the normal teleport controller.
 
 These scripts have static checks and GitHub content verification, but require
 a real Ultimate Build runtime test for engine permissions and network ownership.
+
+
+## Isolated tween replication experiment
+
+Use `tardis_tween_replication_test.luau` in a **new separate** Code Block.
+Save the build, stop the active flight script (do not merely press DROP while
+its Code Block continues moving the rig), and leave the controller running
+and fully materialized. The diagnostic GUI has TEST RAW and TEST FIU buttons.
+Each test moves 30 studs upward in 3 seconds, holds 1 second, and returns.
+Use a second client to observe the **whole welded exterior**, not just the
+pilot's camera or one root part.
+
+- TEST RAW: passes the underlying root to Roblox TweenService.
+- TEST FIU: passes the Ultimate Build block wrapper to TweenService. If the
+  wrapper is a table, TweenService:Create will reject it; that is a useful
+  result, not evidence that the game's separate native Tween Block fails.
+- Each test logs the raw/wrapper displacement at the top and on return.
+- Input A optionally starts TEST RAW if the UI cannot be created.
+
+Do not treat a successful Play(), a changed local Position, or zero API errors
+as replication proof. If the game's dedicated Tween Block behaves differently,
+inspect its actual ports before attempting to wire the flight script to it.
