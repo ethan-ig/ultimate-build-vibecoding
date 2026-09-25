@@ -805,7 +805,9 @@ local function held(key)
         local ok, down = pcall(function()
             return UserInputService:IsKeyDown(key)
         end)
-        if ok and type(down) == "boolean" then return down end
+        if ok and type(down) == "boolean" then
+            return down or keyDown[key] == true
+        end
     end
     -- Older FIU versions might not expose IsKeyDown. The InputBegan/
     -- InputEnded fallback below still works even if processed is true.
@@ -948,10 +950,12 @@ local function updatePhysics(dt)
                 status("EXTERIOR PROXIES MOVING / CHECK SECOND CLIENT")
             end
         end
+        local proxyPosition = nil
+        pcall(function() proxyPosition = rootWrapper.CFrame.Position end)
         print("TARDIS MOTION CHECK:", "local root moved", actualDistance,
             "requested", desiredVelocity.Magnitude,
             "pilot target", tostring(kinematicPose and kinematicPose.Position),
-            "root proxy position", tostring(rootWrapper and rootWrapper.Position),
+            "root proxy position", tostring(proxyPosition),
             "proxy count", #exteriorProxies,
             "last proxy writes", lastSuccessfulWriteCount,
             "total writes", replicationWrites,
