@@ -45,8 +45,12 @@ welded root by CFrame each frame, NOT 155 individual parts. This is a
 compatibility test, not a guarantee of server replication. If it also does not
 move or snaps back, FIU lacks motion authority; a server-owned movement
 mechanism or Ultimate Build's supported movement API is required. The exterior constantly spins
-with a slight wobble while flight is active. The camera holds a stable viewing
-direction rather than circling with the spinning box.
+with a slight wobble while flight is active. Flight V4.4 uses Roblox's native
+`CameraType.Custom` orbit/zoom camera, following a small invisible local
+camera target. Move the mouse to orbit, use the wheel to zoom, and press V to
+switch back to the player or return to the TARDIS. The target copies the
+commanded root position in the FIU CFrame fallback, so stale root reads do not
+leave the camera behind. The camera proxy is separate from the welded rig.
 
 | Port | Meaning |
 |---|---|
@@ -77,7 +81,7 @@ the box fall faster in a vacuum. The hidden stage is the only special support.
 
 ## 3. Navigation: `tardis_navigation.luau`
 
-The overhead map is separate; only the flight GUI was removed.
+The overhead map remains separate from the compact flight control panel.
 
 | Output | Wire to |
 |---|---|
