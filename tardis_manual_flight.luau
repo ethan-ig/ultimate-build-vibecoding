@@ -226,7 +226,10 @@ local function restoreCamera()
         local previous = savedCamera
         -- Do not submit FIU tables to CameraSubject. Only an actual valid
         -- Instance can be a subject; failed assignments are handled once.
-        local subjects = {previous.subject, playerCameraSubject()}
+        local subjects = {}
+        if previous.subject then table.insert(subjects, previous.subject) end
+        local characterSubject = playerCameraSubject()
+        if characterSubject then table.insert(subjects, characterSubject) end
         local restored = false
         for _, subject in ipairs(subjects) do
             if subject then
@@ -313,7 +316,11 @@ local function engageCamera()
     if cameraTarget then pcall(function() rawTarget = cameraTarget.Part end) end
     -- Try native Roblox subject first; FIU sometimes provides a real .Part.
     -- Do not retry a rejected table on every tick.
-    for _, candidate in ipairs({rawTarget, cameraTarget, root}) do
+    local candidates = {}
+    if rawTarget then table.insert(candidates, rawTarget) end
+    if cameraTarget then table.insert(candidates, cameraTarget) end
+    if root then table.insert(candidates, root) end
+    for _, candidate in ipairs(candidates) do
         if candidate then
             local ok = pcall(function()
                 cam.CameraSubject = candidate
@@ -862,8 +869,10 @@ updateCamera = function(dt)
         local ok, err = pcall(function()
             cam.CameraType = Enum.CameraType.Scriptable
             cam.CFrame = orbitCameraPose
-            cam.Focus = CFrame.new(orbitFocus)
         end)
+        -- Focus is optional in some FIU camera proxies; do not let rejection
+        -- of this nonessential property block the actual orbit movement.
+        pcall(function() cam.Focus = CFrame.new(orbitFocus) end)
         if not ok then
             status("MOUSE ORBIT WRITE FAILED: " .. tostring(err))
         end
@@ -937,7 +946,7 @@ end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 5.1 READY / FIU sync / native or mouse-orbit camera")
+print("TARDIS FLIGHT 5.1.1 READY / FIU sync / native or mouse-orbit camera")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
