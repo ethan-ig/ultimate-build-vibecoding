@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 6.0 | Ultimate Build FIU
+-- TARDIS FLIGHT 6.1 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates. Replicated movement writes go to EVERY exterior
 -- Ultimate Build part proxy using the same CFrame setter as the hovering cubes.
@@ -139,14 +139,20 @@ end
 -- clone or destroy the build: drive the EXISTING editable UB block proxies.
 local function proxyDisplayName(object)
     if not object then return nil end
-    local value = nil
-    pcall(function() value = object.attributes["Display name"] end)
-    if type(value) == "string" and value ~= "" then return value end
-    pcall(function() value = object.DisplayName end)
-    if type(value) == "string" and value ~= "" then return value end
-    pcall(function() value = object:GetAttribute("Display name") end)
-    if type(value) == "string" and value ~= "" then return value end
-    return nil
+    -- Match the EXISTING controller's getBlockValue(block, "DisplayName")
+    -- exactly, before trying the unrelated "Display name" metadata key.
+    -- That difference made V6 find only the root even though the controller
+    -- successfully found all of the shell union proxies.
+    local function readKey(key)
+        local ok, value = pcall(function() return object[key] end)
+        if ok and type(value) == "string" and value ~= "" then return value end
+        ok, value = pcall(function() return object:GetAttribute(key) end)
+        if ok and type(value) == "string" and value ~= "" then return value end
+        ok, value = pcall(function() return object.attributes[key] end)
+        if ok and type(value) == "string" and value ~= "" then return value end
+        return nil
+    end
+    return readKey("DisplayName") or readKey("Display name")
 end
 
 local function prepareExteriorProxies(pivot)
@@ -164,25 +170,48 @@ local function prepareExteriorProxies(pivot)
     end
 
     add(rootWrapper)
-    local shellCount, accessoryCount = 0, 0
-    for _, block in ipairs(workspace:GetDescendants()) do
-        local name = proxyDisplayName(block)
-        if type(name) == "string" then
-            name = string.lower(name)
-            if name == "tardis" then
-                add(block)
-                shellCount = shellCount + 1
-            elseif name == "tardismatsound" or name == "tardislight"
-                or name == "tardisportal" then
-                add(block)
-                accessoryCount = accessoryCount + 1
+    local shellCount, accessoryCount, namedCount, readableCount = 0, 0, 0, 0
+    local descendants = workspace:GetDescendants()
+    local function addNamed(block, kind)
+        local previous = #exteriorProxies
+        add(block)
+        if #exteriorProxies > previous then
+            if kind == "shell" then shellCount = shellCount + 1
+            else accessoryCount = accessoryCount + 1 end
+        end
+    end
+    -- Prefer FIU wrappers to their raw BaseParts so CFrame assignments
+    -- follow the same replicated proxy path as our successful chat cubes.
+    -- The controller uses these same workspace descendants.
+    for pass = 1, 2 do
+        for _, block in ipairs(descendants) do
+            local raw = basePart(block)
+            local isWrapper = raw and block ~= raw
+            if (pass == 1 and isWrapper) or (pass == 2 and not isWrapper) then
+                local name = proxyDisplayName(block)
+                if type(name) == "string" then
+                    namedCount = namedCount + 1
+                    name = string.lower(name:match("^%s*(.-)%s*$"))
+                    if name == "tardis" then
+                        addNamed(block, "shell")
+                    elseif name == "tardismatsound" or name == "tardislight"
+                        or name == "tardisportal" then
+                        addNamed(block, "accessory")
+                    end
+                end
+                local readable = pcall(function() return block.CFrame end)
+                if readable then readableCount = readableCount + 1 end
             end
         end
     end
+    print("TARDIS PROXY DISCOVERY:", #descendants, "descendants;",
+        readableCount, "CFrame-readable;", namedCount, "named;",
+        shellCount, "shells;", accessoryCount, "accessories;",
+        #exteriorProxies, "distinct proxies total")
 
-    if #exteriorProxies < 2 then
-        print("TARDIS PROXY SCAN: only", #exteriorProxies,
-            "blocks. Refusing root-only local flight.")
+    if #exteriorProxies < 2 or shellCount < 1 then
+        print("TARDIS PROXY SCAN INCOMPLETE: controller and flight must",
+            "resolve the same DisplayName. Refusing root-only local flight.")
         return false
     end
     local actualRate = math.min(MAX_REPLICATION_RATE,
@@ -1041,7 +1070,7 @@ end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 6.0 READY / all UB exterior proxies / coordinate GUI")
+print("TARDIS FLIGHT 6.1 READY / controller-matched proxy scan / coordinate GUI")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
