@@ -451,6 +451,12 @@ end
 
 local function dropFlight(reason)
     if not flying then return end
+    -- Commit the exact last visual pose before releasing the physical shell.
+    -- Otherwise the remote box can be one network tick behind the pilot.
+    if kinematicPose and #exteriorProxies > 1
+        and attr(root, "TardisTransitioning") ~= true then
+        replicateExterior(kinematicPose, os.clock() + REPLICATION_INTERVAL)
+    end
     flying, autopilot = false, false
     desiredVelocity, keyDown = Vector3.zero, {}
     kinematicFallback, kinematicPose = false, nil
