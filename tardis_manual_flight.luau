@@ -111,7 +111,15 @@ end
 local function rigAvailable()
     if not root then return false, "controller rig missing" end
     local ready = getValue(root, "TardisRigReady")
-    if ready ~= true then return false, "controller rig incomplete" end
+    if ready ~= true then
+        local reason = getValue(root, "TardisRigError")
+        if type(reason) ~= "string" or reason == "" then
+            reason = "unknown: check controller TARDIS RIG FAIL messages"
+        end
+        local count = getValue(root, "TardisRigIssueCount")
+        return false, "controller rig incomplete (" .. tostring(count or "?")
+            .. " issue(s)): " .. reason
+    end
     if getValue(root, "TardisTransitioning") == true then
         return false, "materialization/quick travel is active"
     end
