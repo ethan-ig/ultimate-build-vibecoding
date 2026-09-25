@@ -2,7 +2,7 @@
 -- Input A: pulse true to open/cancel navigation mode
 -- Output A: ground-biased destination; connect to controller input C.
 -- Output B (optional): pulse TRUE to start the flight block's autopilot.
--- Output C (optional): exact clicked world Vector3; connect to flight input B.
+-- Output C (optional): flight root pivot above clicked ground; connect to flight input B.
 -- Wire navigation output B -> flight input C. Keep normal teleport wiring.
 --
 -- Controls while navigation mode is open:
@@ -693,6 +693,23 @@ local function updatePanInput()
         + upXZ * delta.Y * worldPerPixel
 end
 
+local function pilotGroundOffset()
+    -- Convert the map's ground hit into the elevation of the physical
+    -- exterior root. The controller has already measured its lowest shell.
+    for _, object in ipairs(workspace:GetDescendants()) do
+        local raw = getRawPart(object)
+        if raw then
+            local marker, offset = nil, nil
+            pcall(function()
+                marker = raw:GetAttribute("TardisRigRoot")
+                offset = raw:GetAttribute("TardisPilotGroundOffset")
+            end)
+            if marker == true and type(offset) == "number" then return offset end
+        end
+    end
+    return 8 -- Only used if the controller has not initialized its rig.
+end
+
 local function selectMouseDestination()
     if not navigationActive or getRightButtonDown() then return end
 
@@ -722,10 +739,14 @@ local function selectMouseDestination()
     )
 
     pcall(function() outputA:SetState(controllerDestination) end)
-    -- Autopilot needs the exact world point; the normal controller needs
-    -- the slightly lowered Y hint for its own landing-floor search.
+    -- The pilot's root must hover ABOVE the ground by the measured bottom
+    -- offset; otherwise a root-centered autopilot tries to bury the box.
+    -- The normal controller still gets its original lowered Y scan hint.
     if outputC then pcall(function()
-        outputC:SetState(lastSelectedDestination)
+        local groundOffset = pilotGroundOffset()
+        outputC:SetState(Vector3.new(
+            position.X, position.Y + groundOffset, position.Z
+        ))
     end) end
 
     print(
