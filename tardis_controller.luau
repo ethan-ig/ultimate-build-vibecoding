@@ -490,6 +490,13 @@ end
 local rigRoot, rigReady, rigRootOffset = nil, false, nil
 local rigMembers = {}
 local rigMemberSet = {}
+local rigIssues = {}
+local function rigFailure(stage, detail)
+    rigReady = false
+    local description = tostring(stage) .. ": " .. tostring(detail)
+    table.insert(rigIssues, description)
+    print("TARDIS RIG FAIL:", description)
+end
 local function asBasePart(block)
     local raw = getRawPart(block)
     local valid = false
@@ -503,23 +510,27 @@ end
 
 local function addRigMember(block, shouldCollide, density)
     local raw = asBasePart(block)
-    if not raw then return false end
+    if not raw then return false, "no readable BasePart" end
     if not rigMemberSet[raw] then
         rigMemberSet[raw] = true
         table.insert(rigMembers, raw)
-        local success = pcall(function()
-            -- Keep the original anchor state until every weld succeeds.
-            -- If the sandbox rejects a weld, an incomplete rig must not
-            -- scatter the user's unjoined exterior across the map.
-            raw.Massless = false
+        -- Check properties separately. FIU's failed promises can otherwise
+        -- hide which property is unsupported inside one combined pcall.
+        local okMass, massErr = pcall(function() raw.Massless = false end)
+        if not okMass then return false, "Massless: " .. tostring(massErr) end
+        local okCollision, collisionErr = pcall(function()
             raw.CanCollide = shouldCollide
+        end)
+        if not okCollision then
+            return false, "CanCollide: " .. tostring(collisionErr)
+        end
+        local okProps, propsErr = pcall(function()
             raw.CustomPhysicalProperties = PhysicalProperties.new(
                 density, shouldCollide and 1.3 or 0.3, 0, 100, 100
             )
         end)
-        if not success then
-            print("TARDIS RIG: failed physical properties on", raw.Name)
-            return false
+        if not okProps then
+            return false, "CustomPhysicalProperties: " .. tostring(propsErr)
         end
     end
     return true
@@ -531,10 +542,13 @@ if #shellParts > 0 and startingPivot then
         rigReady = true
         rigRootOffset = startingPivot:ToObjectSpace(rigRoot.CFrame)
 
-        for _, shell in ipairs(shellParts) do
-            if not addRigMember(shell, true, shell == shellParts[1] and 65 or 12) then
-                rigReady = false
-                print("TARDIS RIG: a shell part has no physical BasePart")
+        for i, shell in ipairs(shellParts) do
+            local okMember, reason = addRigMember(
+                shell, true, shell == shellParts[1] and 65 or 12
+            )
+            if not okMember then
+                rigFailure("SHELL " .. tostring(i),
+                    tostring(getDisplayName(shell) or "Tardis") .. " / " .. tostring(reason))
             end
         end
         local accessories = {}
@@ -542,15 +556,16 @@ if #shellParts > 0 and startingPivot then
             if item then table.insert(accessories, item) end
         end
         for _, accessory in ipairs(accessories) do
-            if not addRigMember(accessory, false, 2) then
-                rigReady = false
-                print("TARDIS RIG: missing physical accessory", getDisplayName(accessory))
+            local okMember, reason = addRigMember(accessory, false, 2)
+            if not okMember then
+                rigFailure("ACCESSORY",
+                    tostring(getDisplayName(accessory) or "unnamed") .. " / " .. tostring(reason))
             end
         end
 
         for i, part in ipairs(rigMembers) do
             if part ~= rigRoot then
-                local success = pcall(function()
+                local success, weldErr = pcall(function()
                     local name = "TardisRigidWeld_" .. tostring(i)
                     local weld = rigRoot:FindFirstChild(name)
                     if not weld then
@@ -563,42 +578,51 @@ if #shellParts > 0 and startingPivot then
                         weld.Part0, weld.Part1 = rigRoot, part
                     end
                 end)
-                if not success then rigReady = false end
+                if not success then
+                    rigFailure("WELD " .. tostring(i), weldErr)
+                end
             end
         end
 
         if rigReady then
             for _, member in ipairs(rigMembers) do
-                local okUnanchor = pcall(function() member.Anchored = false end)
-                if not okUnanchor or member.Anchored ~= false then
-                    rigReady = false
-                    print("TARDIS RIG: could not unanchor", member.Name)
+                local okUnanchor, unanchorErr = pcall(function()
+                    member.Anchored = false
+                end)
+                local readOK, anchored = pcall(function() return member.Anchored end)
+                if not okUnanchor or not readOK or anchored ~= false then
+                    rigFailure("UNANCHOR " .. tostring(member.Name),
+                        okUnanchor and "Anchored remained true/unreadable" or unanchorErr)
                 end
             end
         end
 
         local massOK, mass = pcall(function() return rigRoot.AssemblyMass end)
-        if massOK and mass == math.huge then
-            rigReady = false
-            print("TARDIS RIG: assembly is connected to another anchored part")
+        if rigReady and (not massOK or mass == math.huge or
+                type(mass) ~= "number" or mass ~= mass or mass <= 0) then
+            rigFailure("ASSEMBLY MASS",
+                massOK and ("invalid mass " .. tostring(mass)) or "cannot read AssemblyMass")
         end
         local flagsOK = pcall(function()
             rigRoot:SetAttribute("TardisRigRoot", true)
             rigRoot:SetAttribute("TardisRigReady", rigReady)
+            rigRoot:SetAttribute("TardisRigError", rigIssues[1] or "")
+            rigRoot:SetAttribute("TardisRigIssueCount", #rigIssues)
             rigRoot:SetAttribute("TardisTransitioning", false)
             rigRoot:SetAttribute("TardisFlightActive", false)
             rigRoot:SetAttribute("TardisPilotGroundOffset",
                 -tardisBottomOffset + rigRootOffset.Position.Y + 0.8)
         end)
         if not flagsOK then
-            rigReady = false
-            print("TARDIS RIG: FIU does not expose required Instance attributes")
+            rigFailure("ATTRIBUTES", "FIU rejected SetAttribute")
+            pcall(function() rigRoot:SetAttribute("TardisRigReady", false) end)
         end
         if rigReady then
             print("TARDIS RIG READY: one unanchored assembly;", #rigMembers,
                 "physical parts; mass", rigRoot.AssemblyMass)
         else
-            print("TARDIS RIG INCOMPLETE: manual physics flight will refuse to arm")
+            print("TARDIS RIG INCOMPLETE:", #rigIssues, "issue(s); first:",
+                rigIssues[1] or "unknown; check FIU API capabilities")
         end
     end
 end
