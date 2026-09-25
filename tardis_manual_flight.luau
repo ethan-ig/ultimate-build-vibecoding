@@ -8,7 +8,8 @@
 -- Input B: optional Vector3, CFrame or "x,y,z" autopilot destination.
 -- Input C: optional TRUE pulse to toggle autopilot.
 -- Input D: optional number speed limit, 10-265.
--- Output A: active boolean. Output B: actual root world Vector3.
+-- Output A: active boolean. Output B: world Vector3.
+-- Output C (optional): desired flight CFrame for a native game mover if needed.
 --
 -- GUI: TAKEOFF / GO / HOVER / DROP / +/- speed, X Y Z target fields.
 -- Native Roblox Custom camera: mouse orbit, scroll zoom, no scripted camera CFrame.
@@ -18,13 +19,14 @@
 -- On DROP, propulsion turns off; gravity takes over, never anchors box.
 
 local inputA, inputB, inputC, inputD = nil, nil, nil, nil
-local outputA, outputB = nil, nil
+local outputA, outputB, outputC = nil, nil, nil
 pcall(function() inputA = script.inputs["a"] end)
 pcall(function() inputB = script.inputs["b"] end)
 pcall(function() inputC = script.inputs["c"] end)
 pcall(function() inputD = script.inputs["d"] end)
 pcall(function() outputA = script.outputs["a"] end)
 pcall(function() outputB = script.outputs["b"] end)
+pcall(function() outputC = script.outputs["c"] end)
 
 local MIN_SPEED, MAX_SPEED, SPEED_STEP = 10, 265, 10
 local ACCELERATION, BRAKING, ARRIVAL_RADIUS = 55, 105, 2.8
@@ -688,8 +690,12 @@ local function updatePhysics(dt)
                 return
             end
             replicationWrites = replicationWrites + 1
+            -- Optional native movement-block bridge. Do not rely on this
+            -- signal alone to prove replication; wire C only to a supported
+            -- in-game movement block that accepts a CFrame.
+            output(outputC, kinematicPose)
             if replicationWrites == 1 then
-                print("TARDIS FIU WRAPPER WRITE ACCEPTED / spectator verification required")
+                print("TARDIS FIU WRAPPER WRITE ACCEPTED / spectator must confirm entire exterior")
             end
         end
     elseif velocityFallback then
