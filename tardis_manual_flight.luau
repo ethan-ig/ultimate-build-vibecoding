@@ -181,11 +181,18 @@ local function stopFlight(reason)
     keyDown = {}
     if thrust then pcall(function() thrust.Enabled = false end) end
     if spin then pcall(function() spin.Enabled = false end) end
-    -- Let the ship drift a little, then gravity does the rest. Do not anchor.
+    -- An ordinary pilot drop retains a little momentum and then falls.
+    -- During dematerialization the main controller owns the shell, so
+    -- absolutely no residual spin/velocity is injected into its teleport.
     if root then pcall(function()
-        local v = root.AssemblyLinearVelocity
-        root.AssemblyLinearVelocity = Vector3.new(v.X * 0.20, v.Y, v.Z * 0.20)
-        root.AssemblyAngularVelocity = Vector3.new(0.08, 0.30, 0.05)
+        if getValue(root, "TardisTransitioning") == true then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        else
+            local v = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(v.X * 0.20, v.Y, v.Z * 0.20)
+            root.AssemblyAngularVelocity = Vector3.new(0.08, 0.30, 0.05)
+        end
     end) end
     safeOutput(outputA, false)
     restoreCamera()
@@ -272,7 +279,8 @@ local function toggleAutopilot()
         print("TARDIS AUTOPILOT: cancelled, manual hover")
         return
     end
-    updateWiredInputs(os.clock() + 1)
+    lastTargetRead = 0
+    updateWiredInputs(os.clock())
     if not target then
         print("TARDIS AUTOPILOT: no target on input B")
         return
