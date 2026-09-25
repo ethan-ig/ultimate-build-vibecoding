@@ -180,6 +180,7 @@ end
 local function stopFlight(reason)
     if not flying then return end
     flying, autopilot = false, false
+    if root then pcall(function() root:SetAttribute("TardisFlightActive", false) end) end
     desiredVelocity = Vector3.zero
     keyDown = {}
     if thrust then pcall(function() thrust.Enabled = false end) end
@@ -222,6 +223,7 @@ local function startFlight()
     desiredVelocity = Vector3.zero
     takeoffUntil = os.clock() + 0.8
     flying, autopilot, cameraEnabled = true, false, true
+    pcall(function() root:SetAttribute("TardisFlightActive", true) end)
     lastCameraFrame = nil
     local look = root.CFrame.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
