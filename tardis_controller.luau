@@ -536,6 +536,86 @@ local function addRigMember(block, shouldCollide, density)
     return true
 end
 
+-- A map's anchored floor can be auto-jointed to the exterior when a user
+-- builds the TARDIS on top of it. Detach only rigid joints that CROSS the
+-- registered TARDIS boundary. Never unanchor or modify the map BasePart.
+local function isRigidJoint(joint)
+    local allowed = {
+        Weld = true, Snap = true, ManualWeld = true,
+        Motor = true, Motor6D = true, WeldConstraint = true,
+    }
+    local className = nil
+    pcall(function() className = joint.ClassName end)
+    return allowed[className] == true
+end
+
+local function jointEndParts(joint)
+    local a, b = nil, nil
+    pcall(function() a = joint.Part0 end)
+    pcall(function() b = joint.Part1 end)
+    return a, b
+end
+
+local function safePartName(part)
+    if not part then return "nil" end
+    local ok, name = pcall(function() return part:GetFullName() end)
+    if ok and type(name) == "string" then return name end
+    ok, name = pcall(function() return part.Name end)
+    return ok and tostring(name) or "unreadable part"
+end
+
+local function detachExternalRigidJoints()
+    local seen = {}
+    local removed, unresolved, reads = 0, 0, 0
+    for _, member in ipairs(rigMembers) do
+        local jointsOK, joints = pcall(function()
+            return member:GetJoints()
+        end)
+        if not jointsOK or type(joints) ~= "table" then
+            rigFailure("EXTERNAL JOINT SCAN",
+                safePartName(member) .. " / GetJoints unavailable: " .. tostring(joints))
+            return false
+        end
+        reads = reads + 1
+        for _, joint in ipairs(joints) do
+            if joint and not seen[joint] then
+                seen[joint] = true
+                if isRigidJoint(joint) then
+                    local a, b = jointEndParts(joint)
+                    local aIn = a ~= nil and rigMemberSet[a] == true
+                    local bIn = b ~= nil and rigMemberSet[b] == true
+                    if a and b and aIn ~= bIn then
+                        local outside = aIn and b or a
+                        local inside = aIn and a or b
+                        -- This destroys the CROSSING JOINT, not the outside
+                        -- part. We intentionally preserve map geometry and all
+                        -- joints whose endpoints both lie outside our build.
+                        local removedOK, removalError = pcall(function()
+                            joint:Destroy()
+                        end)
+                        if removedOK then
+                            removed = removed + 1
+                            print("TARDIS RIG: DETACHED EXTERNAL JOINT",
+                                tostring(joint.ClassName),
+                                safePartName(inside), "from",
+                                safePartName(outside))
+                        else
+                            unresolved = unresolved + 1
+                            rigFailure("EXTERNAL JOINT",
+                                safePartName(inside) .. " -> "
+                                .. safePartName(outside) .. ": "
+                                .. tostring(removalError))
+                        end
+                    end
+                end
+            end
+        end
+    end
+    print("TARDIS RIG JOINT ISOLATION:", removed, "external joint(s) removed;",
+        unresolved, "failed;", reads, "parts scanned")
+    return unresolved == 0
+end
+
 if #shellParts > 0 and startingPivot then
     rigRoot = asBasePart(shellParts[1])
     if rigRoot then
@@ -582,6 +662,10 @@ if #shellParts > 0 and startingPivot then
                     rigFailure("WELD " .. tostring(i), weldErr)
                 end
             end
+        end
+
+        if rigReady then
+            detachExternalRigidJoints()
         end
 
         if rigReady then
