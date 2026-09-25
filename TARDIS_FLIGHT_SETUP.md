@@ -39,8 +39,12 @@ Its TAKEOFF button works without any input-A wiring; GO uses three editable
 world-coordinate fields. A single `LinearVelocity` and `AngularVelocity`
 move the entire unanchored welded assembly. If FIU refuses the constraint API
 or the constraints do not translate the box, flight attempts direct assembly
-velocity and prints `TARDIS MOTION CHECK` diagnostics. Neither mode animates
-individual shell CFrames. The exterior constantly spins
+velocity and prints `TARDIS MOTION CHECK` diagnostics. If even direct velocity
+reports a speed but actual position is unchanged, it tests moving a single
+welded root by CFrame each frame, NOT 155 individual parts. This is a
+compatibility test, not a guarantee of server replication. If it also does not
+move or snaps back, FIU lacks motion authority; a server-owned movement
+mechanism or Ultimate Build's supported movement API is required. The exterior constantly spins
 with a slight wobble while flight is active. The camera holds a stable viewing
 direction rather than circling with the spinning box.
 
