@@ -69,7 +69,7 @@ The overhead map is separate; only the flight GUI was removed.
 |---|---|
 | A | Controller input C (normal teleport landing hint) |
 | B | Flight input C (autopilot pulse) |
-| C | Flight input B (exact selected Vector3) |
+| C | Flight input B (root target at ground + measured box clearance) |
 
 Navigation input A opens/closes the overhead selector. Click the destination.
 If flight is running, it holds while navigation owns the camera and follows
@@ -83,7 +83,7 @@ destination is still available to the normal teleport controller.
 2. Check materialize, demat, quick travel, portal, roof light and time rotor.
 3. Engage flight with A, verify physical rotation and W/S/Q/E.
 4. Enter input B as e.g. `500, 150, 500`, pulse C, check braking and hover.
-5. Use map destination; verify output C is exact and output A is ground-biased.
+5. Use map destination; verify output C is ground-adjusted and output A is ground-biased.
 6. Press X while airborne; verify the box tumbles/falls and rests on terrain.
 7. Dematerialize while flying; flight motors should disarm immediately.
 8. Ensure no two old/new controller copies are running simultaneously.
