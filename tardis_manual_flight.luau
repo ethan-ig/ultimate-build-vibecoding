@@ -42,7 +42,6 @@ local cameraEnabled, savedCamera, cameraPose, cameraHeading = true, nil, nil, ni
 local keyDown, target, speedLimit, desiredVelocity = {}, nil, 80, Vector3.zero
 local travelHeading = Vector3.new(0, 0, -1)
 local previousTarget, previousSpeed = nil, nil
-local guiTargetLocked = false
 local lastInputA, lastInputC = false, false
 local lastTargetRead, lastPositionWrite, lastGuard, lastHeartbeat = 0, 0, 0, 0
 local takeoffUntil, lastTick = 0, os.clock()
@@ -290,9 +289,7 @@ local function readWiredInputs(now)
         pcall(function() v = inputB:GetState() end)
         local p = parseTarget(v)
         if p and (not previousTarget or (p - previousTarget).Magnitude > .01) then
-            previousTarget = p
-            if not guiTargetLocked then target = p end
-            guiTargetLocked = false
+            previousTarget, target = p, p
             if coords[1] then
                 for i, n in ipairs({p.X, p.Y, p.Z}) do
                     local field = coords[i]
@@ -404,7 +401,6 @@ local function goFromGUI()
         previousTarget = parseTarget(wired) or previousTarget
     end
     target = p
-    guiTargetLocked = true
     startAuto()
 end
 
