@@ -36,10 +36,14 @@ to run instead of silently reverting to jerky individual CFrame movement.
 
 A compact, static coordinate-and-controls GUI replaces the old animated HUD.
 Its TAKEOFF button works without any input-A wiring; GO uses three editable
-world-coordinate fields. Flight V5.0 bypasses the ineffective local velocity
-path. It predicts movement on the client for responsive piloting and requests
-the same CFrame through Ultimate Build's exposed block wrapper at 20 Hz,
-rather than relying on the raw BasePart's client-only CFrame. The exterior
+world-coordinate fields. Flight V6.0 keeps responsive local piloting, but writes the calculated
+CFrame to each existing UB exterior proxy at a bounded rate, preserving its
+pivot-relative offset. It uses the same proxy property setter as the replicated
+chat-cube test, rather than moving only one raw/root BasePart. The code captures
+the controller's Tardis shell, exterior sound, roof light and portal blocks.
+The actual proxy count/rate is printed when engaging. Any replication claim
+still needs a spectator check with the WHOLE exterior, since the successful
+single cloned-cube test did not exercise 155 already-existing shell proxies. The exterior
 remains one heavy unanchored welded assembly; stopping flight stops motion
 writes so it can fall. Whether the FIU wrapper assignment reaches the server
 must be confirmed from another player/client, including that **every shell
