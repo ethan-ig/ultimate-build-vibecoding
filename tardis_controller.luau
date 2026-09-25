@@ -574,6 +574,7 @@ if #shellParts > 0 and startingPivot then
             rigRoot:SetAttribute("TardisRigRoot", true)
             rigRoot:SetAttribute("TardisRigReady", rigReady)
             rigRoot:SetAttribute("TardisTransitioning", false)
+            rigRoot:SetAttribute("TardisFlightActive", false)
             rigRoot:SetAttribute("TardisPilotGroundOffset",
                 -tardisBottomOffset + rigRootOffset.Position.Y + 0.8)
         end)
@@ -1859,6 +1860,9 @@ end
 local function shouldRunTimeRotor()
     if hidden then return true end
     if activeTransition then return true end
+    -- Physical piloting is a legitimate flight state, even though the shell
+    -- stays materialized. The rotor should animate the entire time.
+    if getBlockValue(rigRoot, "TardisFlightActive") == true then return true end
     return currentFade > 0.001
 end
 
