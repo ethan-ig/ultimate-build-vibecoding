@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 5.0 | Ultimate Build FIU
+-- TARDIS FLIGHT 5.1 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates; only one welded root CFrame is driven.
 -- The FIU wrapper receives throttled authoritative-position requests.
@@ -47,6 +47,12 @@ local replicationWriteFailures = 0
 local flying, autopilot, velocityFallback = false, false, false
 local cameraEnabled, savedCamera, cameraTarget = true, nil, nil
 local lastCameraCheck = 0
+local cameraMode, nativeSubject = "OFF", nil
+local orbitYaw, orbitPitch, orbitDistance = 0, math.rad(18), 30
+local orbitDragging = false
+local orbitFocus, orbitCameraPose = nil, nil
+local cameraRenderConnection, lastOrbitRender = nil, 0
+local cameraFailureLogged = false
 local keyDown, target, speedLimit, desiredVelocity = {}, nil, 80, Vector3.zero
 local travelHeading = Vector3.new(0, 0, -1)
 local previousTarget, previousSpeed = nil, nil
@@ -208,33 +214,59 @@ local function playerCameraSubject()
     return found
 end
 
+local function cameraFocusPosition()
+    local pose = (kinematicFallback and kinematicPose) or (root and root.CFrame)
+    return pose and (pose.Position + Vector3.new(0, 2, 0)) or nil
+end
+
 local function restoreCamera()
+    cameraMode, nativeSubject, orbitDragging = "OFF", nil, false
     local cam = camera()
     if cam and savedCamera then
         local previous = savedCamera
-        local subject = previous.subject
-        -- If an earlier run left its camera proxy behind, return to the
-        -- player's character instead of following an orphaned invisible Part.
-        local isOldProxy = false
-        pcall(function()
-            isOldProxy = subject and subject.Name == "TardisFlightCameraTarget"
-        end)
-        if not subject or isOldProxy then
-            subject = playerCameraSubject()
+        -- Do not submit FIU tables to CameraSubject. Only an actual valid
+        -- Instance can be a subject; failed assignments are handled once.
+        local subjects = {previous.subject, playerCameraSubject()}
+        local restored = false
+        for _, subject in ipairs(subjects) do
+            if subject then
+                local ok = pcall(function() cam.CameraSubject = subject end)
+                if ok then restored = true; break end
+                local inner = nil
+                pcall(function() inner = subject.Part end)
+                if inner then
+                    ok = pcall(function() cam.CameraSubject = inner end)
+                    if ok then restored = true; break end
+                end
+            end
         end
-        local ok, err = pcall(function()
-            if subject then cam.CameraSubject = subject end
+        pcall(function()
             if previous.fov then cam.FieldOfView = previous.fov end
             cam.CameraType = previous.kind == Enum.CameraType.Scriptable
                 and Enum.CameraType.Custom or (previous.kind or Enum.CameraType.Custom)
         end)
-        if not ok then print("TARDIS CAMERA RESTORE:", tostring(err)) end
+        if not restored then
+            print("TARDIS CAMERA: FIU did not expose a restorable subject")
+        end
     end
     savedCamera = nil
+    orbitFocus, orbitCameraPose = nil, nil
     if cameraTarget then
         pcall(function() cameraTarget:Destroy() end)
         cameraTarget = nil
     end
+end
+
+local function configureOrbitFromCurrentView(cam, focus)
+    orbitFocus, orbitCameraPose = focus, nil
+    local offset = Vector3.new(0, 12, 28)
+    pcall(function() offset = cam.CFrame.Position - focus end)
+    if offset.Magnitude < 1 then offset = Vector3.new(0, 12, 28) end
+    orbitDistance = math.clamp(offset.Magnitude, 8, 120)
+    orbitYaw = math.atan2(offset.X, offset.Z)
+    orbitPitch = math.clamp(math.asin(
+        math.clamp(offset.Y / offset.Magnitude, -1, 1)),
+        math.rad(-78), math.rad(78))
 end
 
 local function engageCamera()
@@ -252,10 +284,13 @@ local function engageCamera()
             }
         end)
     end
+
+    local followPosition = cameraFocusPosition()
+    if not followPosition then return end
     if not cameraTarget then
-        local ok, err = pcall(function()
-            -- Keep this proxy independent from the TARDIS weld assembly. It
-            -- follows POSITION only, so exterior spin never rotates the view.
+        -- This FIU may return a table proxy rather than a Roblox Instance.
+        -- Native CameraSubject gets only ONE guarded attempt per candidate.
+        local created, err = pcall(function()
             local old = workspace:FindFirstChild("TardisFlightCameraTarget")
             if old then old:Destroy() end
             local part = Instance.new("Part")
@@ -266,26 +301,47 @@ local function engageCamera()
             part.CanCollide = false
             pcall(function() part.CanTouch = false end)
             pcall(function() part.CanQuery = false end)
-            local pose = (kinematicFallback and kinematicPose) or root.CFrame
-            part.CFrame = CFrame.new(pose.Position + Vector3.new(0, 2, 0))
+            part.CFrame = CFrame.new(followPosition)
             part.Parent = workspace
             cameraTarget = part
         end)
-        if not ok then
-            status("CAMERA TARGET FAILED: " .. tostring(err))
-            return
+        if not created then print("TARDIS CAMERA PROXY:", tostring(err)) end
+    end
+
+    nativeSubject = nil
+    local rawTarget = nil
+    if cameraTarget then pcall(function() rawTarget = cameraTarget.Part end) end
+    -- Try native Roblox subject first; FIU sometimes provides a real .Part.
+    -- Do not retry a rejected table on every tick.
+    for _, candidate in ipairs({rawTarget, cameraTarget, root}) do
+        if candidate then
+            local ok = pcall(function()
+                cam.CameraSubject = candidate
+                cam.CameraType = Enum.CameraType.Custom
+            end)
+            if ok then
+                nativeSubject = candidate
+                cameraMode = "NATIVE"
+                break
+            end
         end
     end
-    local ok, err = pcall(function()
-        cam.CameraSubject = cameraTarget
-        cam.CameraType = Enum.CameraType.Custom
-    end)
-    if not ok then
-        status("CAMERA SETUP FAILED: " .. tostring(err))
+
+    if nativeSubject then
+        print("TARDIS CAMERA: native Roblox orbit enabled")
     else
-        print("TARDIS CAMERA: ROBLOX CUSTOM / free orbit + mouse zoom")
-        lastCameraCheck = os.clock()
+        -- CameraSubject rejects FIU table proxies. Preserve mouse orbit/zoom
+        -- without relying on that property at all.
+        if not cameraFailureLogged then
+            print("TARDIS CAMERA: FIU CameraSubject requires Instance, got proxy; using mouse orbit")
+            cameraFailureLogged = true
+        end
+        cameraMode = "ORBIT"
+        configureOrbitFromCurrentView(cam, followPosition)
+        local ok, err = pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+        if not ok then status("CAMERA ORBIT UNAVAILABLE: " .. tostring(err)) end
     end
+    lastCameraCheck = os.clock()
 end
 
 local function dropFlight(reason)
@@ -760,39 +816,56 @@ local function updatePhysics(dt)
     if cameraEnabled then updateCamera() end
 end
 
-updateCamera = function()
-    if not flying or not cameraEnabled or not cameraTarget or not root then return end
-    local pose = (kinematicFallback and kinematicPose) or root.CFrame
-    if not pose then return end
-    local ok, err = pcall(function()
-        cameraTarget.CFrame = CFrame.new(pose.Position + Vector3.new(0, 2, 0))
-    end)
-    if not ok then
-        status("CAMERA FOLLOW FAILED: " .. tostring(err))
-        return
-    end
+updateCamera = function(dt)
+    if not flying or not cameraEnabled or not root then return end
+    local focus = cameraFocusPosition()
+    if not focus then return end
+    local cam = camera()
+    if not cam then return end
 
-    -- Navigation temporarily owns the view. Once it closes, reinstate the
-    -- native orbit camera WITHOUT forcing any camera CFrame or mouse angle.
-    local now = os.clock()
-    if now - lastCameraCheck > .5 and not navigationOpen() then
-        lastCameraCheck = now
-        local cam = camera()
-        if cam then
-            local needsFollow = false
-            pcall(function()
-                needsFollow = cam.CameraSubject ~= cameraTarget
-                    or cam.CameraType ~= Enum.CameraType.Custom
-            end)
-            if needsFollow then
-                local changed, changeErr = pcall(function()
-                    cam.CameraSubject = cameraTarget
+    if cameraMode == "NATIVE" then
+        if cameraTarget then
+            pcall(function() cameraTarget.CFrame = CFrame.new(focus) end)
+        end
+        -- The exterior's spin is not inherited by the invisible subject.
+        -- Navigation takes over temporarily. Do not fight it.
+        local now = os.clock()
+        if not navigationOpen() and now - lastCameraCheck > .5 then
+            lastCameraCheck = now
+            local ok, subject = pcall(function() return cam.CameraSubject end)
+            if ok and subject ~= nativeSubject then
+                local changed = pcall(function()
+                    cam.CameraSubject = nativeSubject
                     cam.CameraType = Enum.CameraType.Custom
                 end)
                 if not changed then
-                    status("CAMERA SUBJECT FAILED: " .. tostring(changeErr))
+                    cameraMode = "ORBIT"
+                    configureOrbitFromCurrentView(cam, focus)
+                    pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+                    status("NATIVE SUBJECT LOST / MOUSE ORBIT")
                 end
             end
+        end
+    elseif cameraMode == "ORBIT" and not navigationOpen() then
+        dt = math.clamp(dt or UPDATE, .001, .10)
+        local alpha = 1 - math.exp(-16 * dt)
+        orbitFocus = orbitFocus and orbitFocus:Lerp(focus, alpha) or focus
+        local c, si = math.cos(orbitPitch), math.sin(orbitPitch)
+        local offset = Vector3.new(
+            math.sin(orbitYaw) * c * orbitDistance,
+            si * orbitDistance,
+            math.cos(orbitYaw) * c * orbitDistance
+        )
+        local desired = CFrame.lookAt(orbitFocus + offset, orbitFocus)
+        orbitCameraPose = orbitCameraPose
+            and orbitCameraPose:Lerp(desired, alpha) or desired
+        local ok, err = pcall(function()
+            cam.CameraType = Enum.CameraType.Scriptable
+            cam.CFrame = orbitCameraPose
+            cam.Focus = CFrame.new(orbitFocus)
+        end)
+        if not ok then
+            status("MOUSE ORBIT WRITE FAILED: " .. tostring(err))
         end
     end
 end
@@ -818,6 +891,30 @@ if UserInputService then pcall(function()
     end)
     UserInputService.InputEnded:Connect(function(input)
         keyDown[input.KeyCode] = nil
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then
+            orbitDragging = false
+        end
+    end)
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if flying and cameraMode == "ORBIT" and not navigationOpen()
+            and input.UserInputType == Enum.UserInputType.MouseButton2 then
+            orbitDragging = true
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input, processed)
+        if not flying or not cameraEnabled or cameraMode ~= "ORBIT"
+            or navigationOpen() or processed then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            and orbitDragging then
+            local d = input.Delta
+            orbitYaw = orbitYaw - d.X * .004
+            orbitPitch = math.clamp(orbitPitch + d.Y * .004,
+                math.rad(-78), math.rad(78))
+        elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+            orbitDistance = math.clamp(
+                orbitDistance - input.Position.Z * 4, 8, 120
+            )
+        end
     end)
 end) end
 
@@ -829,11 +926,18 @@ if RunService then
         end)
     end)
     if ok then heartbeatConnection = conn end
+    local renderOK, renderConn = pcall(function()
+        return RunService.RenderStepped:Connect(function(dt)
+            lastOrbitRender = os.clock()
+            if cameraMode == "ORBIT" then updateCamera(dt) end
+        end)
+    end)
+    if renderOK then cameraRenderConnection = renderConn end
 end
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 5.0 READY / FIU wrapper CFrame sync / native Roblox camera")
+print("TARDIS FLIGHT 5.1 READY / FIU sync / native or mouse-orbit camera")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
@@ -861,6 +965,9 @@ while true do
     end
     -- Refresh proxy even if the FIU Heartbeat callback stalls; Roblox's
     -- default CameraModule handles every rendered camera frame itself.
-    if flying and cameraEnabled then updateCamera() end
+    if flying and cameraEnabled and
+        (cameraMode ~= "ORBIT" or now - lastOrbitRender > .15) then
+        updateCamera(dt)
+    end
     task.wait(UPDATE)
 end
