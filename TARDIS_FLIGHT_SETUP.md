@@ -34,31 +34,31 @@ to run instead of silently reverting to jerky individual CFrame movement.
 
 ## 2. Flight: `tardis_manual_flight.luau`
 
-A compact, static coordinate-and-controls GUI replaces the old animated HUD.
-Its TAKEOFF button works without any input-A wiring; GO uses three editable
-world-coordinate fields. Flight V6.0 keeps responsive local piloting, but writes the calculated
-CFrame to each existing UB exterior proxy at a bounded rate, preserving its
-pivot-relative offset. It uses the same proxy property setter as the replicated
-chat-cube test, rather than moving only one raw/root BasePart. The code captures
-the controller's Tardis shell, exterior sound, roof light and portal blocks.
-The actual proxy count/rate is printed when engaging. Any replication claim
-still needs a spectator check with the WHOLE exterior, since the successful
-single cloned-cube test did not exercise 155 already-existing shell proxies. The exterior
-remains one heavy unanchored welded assembly; stopping flight stops motion
-writes so it can fall. Whether the FIU wrapper assignment reaches the server
-must be confirmed from another player/client, including that **every shell
-part** follows, not just the root. If it does not, this game must provide a
-server-authorized movement block or server-side script. The optional flight
-output C publishes the desired CFrame for a native mover that accepts it. The exterior constantly spins
-with a slight wobble while flight is active. Flight V5.1 tries Roblox's
-native `CameraType.Custom` camera with a real underlying BasePart as the follow
-subject. In this FIU environment, CameraSubject sometimes rejects its
-table-based proxies. When that happens, the script switches ONCE to a
-Scriptable orbit camera with right-mouse drag and scroll-wheel zoom instead
-of repeatedly submitting the invalid table. Press V to switch between the
-player and TARDIS views. The camera uses the commanded flight position so
-stale root reads do not leave it behind. The camera proxy is independent
-from the welded rig.
+A compact coordinate-and-controls GUI provides TAKEOFF, GO, speed +/-,
+HOVER and DROP. The controller still constructs a heavy welded assembly with
+its root normally unanchored.
+
+**Powered-flight tradeoff (V7.0):** The pilot temporarily anchors just the
+root *through the editable UB proxy*, then updates only its CFrame at up to
+30 Hz. Roblox's weld behavior is designed to carry the connected parts
+together. This removes V6's roughly 155 independent proxy writes per tick.
+When you press DROP or initiate controller travel, the root is unanchored
+again so normal gravity can act. The root is therefore NOT always unanchored
+while flight is active. Press DROP **before stopping the flight Code Block**;
+abruptly killing a running block may prevent cleanup.
+
+The old cloned-cube test established that an anchored UB proxy could move on
+another client. It did not prove that the entire controller-created welded
+assembly follows one anchored root on other clients. Test this with a second
+client, checking the entire shell, light, portal and sound block. If only the
+root moves, the engine's client-created welds may not be server-authoritative.
+Do not reactivate the 155-write backend: it was visibly unsmooth.
+
+Camera: try the native Custom orbit camera first, then FIU-compatible right-
+mouse drag and wheel zoom if CameraSubject rejects the proxy table. Camera
+position follows the calculated flight position rather than inheriting the
+exterior spin. Input B and the GUI use world X/Y/Z coordinates. Output C
+optionally publishes the desired full CFrame.
 
 | Port | Meaning |
 |---|---|
@@ -76,15 +76,14 @@ G toggles autopilot; V toggles camera; X or Escape drops out of flight.
 
 The GUI is visible even when flight is off. Click TAKEOFF, type X/Y/Z, click GO;
 use HOVER/ABORT or DROP at any time. The status line reports rig failures and
-whether physical motors, direct assembly velocity or network authority may be
-preventing movement.
+whether the powered-flight root and CFrame writes are available.
 
 With autopilot active, normal steering thrust or Space cancels autopilot.
-The target stays set until a new one is supplied. When the ship arrives, the
-flight constraint holds a hover until X/input A releases it.
+The target stays set until a new one is supplied. When the ship arrives, the powered root remains at its final CFrame until DROP.
 
-**Drop** disables both movers, leaves the exterior unanchored, and lets
-Roblox gravity act on the heavy physical assembly. Greater density increases
+**Drop** unanchors the replicated UB root and lets Roblox gravity act on the
+heavy physical assembly. If the unanchor write fails, the script reports a
+release error rather than claiming success. Greater density increases
 mass and collision inertia, not gravity's acceleration. It does not make
 the box fall faster in a vacuum. The hidden stage is the only special support.
 
@@ -112,8 +111,8 @@ destination is still available to the normal teleport controller.
 4. Enter GUI coordinates, e.g. `500, 150, 500`, click GO and check braking/hover. Input B/C remain optional for map wiring.
 5. Use map destination; verify output C is ground-adjusted and output A is ground-biased.
 6. Test with a second client. Confirm **the whole exterior** moves, not only the root, and check movement after reconnecting. Then press X to verify the box can fall.
-7. Dematerialize while flying; flight motors should disarm immediately.
-8. Ensure no two old/new controller copies are running simultaneously.
+7. Dematerialize while flying; the controller should release the flight anchor before travel.
+8. Press DROP before stopping the flight Code Block. Ensure no two pilot/controller copies are running.
 
 These scripts have static checks and GitHub content verification, but require
 a real Ultimate Build runtime test for engine permissions and network ownership.
