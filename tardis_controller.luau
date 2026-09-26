@@ -553,10 +553,25 @@ if #shellParts > 0 and startingPivot then
                 tostring(anchorFailures) .. " rejected / "
                 .. tostring(unresolved) .. " unconfirmed")
         end
-        local rawOK, rawAnchored = pcall(function() return rigRoot.Anchored end)
-        if not rawOK or rawAnchored ~= true then
-            rigFailure("ROOT PHYSICS", "underlying root anchored="
-                .. tostring(rawAnchored) .. " read=" .. tostring(rawOK))
+        -- Verify EVERY backing BasePart, not just the root. Otherwise
+        -- destroying the client welds can scatter still-unanchored pieces.
+        local rawUnanchored = 0
+        for i, block in ipairs(moveParts) do
+            local raw = asBasePart(block)
+            if raw then
+                local ok, anchored = pcall(function() return raw.Anchored end)
+                if not ok or anchored ~= true then
+                    rawUnanchored = rawUnanchored + 1
+                    if rawUnanchored <= 4 then
+                        print("TARDIS RAW ANCHOR UNCONFIRMED:", i,
+                            tostring(anchored), "read", tostring(ok))
+                    end
+                end
+            end
+        end
+        if rawUnanchored > 0 then
+            rigFailure("PHYSICAL ANCHORS",
+                tostring(rawUnanchored) .. " backing parts not anchored")
         end
         if #moveParts < 2 then rigFailure("SHELL", "not enough exterior blocks") end
 
