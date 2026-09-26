@@ -51,6 +51,7 @@ local root, rootWrapper = nil, nil
 local exteriorProxies, exteriorOffsets, exteriorRawParts = {}, {}, {}
 local dropping, dropVelocity, dropGroundY, initialFloorY = false, 0, nil, nil
 local writerBusy, writerFault, writerEpoch = false, nil, 0
+local landingCommitInProgress = false
 local lastReplicationWrite, replicationWrites = 0, 0
 local replicationWriteFailures, lastFailureLog = 0, 0
 local lastSuccessfulWriteCount, lastProxySummary = 0, 0
@@ -269,7 +270,7 @@ local function replicateExterior(pivot, now, force)
             if i % 24 == 0 then task.wait() end
         end
         if epoch ~= writerEpoch then
-            writerBusy = false
+            -- Do not clear the busy flag of a NEW flight session.
             return
         end
         replicationWrites = replicationWrites + wrote
@@ -494,6 +495,7 @@ local function stopFlight(reason)
     -- Controller transitions and failed writes stop here. They do NOT
     -- unanchor or destroy any part of the restored exterior.
     flying, dropping, autopilot = false, false, false
+    landingCommitInProgress = false
     writerEpoch = writerEpoch + 1
     desiredVelocity, keyDown = Vector3.zero, {}
     kinematicFallback, kinematicPose = false, nil
@@ -547,7 +549,7 @@ local function takeoff()
     kinematicPose, kinematicStallChecks = initialPose, 0
     lastReplicationWrite, replicationWrites, replicationWriteFailures = 0, 0, 0
     lastSuccessfulWriteCount, lastProxySummary, lastFailureLog = 0, 0, 0
-    writerFault, writerBusy = nil, false
+    writerFault, writerBusy, landingCommitInProgress = nil, false, false
     writerEpoch = writerEpoch + 1
     desiredVelocity = Vector3.zero
     initialFloorY = estimateGroundY(initialPose)
@@ -824,7 +826,7 @@ end
 -- Controlled fall: animated gravity, not Roblox physical gravity. Keeping
 -- every block anchored is essential when the client welds do not replicate.
 local function updateDrop(dt)
-    if not dropping or not kinematicPose then return end
+    if not dropping or not kinematicPose or landingCommitInProgress then return end
     if writerFault then stopFlight("DESCENT NETWORK ERROR: " .. writerFault); return end
     dt = math.clamp(dt or UPDATE, .002, .10)
     if attr(root, "TardisTransitioning") == true then
@@ -840,6 +842,7 @@ local function updateDrop(dt)
     kinematicPose = CFrame.new(previousPose.Position.X, nextY,
         previousPose.Position.Z) * rotation
     local landingReached = nextY <= landing + 0.001
+    if landingReached then landingCommitInProgress = true end
     if not replicateExterior(kinematicPose, os.clock(), landingReached) then
         stopFlight("DESCENT PROXY WRITE FAILED / HOLD")
         return
@@ -850,6 +853,7 @@ local function updateDrop(dt)
     if landingReached then
         -- Final synchronized position before ending the follow camera.
         dropping = false
+        landingCommitInProgress = false
         status("LANDED / EXTERIOR SAFELY ANCHORED")
         restoreCamera()
         kinematicFallback, kinematicPose = false, nil
