@@ -421,119 +421,107 @@ local function engageCamera()
     lastCameraCheck = os.clock()
 end
 
-local function dropFlight(reason)
-    if not flying then return end
-    -- Commit the exact last visual pose before releasing the physical shell.
-    -- Otherwise the remote box can be one network tick behind the pilot.
-    if kinematicPose and poweredRootAnchor
-        and attr(root, "TardisTransitioning") ~= true then
-        replicateExterior(kinematicPose, os.clock(), true)
-    end
-    -- Release the replicated ANCHOR before restoring normal gravity. Releasing
-    -- only the local raw BasePart is not enough for the other clients.
-    local released = true
-    if poweredRootAnchor and rootWrapper then
-        local releaseReason
-        released, releaseReason = setRootAnchorState(false, .75)
-        if not released then
-            print("TARDIS ROOT UNANCHOR FAILED:", releaseReason)
+-- Find a safe scripted landing height. Raycasts exclude the entire exterior;
+-- if the sandbox does not expose RaycastParams, fall back to the takeoff floor.
+local function estimateGroundY(pose)
+    local clearance = tonumber(attr(root, "TardisPilotGroundOffset")) or 7
+    clearance = math.clamp(clearance - .8, 2, 24)
+    local params = nil
+    local setupOK = pcall(function()
+        params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = exteriorRawParts
+        params.IgnoreWater = true
+    end)
+    if setupOK and params then
+        local hitOK, hit = pcall(function()
+            return workspace:Raycast(
+                pose.Position + Vector3.new(0, 25, 0),
+                Vector3.new(0, -2000, 0), params
+            )
+        end)
+        if hitOK and hit then
+            local hitPosition = nil
+            pcall(function() hitPosition = hit.Position end)
+            if typeof(hitPosition) == "Vector3" then
+                return math.min(pose.Position.Y,
+                    hitPosition.Y + clearance)
+            end
         end
     end
-    poweredRootAnchor = false
-    flying, autopilot = false, false
+    return initialFloorY or pose.Position.Y
+end
+
+local function stopFlight(reason)
+    -- Controller transitions and failed writes stop here. They do NOT
+    -- unanchor or destroy any part of the restored exterior.
+    flying, dropping, autopilot = false, false, false
     desiredVelocity, keyDown = Vector3.zero, {}
     kinematicFallback, kinematicPose = false, nil
-    disableMotors()
-    if root then
-        pcall(function() root:SetAttribute("TardisFlightActive", false) end)
-        pcall(function()
-            if attr(root, "TardisTransitioning") == true then
-                root.AssemblyLinearVelocity = Vector3.zero
-                root.AssemblyAngularVelocity = Vector3.zero
-            else
-                local v = root.AssemblyLinearVelocity
-                root.AssemblyLinearVelocity = Vector3.new(v.X * .2, v.Y, v.Z * .2)
-                root.AssemblyAngularVelocity = Vector3.new(.08, .30, .05)
-            end
-        end)
-    end
     output(outputA, false)
+    if root then pcall(function() root:SetAttribute("TardisFlightActive", false) end) end
     restoreCamera()
-    if released then
-        status(reason or "DROP / gravity released")
+    status(reason or "STOPPED / EXTERIOR HELD TOGETHER")
+end
+
+local function dropFlight(reason)
+    if not flying and not dropping then return end
+    if flying and (reason == "DROP / scripted descent" or reason == "TOGGLE DROP") then
+        flying, dropping, autopilot = false, true, false
+        desiredVelocity, keyDown = Vector3.zero, {}
+        output(outputA, false)
+        if root then pcall(function() root:SetAttribute("TardisFlightActive", false) end) end
+        dropGroundY = estimateGroundY(kinematicPose)
+        dropGroundY = math.min(dropGroundY, kinematicPose.Position.Y)
+        dropVelocity = 0
+        status("SCRIPTED GRAVITY DESCENT / SHELL STAYS TOGETHER")
+        print("TARDIS V8 DESCENT TARGET:", dropGroundY)
     else
-        status("DROP FAILED: manually unanchor TARDIS root")
+        stopFlight(reason)
     end
 end
 
 local function takeoff()
     if flying then return true end
+    if dropping then status("WAIT FOR DESCENT TO FINISH"); return false end
     root, rootWrapper = findRoot()
     local ok, reason = rigReady()
-    if not ok then
-        status("CAN'T TAKE OFF: " .. tostring(reason))
+    if not ok then status("CAN'T TAKE OFF: " .. tostring(reason)); return false end
+    if not rootWrapper then status("NO EDITABLE UB ROOT PROXY"); return false end
+    local readOK, initialPose = pcall(function() return rootWrapper.CFrame end)
+    if not readOK or typeof(initialPose) ~= "CFrame" then
+        status("ROOT PROXY CFRAME UNREADABLE")
         return false
     end
-    if not rootWrapper then
-        status("NO FIU ROOT WRAPPER")
+    if not prepareExteriorProxies(initialPose) then
+        status("V8 EXTERIOR NOT SAFE / RESTORE BUILD")
+        return false
+    end
+    -- Preflight uses the same replicated property path without moving anything.
+    local writeOK, err = pcall(function() rootWrapper.CFrame = initialPose end)
+    if not writeOK then
+        status("UB ROOT WRITER FAILED: " .. tostring(err))
         return false
     end
 
-    local wrapperOK, initialPose = pcall(function() return rootWrapper.CFrame end)
-    if not wrapperOK or typeof(initialPose) ~= "CFrame" then
-        status("FIU ROOT CFRAME UNREADABLE")
-        return false
-    end
-    local testOK, testErr = pcall(function() rootWrapper.CFrame = initialPose end)
-    if not testOK then
-        status("FIU ROOT CFRAME WRITE REJECTED: " .. tostring(testErr))
-        return false
-    end
-
-    -- Takeoff must use the SAME property path as the replicated anchored
-    -- cube. Unlike V5's unanchored root, this is driven as a kinematic
-    -- assembly during flight. Only the root is anchored, not all 155 parts.
-    local anchorOK, anchorReason = setRootAnchorState(true, 1.0)
-    if not anchorOK then
-        print("TARDIS ANCHOR DIAGNOSTIC:", anchorReason)
-        local released, releaseReason = setRootAnchorState(false, .75)
-        if not released then
-            print("TARDIS ANCHOR CLEANUP FAILED:", releaseReason)
-        end
-        status("FLIGHT ANCHOR FAILED / " .. anchorReason)
-        return false
-    end
-    poweredRootAnchor = true
-    -- The unanchored box may fall slightly while the server applies the
-    -- anchor. Start from its CURRENT pose, not the old pre-anchor position.
-    local freshOK, freshPose = pcall(function()
-        return rootWrapper.CFrame
-    end)
-    if freshOK and typeof(freshPose) == "CFrame" then initialPose = freshPose end
-    prepareExteriorProxies(initialPose)
-    clearMotors()
-    velocityFallback, kinematicFallback = true, true
+    velocityFallback, kinematicFallback = false, true
     kinematicPose, kinematicStallChecks = initialPose, 0
     lastReplicationWrite, replicationWrites, replicationWriteFailures = 0, 0, 0
     lastSuccessfulWriteCount, lastProxySummary, lastFailureLog = 0, 0, 0
     desiredVelocity = Vector3.zero
-    local look = initialPose.LookVector
-    local flat = Vector3.new(look.X, 0, look.Z)
+    initialFloorY = estimateGroundY(initialPose)
+    local flat = Vector3.new(initialPose.LookVector.X, 0, initialPose.LookVector.Z)
     travelHeading = flat.Magnitude > .01 and flat.Unit or Vector3.new(0, 0, -1)
     lastCameraCheck = 0
-    takeoffUntil = os.clock() + .8
-    motionStart, motionPosition, stalledChecks = os.clock(), root.Position, 0
+    takeoffUntil = os.clock() + .9
+    motionStart, motionPosition, stalledChecks = os.clock(), initialPose.Position, 0
     flying, autopilot, cameraEnabled = true, false, true
     pcall(function() root:SetAttribute("TardisFlightActive", true) end)
     engageCamera()
     output(outputA, true)
-    print("TARDIS REPLICATION: same anchored-proxy movement as chat cube")
-    print("TARDIS FLIGHT: ONE ROOT / 30 HZ / WELDED ASSEMBLY;",
-        "anchored only in powered flight")
-    local ownerOK, owner = pcall(function() return root:GetNetworkOwner() end)
-    print("TARDIS NETWORK OWNER:", ownerOK and
-        (owner and tostring(owner.Name) or "server") or "unavailable to FIU")
-    status("POWERED FLIGHT / SINGLE REPLICATED ROOT")
+    print("TARDIS V8 ENGAGED:", #exteriorProxies,
+        "independent replicated proxies / no physics welds")
+    status("V8 FLIGHT / SHARED-PIVOT PROXY MOVEMENT")
     return true
 end
 
@@ -737,7 +725,7 @@ local function buildGUI()
         uiButton(frame, "TAKEOFF", 12, 102, 101, function() takeoff() end)
         uiButton(frame, "GO", 119, 102, 102, goFromGUI)
         uiButton(frame, "DROP", 227, 102, 100,
-            function() dropFlight("DROP / gravity released") end)
+            function() dropFlight("DROP / scripted descent") end)
         uiText(frame, "CRUISE SPEED", offsetUDim(12, 148),
             offsetUDim(145, 22), 12)
         speedLabel = uiText(frame, tostring(speedLimit), offsetUDim(180, 146),
@@ -793,6 +781,10 @@ local function approach(current, goal, maxStep)
 end
 
 local function updatePhysics(dt)
+    if dropping then
+        updateDrop(dt)
+        return
+    end
     if not flying or not root then return end
     dt = math.clamp(dt or UPDATE, .002, .10)
     local now = os.clock()
@@ -852,102 +844,54 @@ local function updatePhysics(dt)
         SPIN_RATE + steer * STEER_SPIN,
         WOBBLE * math.cos(now * .65)
     )
-    if kinematicFallback then
-        -- In some FIU environments velocity *properties* update but their
-        -- physics owner never integrates a change in position. Move the ONE
-        -- welded root instead, never all 155 separate shell pieces. It stays
-        -- unanchored: dropping flight simply stops all kinematic writes.
-        -- This can be client-local if the server does not grant ownership.
-        if not kinematicPose then kinematicPose = root.CFrame end
-        local orientation = kinematicPose - kinematicPose.Position
-        local yaw = CFrame.Angles(0, rotation.Y * dt, 0)
-        local wobble = CFrame.Angles(rotation.X * dt, 0, rotation.Z * dt)
-        orientation = yaw * orientation * wobble
-        kinematicPose = CFrame.new(kinematicPose.Position + desiredVelocity * dt)
-            * orientation
-        -- One authoritative proxy write moves the welded assembly. The
-        -- camera can follow the continuously integrated kinematicPose, even
-        -- between the 30 Hz replicated root updates.
-        -- Controller owns the assembly during dematerialization/recall.
-        -- Check before EVERY network write, not just the slower safety poll.
-        if attr(root, "TardisTransitioning") == true then
-            dropFlight("CONTROLLER HANDOFF")
-            return
-        end
-        if not replicateExterior(kinematicPose, now, false) then
-            dropFlight("REPLICATED ROOT WRITE REJECTED")
-            return
-        end
-        -- Optional native movement block bridge.
-        output(outputC, kinematicPose)
-    elseif velocityFallback then
-        local ok, err = pcall(function()
-            root.AssemblyLinearVelocity = desiredVelocity
-            root.AssemblyAngularVelocity = rotation
-        end)
-        if not ok then
-            print("TARDIS VELOCITY ERROR:", tostring(err))
-            dropFlight("PHYSICS WRITE BLOCKED")
-            return
-        end
+    -- Integrate ONE commanded pose, then write all independent UB proxies
+    -- from their saved offsets. There are no physical welds or raw CFrame
+    -- preview writes to fight these authoritative edits.
+    if not kinematicPose then
+        stopFlight("MISSING FLIGHT POSE")
+        return
+    end
+    local orientation = kinematicPose - kinematicPose.Position
+    local yaw = CFrame.Angles(0, rotation.Y * dt, 0)
+    local wobble = CFrame.Angles(rotation.X * dt, 0, rotation.Z * dt)
+    orientation = yaw * orientation * wobble
+    kinematicPose = CFrame.new(
+        kinematicPose.Position + desiredVelocity * dt
+    ) * orientation
+    if attr(root, "TardisTransitioning") == true then
+        stopFlight("CONTROLLER HANDOFF")
+        return
+    end
+    if not replicateExterior(kinematicPose, now, false) then
+        stopFlight("PARTIAL PROXY WRITE / HOLD EXTERIOR")
+        return
+    end
+    output(outputC, kinematicPose)
+
+    -- Actual editor writes are counted separately from local interpolation.
+    if now - motionStart >= 2 then
+        local proxyCF = nil
+        pcall(function() proxyCF = rootWrapper.CFrame end)
+        print("TARDIS V8 FLIGHT CHECK:", #exteriorProxies, "proxies;",
+            "speed", desiredVelocity.Magnitude,
+            "target", tostring(kinematicPose.Position),
+            "root read", tostring(proxyCF and proxyCF.Position),
+            "total writes", replicationWrites,
+            "write errors", replicationWriteFailures)
+        motionStart = now
+    end
+    if outputB and now - lastPositionWrite >= .12 then
+        lastPositionWrite = now
+        output(outputB, kinematicPose.Position)
     end
 
-    -- Client raw-part reads may remain stale even when UB proxy movement is
-    -- accepted, so report it as LOCAL raw-root displacement, not server proof.
-    if now - motionStart >= 1.3 and motionPosition then
-        local actualDistance = (root.Position - motionPosition).Magnitude
-        if desiredVelocity.Magnitude > 8 and actualDistance < .35 then
-            stalledChecks = stalledChecks + 1
-            if not velocityFallback then
-                velocityFallback = true
-                disableMotors()
-                status("CONSTRAINTS STALLED / trying direct velocity")
-            elseif not kinematicFallback then
-                -- Repeated zero displacement with a finite mass and a
-                -- nonzero AssemblyLinearVelocity is not successful flight.
-                -- Stop relying on the velocity setter and try one root CFrame.
-                kinematicFallback = true
-                kinematicPose = root.CFrame
-                kinematicStallChecks = 0
-                disableMotors()
-                print("TARDIS FALLBACK: single-root CFrame flight; physics velocity not advancing position")
-                status("PHYSICS NOT ADVANCING / UB PROXY FLIGHT")
-            else
-                kinematicStallChecks = kinematicStallChecks + 1
-                if kinematicStallChecks >= 2 then
-                    status("RAW ROOT READ STALE / CHECK EXTERIOR ON SECOND CLIENT")
-                    print("TARDIS PROXY STATUS: raw Position unchanged; use spectator and proxy count to verify movement")
-                end
-            end
-        else
-            stalledChecks = 0
-            kinematicStallChecks = 0
-            if kinematicFallback and lastSuccessfulWriteCount == #exteriorProxies then
-                status("EXTERIOR PROXIES MOVING / CHECK SECOND CLIENT")
-            end
-        end
-        local proxyPosition = nil
-        pcall(function() proxyPosition = rootWrapper.CFrame.Position end)
-        print("TARDIS MOTION CHECK:", "local root moved", actualDistance,
-            "requested", desiredVelocity.Magnitude,
-            "pilot target", tostring(kinematicPose and kinematicPose.Position),
-            "root proxy position", tostring(proxyPosition),
-            "root updates", replicationWrites,
-            "write errors", replicationWriteFailures,
-            "temporary anchor", tostring(poweredRootAnchor))
-        motionStart, motionPosition = now, root.Position
-    end
-    if outputB and now - lastPositionWrite >= .1 then
-        lastPositionWrite = now
-        output(outputB, kinematicFallback and kinematicPose.Position or root.Position)
-    end
     -- Update the follow subject on the physics tick, independently from
     -- Roblox's native render-frame orbit and scroll-wheel zoom.
     if cameraEnabled then updateCamera() end
 end
 
 updateCamera = function(dt)
-    if not flying or not cameraEnabled or not root then return end
+    if not (flying or dropping) or not cameraEnabled or not root then return end
     local focus = cameraFocusPosition()
     if not focus then return end
     local cam = camera()
@@ -1004,7 +948,7 @@ end
 
 if UserInputService then pcall(function()
     UserInputService.InputBegan:Connect(function(input, processed)
-        if not flying then return end
+        if not (flying or dropping) then return end
         local key = input.KeyCode
         -- Roblox may consume WASD for regular player movement and set
         -- processed=true. Keep those keys for the flight fallback unless
@@ -1019,7 +963,7 @@ if UserInputService then pcall(function()
         end
         if processed then return end
         if key == Enum.KeyCode.X or key == Enum.KeyCode.Escape then
-            dropFlight("DROP / gravity released")
+            dropFlight("DROP / scripted descent")
         elseif key == Enum.KeyCode.G then
             toggleAuto()
         elseif key == Enum.KeyCode.V then
@@ -1040,13 +984,13 @@ if UserInputService then pcall(function()
         end
     end)
     UserInputService.InputBegan:Connect(function(input, processed)
-        if flying and cameraMode == "ORBIT" and not navigationOpen()
+        if (flying or dropping) and cameraMode == "ORBIT" and not navigationOpen()
             and input.UserInputType == Enum.UserInputType.MouseButton2 then
             orbitDragging = true
         end
     end)
     UserInputService.InputChanged:Connect(function(input, processed)
-        if not flying or not cameraEnabled or cameraMode ~= "ORBIT"
+        if not (flying or dropping) or not cameraEnabled or cameraMode ~= "ORBIT"
             or navigationOpen() or processed then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement
             and orbitDragging then
@@ -1083,13 +1027,13 @@ end
 -- Still press DROP before manually stopping the Code Block.
 pcall(function()
     script.Destroying:Connect(function()
-        if flying then dropFlight("FLIGHT BLOCK DESTROYED") end
+        if flying or dropping then stopFlight("FLIGHT BLOCK DESTROYED") end
     end)
 end)
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 7.1 READY / verified single-root anchor / 30 Hz")
+print("TARDIS FLIGHT 8.0 READY / stable independent proxies / scripted descent")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
@@ -1112,12 +1056,12 @@ while true do
     if c and not lastInputC then toggleAuto() end
     lastInputC = c
 
-    if flying and (not heartbeatConnection or now - lastHeartbeat > .6) then
+    if (flying or dropping) and (not heartbeatConnection or now - lastHeartbeat > .6) then
         updatePhysics(dt)
     end
     -- Refresh proxy even if the FIU Heartbeat callback stalls; Roblox's
     -- default CameraModule handles every rendered camera frame itself.
-    if flying and cameraEnabled and
+    if (flying or dropping) and cameraEnabled and
         (cameraMode ~= "ORBIT" or now - lastOrbitRender > .15) then
         updateCamera(dt)
     end
