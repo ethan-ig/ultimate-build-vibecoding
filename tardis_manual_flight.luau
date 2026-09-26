@@ -280,7 +280,7 @@ local function replicateExterior(pivot, now, force)
             writerFault = "only " .. tostring(wrote) .. "/"
                 .. tostring(#exteriorProxies) .. " proxy edits accepted"
         end
-        if os.clock() - lastProxySummary > 5 then
+        if os.clock() - lastProxySummary > 12 then
             lastProxySummary = os.clock()
             print("TARDIS V8 SYNC:", wrote, "/", #exteriorProxies,
                 "writes; total errors", replicationWriteFailures)
@@ -952,15 +952,12 @@ local function updatePhysics(dt)
     output(outputC, kinematicPose)
 
     -- Actual editor writes are counted separately from local interpolation.
-    if now - motionStart >= 2 then
-        local proxyCF = nil
-        pcall(function() proxyCF = rootWrapper.CFrame end)
-        print("TARDIS V8 FLIGHT CHECK:", #exteriorProxies, "proxies;",
-            "speed", desiredVelocity.Magnitude,
-            "target", tostring(kinematicPose.Position),
-            "root read", tostring(proxyCF and proxyCF.Position),
-            "total writes", replicationWrites,
-            "write errors", replicationWriteFailures)
+    if now - motionStart >= 10 then
+        print("TARDIS V8 STATUS:",
+            "parts", #exteriorProxies,
+            "speed", math.floor(desiredVelocity.Magnitude + .5),
+            "edits", replicationWrites,
+            "errors", replicationWriteFailures)
         motionStart = now
     end
     if outputB and now - lastPositionWrite >= .12 then
