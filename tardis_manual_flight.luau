@@ -849,6 +849,12 @@ local function updatePhysics(dt)
         -- One authoritative proxy write moves the welded assembly. The
         -- camera can follow the continuously integrated kinematicPose, even
         -- between the 30 Hz replicated root updates.
+        -- Controller owns the assembly during dematerialization/recall.
+        -- Check before EVERY network write, not just the slower safety poll.
+        if attr(root, "TardisTransitioning") == true then
+            dropFlight("CONTROLLER HANDOFF")
+            return
+        end
         if not replicateExterior(kinematicPose, now, false) then
             dropFlight("REPLICATED ROOT WRITE REJECTED")
             return
@@ -1053,6 +1059,14 @@ if RunService then
     end)
     if renderOK then cameraRenderConnection = renderConn end
 end
+
+-- Best-effort emergency unanchor if FIU exposes the Destroying signal.
+-- Still press DROP before manually stopping the Code Block.
+pcall(function()
+    script.Destroying:Connect(function()
+        if flying then dropFlight("FLIGHT BLOCK DESTROYED") end
+    end)
+end)
 
 output(outputA, false)
 buildGUI()
