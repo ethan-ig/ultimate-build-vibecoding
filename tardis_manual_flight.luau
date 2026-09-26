@@ -780,6 +780,42 @@ local function approach(current, goal, maxStep)
     return current + diff.Unit * maxStep
 end
 
+-- Controlled fall: animated gravity, not Roblox physical gravity. Keeping
+-- every block anchored is essential when the client welds do not replicate.
+local function updateDrop(dt)
+    if not dropping or not kinematicPose then return end
+    dt = math.clamp(dt or UPDATE, .002, .10)
+    if attr(root, "TardisTransitioning") == true then
+        stopFlight("CONTROLLER HANDOFF")
+        return
+    end
+    local previousPose = kinematicPose
+    local fromY = previousPose.Position.Y
+    local landing = dropGroundY or initialFloorY or fromY
+    dropVelocity = math.min(MAX_DROP_SPEED, dropVelocity + DROP_ACCELERATION * dt)
+    local nextY = math.max(landing, fromY - dropVelocity * dt)
+    local rotation = previousPose - previousPose.Position
+    kinematicPose = CFrame.new(previousPose.Position.X, nextY,
+        previousPose.Position.Z) * rotation
+    local landingReached = nextY <= landing + 0.001
+    if not replicateExterior(kinematicPose, os.clock(), landingReached) then
+        stopFlight("DESCENT PROXY WRITE FAILED / HOLD")
+        return
+    end
+    output(outputC, kinematicPose)
+    if outputB then output(outputB, kinematicPose.Position) end
+    if cameraEnabled then updateCamera() end
+    if landingReached then
+        -- Final synchronized position before ending the follow camera.
+        dropping = false
+        status("LANDED / EXTERIOR SAFELY ANCHORED")
+        restoreCamera()
+        kinematicFallback, kinematicPose = false, nil
+        print("TARDIS V8 LANDING: all", #exteriorProxies,
+            "independent shell proxies remained intact")
+    end
+end
+
 local function updatePhysics(dt)
     if dropping then
         updateDrop(dt)
