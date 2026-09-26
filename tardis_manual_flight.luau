@@ -1,24 +1,24 @@
--- TARDIS FLIGHT 7.1 | Ultimate Build FIU
--- Standalone physics flight with a SMALL, STATIC destination/control GUI.
--- No per-frame GUI updates. The server-facing movement backend commands ONE
--- anchored UB root proxy's CFrame; existing WeldConstraints move its assembly.
--- Anchor is TEMPORARY during powered flight, released for gravity on DROP.
--- This replaces the jittery 155-per-frame proxy movement. Existing GUI,
--- manual controls, autopilot and mouse-controlled orbit remain.
+-- TARDIS FLIGHT 8.0 | Ultimate Build FIU
+-- Standalone replicated UB-proxy flight with compact destination GUI.
+-- Requires the matching V8 controller, which REMOVES client-only welds and
+-- independently anchors each editable exterior part.
+-- Every part receives one shared pivot and a fixed relative offset.
+-- The original hovering-cube test proved these per-block proxy writes
+-- replicate; unlike V7, there is no client weld graph to tear apart.
+-- DROP uses scripted downward motion of the complete exterior. It does
+-- NOT unanchor the pieces: real gravity would scatter them without
+-- server-owned joints. The camera remains user-controlled.
 --
--- Input A: optional TRUE pulse to take off / drop.
--- Input B: optional Vector3, CFrame or "x,y,z" autopilot destination.
--- Input C: optional TRUE pulse to toggle autopilot.
--- Input D: optional number speed limit, 10-265.
--- Output A: active boolean. Output B: world Vector3.
--- Output C (optional): desired flight CFrame for a native game mover if needed.
---
--- GUI: TAKEOFF / GO / HOVER / DROP / +/- speed, X Y Z target fields.
--- Native Roblox Custom camera: mouse orbit, scroll zoom, no scripted camera CFrame.
--- Keyboard W/S: thrust, A/D: steer, Q/E: up/down, Shift: boost,
--- Space: hover, +/-: speed, G: autopilot, V: camera, X: drop.
--- Box spins with gentle wobble independently of travel heading.
--- On DROP, the temporary powered-flight anchor is removed; gravity takes over.
+-- Input A: optional TRUE pulse takeoff / scripted drop.
+-- Input B: optional Vector3, CFrame or "x,y,z" destination.
+-- Input C: optional TRUE pulse toggle autopilot.
+-- Input D: optional number speed limit.
+-- Output A: powered flight active. B: current target world Vector3.
+-- Output C: desired pivot CFrame.
+-- GUI: TAKEOFF / GO / HOVER / DROP / +/- speed, X Y Z.
+-- Keyboard W/S thrust, A/D steer, Q/E up/down, Shift boost,
+-- Space brake, +/- speed, G autopilot, V camera, X scripted drop.
+-- Spin rotates a single desired pivot and maintains all relative offsets.
 
 local inputA, inputB, inputC, inputD = nil, nil, nil, nil
 local outputA, outputB, outputC = nil, nil, nil
@@ -30,12 +30,15 @@ pcall(function() outputA = script.outputs["a"] end)
 pcall(function() outputB = script.outputs["b"] end)
 pcall(function() outputC = script.outputs["c"] end)
 
-local MIN_SPEED, MAX_SPEED, SPEED_STEP = 10, 265, 10
-local ACCELERATION, BRAKING, ARRIVAL_RADIUS = 55, 105, 2.8
-local SPIN_RATE, STEER_SPIN, TURN_RATE, WOBBLE = 0.9, 0.4, math.rad(70), 0.11
+local MIN_SPEED, MAX_SPEED, SPEED_STEP = 5, 90, 5
+local ACCELERATION, BRAKING, ARRIVAL_RADIUS = 16, 28, 2.8
+local SPIN_RATE, STEER_SPIN, TURN_RATE, WOBBLE = .60, .25, math.rad(55), .028
 local UPDATE = 1 / 30
-local MAX_REPLICATION_RATE = 30 -- One replicated root update, NOT 155
+local MAX_REPLICATION_RATE = 12 -- 155 proxies ~= 1,860 edits/sec
+local MAX_WRITES_PER_SECOND = 1900
 local REPLICATION_INTERVAL = 1 / MAX_REPLICATION_RATE
+local MAX_SHELL_RADIUS = 70
+local DROP_ACCELERATION, MAX_DROP_SPEED = 65, 75
 local NAV_GUI = "TardisNavigationGui"
 local RunService, Players, UserInputService = nil, nil, nil
 pcall(function() RunService = game:GetService("RunService") end)
@@ -44,10 +47,9 @@ pcall(function() UserInputService = game:GetService("UserInputService") end)
 local player = nil
 if Players then pcall(function() player = Players.LocalPlayer end) end
 
-local root, rootWrapper, attachment, linear, angular = nil, nil, nil, nil
-local exteriorProxies, exteriorOffsets = {}, {}
-local poweredRootAnchor = false
-local lastMovementSample, lastSamplePose = 0, nil
+local root, rootWrapper = nil, nil
+local exteriorProxies, exteriorOffsets, exteriorRawParts = {}, {}, {}
+local dropping, dropVelocity, dropGroundY, initialFloorY = false, 0, nil, nil
 local lastReplicationWrite, replicationWrites = 0, 0
 local replicationWriteFailures, lastFailureLog = 0, 0
 local lastSuccessfulWriteCount, lastProxySummary = 0, 0
@@ -60,7 +62,7 @@ local orbitDragging = false
 local orbitFocus, orbitCameraPose = nil, nil
 local cameraRenderConnection, lastOrbitRender = nil, 0
 local cameraFailureLogged = false
-local keyDown, target, speedLimit, desiredVelocity = {}, nil, 80, Vector3.zero
+local keyDown, target, speedLimit, desiredVelocity = {}, nil, 24, Vector3.zero
 local travelHeading = Vector3.new(0, 0, -1)
 local previousTarget, previousSpeed = nil, nil
 local lastInputA, lastInputC = false, false
@@ -136,163 +138,135 @@ local function findRoot()
     return selectedRoot, selectedWrapper
 end
 
--- The chat-cube replication test moved ONE anchored editable UB proxy.
--- A welded assembly should follow a root CFrame change as one rigid body.
--- Never CFrame each welded component separately: those writes fight the
--- solver and cause noticeable stutter and bandwidth pressure.
+-- The controller's shell/sound/light/portal blocks remain independent
+-- anchored UB entities. Collect their editable proxies, NEVER raw BaseParts.
+local function proxyDisplayName(object)
+    if not object then return nil end
+    local function readName(key)
+        local ok, v = pcall(function() return object[key] end)
+        if ok and type(v) == "string" and v ~= "" then return v end
+        ok, v = pcall(function() return object:GetAttribute(key) end)
+        if ok and type(v) == "string" and v ~= "" then return v end
+        ok, v = pcall(function() return object.attributes[key] end)
+        if ok and type(v) == "string" and v ~= "" then return v end
+        return nil
+    end
+    return readName("DisplayName") or readName("Display name")
+end
+
 local function prepareExteriorProxies(pivot)
-    exteriorProxies = {rootWrapper}
-    exteriorOffsets = {[rootWrapper] = CFrame.identity}
-    print("TARDIS FLIGHT DRIVER: one anchored UB root proxy / 30 Hz;",
-        "welded exterior expected to follow")
+    exteriorProxies, exteriorOffsets, exteriorRawParts = {}, {}, {}
+    local seen = {}
+    local shellCount, accessoryCount, unsafeCount = 0, 0, 0
+    local function add(block, isShell)
+        local ok, cf = pcall(function() return block.CFrame end)
+        if not ok or typeof(cf) ~= "CFrame" then return end
+        local raw = basePart(block) or block
+        if seen[raw] then return end
+        seen[raw] = true
+        local anchoredOK, anchored = pcall(function() return block.Anchored end)
+        if not anchoredOK or anchored ~= true then
+            unsafeCount = unsafeCount + 1
+            return
+        end
+        local offset = pivot:ToObjectSpace(cf)
+        if isShell and offset.Position.Magnitude > MAX_SHELL_RADIUS then
+            unsafeCount = unsafeCount + 1
+            print("TARDIS V8: scattered shell at radius", offset.Position.Magnitude)
+            return
+        end
+        table.insert(exteriorProxies, block)
+        exteriorOffsets[block] = offset
+        if raw then table.insert(exteriorRawParts, raw) end
+        if isShell then shellCount = shellCount + 1
+        else accessoryCount = accessoryCount + 1 end
+    end
+    -- Prefer the same editable objects used by the controller, not raw
+    -- duplicates. A BasePart wrapper may otherwise be counted twice.
+    local all = workspace:GetDescendants()
+    for pass = 1, 2 do
+        for _, block in ipairs(all) do
+            local raw = basePart(block)
+            local wrapper = raw and block ~= raw
+            if (pass == 1 and wrapper) or (pass == 2 and not wrapper) then
+                local name = proxyDisplayName(block)
+                if type(name) == "string" then
+                    name = string.lower(name:match("^%s*(.-)%s*$"))
+                    if name == "tardis" then
+                        add(block, true)
+                    elseif name == "tardismatsound" or name == "tardislight"
+                        or name == "tardisportal" then
+                        add(block, false)
+                    end
+                end
+            end
+        end
+    end
+    local actualRate = math.min(MAX_REPLICATION_RATE, math.max(1,
+        math.floor(MAX_WRITES_PER_SECOND / math.max(1, #exteriorProxies))))
+    REPLICATION_INTERVAL = 1 / actualRate
+    print("TARDIS V8 PROXY SCAN:", shellCount, "shell;",
+        accessoryCount, "accessory;", unsafeCount, "unsafe;",
+        #exteriorProxies, "total;", actualRate, "Hz")
+
+    -- A partial shell is more dangerous than a flight that refuses to arm.
+    if shellCount < 10 or unsafeCount > 0 then
+        status("SHELL INCOMPLETE / RESTORE BUILD OR CHECK ANCHORS")
+        return false
+    end
+    if not seen[root] then
+        status("ROOT PROXY MISSING FROM V8 SHELL")
+        return false
+    end
     return true
 end
 
 local function replicateExterior(pivot, now, force)
-    if not rootWrapper then return false end
     if not force and now - lastReplicationWrite < REPLICATION_INTERVAL then
         return true
     end
-    local ok, err = pcall(function()
-        -- Same editable proxy CFrame assignment as the tested chat cube.
-        rootWrapper.CFrame = pivot
-    end)
-    if not ok then
-        replicationWriteFailures = replicationWriteFailures + 1
-        if now - lastFailureLog > 1 then
-            lastFailureLog = now
-            print("TARDIS ROOT PROXY WRITE FAILED:", tostring(err))
-        end
-        return false
-    end
     lastReplicationWrite = now
-    replicationWrites = replicationWrites + 1
-    lastSuccessfulWriteCount = 1
-    if now - lastProxySummary > 5 then
-        lastProxySummary = now
-        print("TARDIS FLIGHT DRIVER:", replicationWrites,
-            "single-root frames; write errors", replicationWriteFailures)
-    end
-    return true
-end
-
--- A FIU proxy may acknowledge a property write before its backing BasePart
--- reflects the change. Verify both values over a bounded period; never treat
--- a successful pcall as proof that the server/physics state actually changed.
-local function setRootAnchorState(expected, timeoutSeconds)
-    if not root or not rootWrapper then
-        return false, "missing root or UB wrapper"
-    end
-    local writeOK, writeErr = pcall(function()
-        rootWrapper.Anchored = expected
-    end)
-    if not writeOK then
-        return false, "UB Anchored setter rejected: " .. tostring(writeErr)
-    end
-    local startedAt = os.clock()
-    local retried = false
-    local wrapperOK, wrapperValue, rawOK, rawValue = false, nil, false, nil
-    repeat
-        wrapperOK, wrapperValue = pcall(function()
-            return rootWrapper.Anchored
-        end)
-        rawOK, rawValue = pcall(function()
-            return root.Anchored
-        end)
-        if wrapperOK and rawOK
-            and wrapperValue == expected and rawValue == expected then
-            return true
-        end
-        if not retried and os.clock() - startedAt > .30 then
-            retried = true
-            local retryOK, retryErr = pcall(function()
-                rootWrapper.Anchored = expected
+    local wrote, failed = 0, 0
+    -- No raw part writes, no constraints and no WeldConstraints.
+    -- Each replicated write gets its pose from the SAME pivot.
+    for _, proxy in ipairs(exteriorProxies) do
+        local offset = exteriorOffsets[proxy]
+        if offset then
+            local ok, err = pcall(function()
+                proxy.CFrame = pivot * offset
             end)
-            if not retryOK then
-                return false, "retry rejected: " .. tostring(retryErr)
+            if ok then
+                wrote = wrote + 1
+            else
+                failed = failed + 1
+                if failed <= 3 and now - lastFailureLog > 1 then
+                    lastFailureLog = now
+                    print("TARDIS V8 PROXY WRITE ERROR:", tostring(err))
+                end
             end
         end
-        if os.clock() - startedAt >= timeoutSeconds then break end
-        task.wait(.05)
-    until false
-    return false, "setter accepted; UB proxy=" .. tostring(wrapperValue)
-        .. " (read=" .. tostring(wrapperOK) .. "), physical root="
-        .. tostring(rawValue) .. " (read=" .. tostring(rawOK)
-        .. "), expected=" .. tostring(expected)
+    end
+    replicationWrites = replicationWrites + wrote
+    replicationWriteFailures = replicationWriteFailures + failed
+    lastSuccessfulWriteCount = wrote
+    if now - lastProxySummary > 5 then
+        lastProxySummary = now
+        print("TARDIS V8 SYNC:", wrote, "/", #exteriorProxies,
+            "writes per tick; total errors", replicationWriteFailures)
+    end
+    return failed == 0 and wrote == #exteriorProxies
 end
 
 local function rigReady()
     if not root then return false, "controller rig not found" end
+    if attr(root, "TardisRigMode") ~= "PROXY_V8" then
+        return false, "matching V8 controller required; no client welds"
+    end
     if attr(root, "TardisRigReady") ~= true then
-        return false, tostring(attr(root, "TardisRigError") or "controller rig incomplete")
+        return false, tostring(attr(root, "TardisRigError") or "proxy rig incomplete")
     end
     if attr(root, "TardisTransitioning") == true then
-        return false, "controller is materializing/dematerializing"
-    end
-    local anchored = nil
-    pcall(function() anchored = root.Anchored end)
-    if flying then
-        if anchored ~= true then return false, "powered-flight root lost its anchor" end
-        return true
-    end
-    if anchored ~= false then return false, "root must start unanchored" end
-    local mass = nil
-    pcall(function() mass = root.AssemblyMass end)
-    if type(mass) ~= "number" or mass == math.huge or mass ~= mass or mass <= 0 then
-        return false, "invalid assembly mass: " .. tostring(mass)
-    end
-    return true
-end
-
-local function disableMotors()
-    if linear then pcall(function() linear.Enabled = false end) end
-    if angular then pcall(function() angular.Enabled = false end) end
-end
-
-local function clearMotors()
-    if not root then return end
-    for _, name in ipairs({
-        "TardisFlightVelocity", "TardisFlightSpin", "TardisFlightAttachment"
-    }) do
-        local old = root:FindFirstChild(name)
-        if old then pcall(function() old:Destroy() end) end
-    end
-end
-
-local function buildMotors()
-    local ok, err = pcall(function()
-        clearMotors()
-        attachment = Instance.new("Attachment")
-        attachment.Name = "TardisFlightAttachment"
-        attachment.Parent = root
-
-        linear = Instance.new("LinearVelocity")
-        linear.Name = "TardisFlightVelocity"
-        linear.Attachment0 = attachment
-        linear.RelativeTo = Enum.ActuatorRelativeTo.World
-        linear.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-        linear.ForceLimitsEnabled = false
-        linear.VectorVelocity = Vector3.zero
-        linear.Enabled = false
-        linear.Parent = root
-
-        angular = Instance.new("AngularVelocity")
-        angular.Name = "TardisFlightSpin"
-        angular.Attachment0 = attachment
-        angular.RelativeTo = Enum.ActuatorRelativeTo.World
-        angular.MaxTorque = 1e12
-        angular.AngularVelocity = Vector3.zero
-        angular.Enabled = false
-        angular.Parent = root
-    end)
-    if not ok then
-        print("TARDIS MOTOR CREATION FAILED:", tostring(err))
-        disableMotors()
-        for _, obj in ipairs({linear, angular, attachment}) do
-            if obj then pcall(function() obj:Destroy() end) end
-        end
-        linear, angular, attachment = nil, nil, nil
-        return false
+        return false, "controller owns exterior during transition"
     end
     return true
 end
