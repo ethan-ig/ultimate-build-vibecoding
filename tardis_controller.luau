@@ -1396,8 +1396,8 @@ local function startTransition(kind, targetFade, fast)
     setRigFlag("TardisTransitioning", true)
     setRigFlag("TardisFlightActive", false)
     if rigRoot then pcall(function()
-        -- Do not wait for the pilot's next poll. Physically release both motors
-        -- before demat/recall can move the shell.
+        -- Do not wait for the pilot's next poll. Release the flight motors
+        -- and its TEMPORARY anchored root before a controller teleport.
         local linearMotor = rigRoot:FindFirstChild("TardisFlightVelocity")
         local angularMotor = rigRoot:FindFirstChild("TardisFlightSpin")
         if linearMotor then linearMotor.Enabled = false end
@@ -1405,6 +1405,17 @@ local function startTransition(kind, targetFade, fast)
         rigRoot.AssemblyLinearVelocity = Vector3.zero
         rigRoot.AssemblyAngularVelocity = Vector3.zero
     end) end
+    if rigRoot and shellParts[1] then
+        local rootAnchored = false
+        pcall(function() rootAnchored = rigRoot.Anchored == true end)
+        if rootAnchored then
+            local releaseOK = setBlockValue(shellParts[1], "Anchored", false)
+            if not releaseOK then
+                print("TARDIS CONTROLLER: flight root proxy unanchor rejected")
+            end
+            pcall(function() rigRoot.Anchored = false end)
+        end
+    end
 
     if targetFade <= 0 and not prepareMaterialization(kind) then
         print("Materialization destination unavailable")
