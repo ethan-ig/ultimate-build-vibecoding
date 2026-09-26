@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 8.0 | Ultimate Build FIU
+-- TARDIS FLIGHT 8.1 | Ultimate Build FIU
 -- Standalone replicated UB-proxy flight with compact destination GUI.
 -- Requires the matching V8 controller, which REMOVES client-only welds and
 -- independently anchors each editable exterior part.
@@ -59,6 +59,7 @@ local flying, autopilot, velocityFallback = false, false, false
 local cameraEnabled, savedCamera, cameraTarget = true, nil, nil
 local lastCameraCheck = 0
 local cameraMode, nativeSubject = "OFF", nil
+local nativeCameraLagSince = 0
 local orbitYaw, orbitPitch, orbitDistance = 0, math.rad(18), 30
 local orbitDragging = false
 local orbitFocus, orbitCameraPose = nil, nil
@@ -330,6 +331,7 @@ end
 
 local function restoreCamera()
     cameraMode, nativeSubject, orbitDragging = "OFF", nil, false
+    nativeCameraLagSince = 0
     local cam = camera()
     if cam and savedCamera then
         local previous = savedCamera
@@ -406,6 +408,7 @@ local function engageCamera()
     -- No need to create an invisible proxy or invoke the failing constructor.
     cameraTarget = nil
     nativeSubject = nil
+    nativeCameraLagSince = 0
     local ok, err = pcall(function()
         cam.CameraSubject = root
         cam.CameraType = Enum.CameraType.Custom
@@ -952,12 +955,30 @@ updateCamera = function(dt)
     if not cam then return end
 
     if cameraMode == "NATIVE" then
-        if cameraTarget then
-            pcall(function() cameraTarget.CFrame = CFrame.new(focus) end)
-        end
-        -- The exterior's spin is not inherited by the invisible subject.
-        -- Navigation takes over temporarily. Do not fight it.
+        -- The native orbit controls are ideal IF FIU updates the physical
+        -- root's actual position. If only the UB proxy follows the calculated
+        -- CFrame, switch to our manually orbitable camera rather than leaving
+        -- the player staring at an empty patch of map.
         local now = os.clock()
+        if not navigationOpen() then
+            local readOK, rawPosition = pcall(function() return root.Position end)
+            local goalPosition = focus - Vector3.new(0, 2, 0)
+            if readOK and typeof(rawPosition) == "Vector3"
+                and (rawPosition - goalPosition).Magnitude > 8 then
+                if nativeCameraLagSince == 0 then nativeCameraLagSince = now end
+                if now - nativeCameraLagSince > .8 then
+                    cameraMode = "ORBIT"
+                    configureOrbitFromCurrentView(cam, focus)
+                    pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+                    print("TARDIS CAMERA: raw root lagging; using mouse orbit on live flight pose")
+                    status("CAMERA FOLLOW: MANUAL ORBIT / RIGHT MOUSE + WHEEL")
+                    return
+                end
+            else
+                nativeCameraLagSince = 0
+            end
+        end
+        -- Navigation takes over temporarily; do not fight its camera.
         if not navigationOpen() and now - lastCameraCheck > .5 then
             lastCameraCheck = now
             local ok, subject = pcall(function() return cam.CameraSubject end)
@@ -1087,7 +1108,7 @@ end)
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 8.0 READY / stable independent proxies / scripted descent")
+print("TARDIS FLIGHT 8.1 READY / no camera proxy creation / stable flight")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
