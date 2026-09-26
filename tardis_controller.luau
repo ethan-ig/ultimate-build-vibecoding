@@ -483,13 +483,12 @@ if startingPivot then
     end
 end
 
--- PHYSICS RIG: the exterior is always unanchored. All physical shell
--- pieces, roof lamp, exterior sound emitter and portal are welded to ONE root.
--- In flight, only that root receives velocity/angular-velocity constraints.
--- The time rotor and interior are independent and are never part of this rig.
+-- PROXY RIG V8: each existing Ultimate Build block is independently anchored.
+-- Client-created WeldConstraints did not replicate their assembly motion:
+-- moving only the root scattered the box for other clients. Flight now moves
+-- editable part proxies with one shared pivot, never a client-side weld graph.
+-- Only the exterior is included. Interior/time rotor remain independent.
 local rigRoot, rigReady, rigRootOffset = nil, false, nil
-local rigMembers = {}
-local rigMemberSet = {}
 local rigIssues = {}
 local function rigFailure(stage, detail)
     rigReady = false
@@ -503,245 +502,87 @@ local function asBasePart(block)
     if raw then pcall(function() valid = raw:IsA("BasePart") end) end
     return valid and raw or nil
 end
-
 local function setRigFlag(name, value)
     if rigRoot then pcall(function() rigRoot:SetAttribute(name, value) end) end
 end
 
-local function addRigMember(block, shouldCollide, density)
-    local raw = asBasePart(block)
-    if not raw then return false, "no readable BasePart" end
-    if not rigMemberSet[raw] then
-        rigMemberSet[raw] = true
-        table.insert(rigMembers, raw)
-        -- Check properties separately. FIU's failed promises can otherwise
-        -- hide which property is unsupported inside one combined pcall.
-        local okMass, massErr = pcall(function() raw.Massless = false end)
-        if not okMass then return false, "Massless: " .. tostring(massErr) end
-        local okCollision, collisionErr = pcall(function()
-            raw.CanCollide = shouldCollide
-        end)
-        if not okCollision then
-            return false, "CanCollide: " .. tostring(collisionErr)
-        end
-        local okProps, propsErr = pcall(function()
-            raw.CustomPhysicalProperties = PhysicalProperties.new(
-                density, shouldCollide and 1.3 or 0.3, 0, 100, 100
-            )
-        end)
-        if not okProps then
-            return false, "CustomPhysicalProperties: " .. tostring(propsErr)
-        end
-    end
-    return true
-end
-
--- A map's anchored floor can be auto-jointed to the exterior when a user
--- builds the TARDIS on top of it. Detach only rigid joints that CROSS the
--- registered TARDIS boundary. Never unanchor or modify the map BasePart.
-local function isRigidJoint(joint)
-    local allowed = {
-        Weld = true, Snap = true, ManualWeld = true,
-        Motor = true, Motor6D = true, WeldConstraint = true,
-    }
-    local className = nil
-    pcall(function() className = joint.ClassName end)
-    return allowed[className] == true
-end
-
-local function jointEndParts(joint)
-    local a, b = nil, nil
-    pcall(function() a = joint.Part0 end)
-    pcall(function() b = joint.Part1 end)
-    return a, b
-end
-
-local function safePartName(part)
-    if not part then return "nil" end
-    local ok, name = pcall(function() return part:GetFullName() end)
-    if ok and type(name) == "string" then return name end
-    ok, name = pcall(function() return part.Name end)
-    return ok and tostring(name) or "unreadable part"
-end
-
-local function detachExternalRigidJoints()
-    local seen = {}
-    local removed, unresolved, reads = 0, 0, 0
-    for _, member in ipairs(rigMembers) do
-        local jointsOK, joints = pcall(function()
-            return member:GetJoints()
-        end)
-        if not jointsOK or type(joints) ~= "table" then
-            rigFailure("EXTERNAL JOINT SCAN",
-                safePartName(member) .. " / GetJoints unavailable: " .. tostring(joints))
-            return false
-        end
-        reads = reads + 1
-        for _, joint in ipairs(joints) do
-            if joint and not seen[joint] then
-                seen[joint] = true
-                if isRigidJoint(joint) then
-                    local a, b = jointEndParts(joint)
-                    local aIn = a ~= nil and rigMemberSet[a] == true
-                    local bIn = b ~= nil and rigMemberSet[b] == true
-                    if a and b and aIn ~= bIn then
-                        local outside = aIn and b or a
-                        local inside = aIn and a or b
-                        -- This destroys the CROSSING JOINT, not the outside
-                        -- part. We intentionally preserve map geometry and all
-                        -- joints whose endpoints both lie outside our build.
-                        local removedOK, removalError = pcall(function()
-                            joint:Destroy()
-                        end)
-                        if removedOK then
-                            removed = removed + 1
-                            print("TARDIS RIG: DETACHED EXTERNAL JOINT",
-                                tostring(joint.ClassName),
-                                safePartName(inside), "from",
-                                safePartName(outside))
-                        else
-                            unresolved = unresolved + 1
-                            rigFailure("EXTERNAL JOINT",
-                                safePartName(inside) .. " -> "
-                                .. safePartName(outside) .. ": "
-                                .. tostring(removalError))
-                        end
-                    end
-                end
-            end
-        end
-    end
-    print("TARDIS RIG JOINT ISOLATION:", removed, "external joint(s) removed;",
-        unresolved, "failed;", reads, "parts scanned")
-    return unresolved == 0
-end
-
 if #shellParts > 0 and startingPivot then
     rigRoot = asBasePart(shellParts[1])
-    if rigRoot then
+    if not rigRoot then
+        rigFailure("ROOT", "shell[1] has no underlying BasePart")
+    else
         rigReady = true
         rigRootOffset = startingPivot:ToObjectSpace(rigRoot.CFrame)
 
-        for i, shell in ipairs(shellParts) do
-            local okMember, reason = addRigMember(
-                shell, true, shell == shellParts[1] and 65 or 12
-            )
-            if not okMember then
-                rigFailure("SHELL " .. tostring(i),
-                    tostring(getDisplayName(shell) or "Tardis") .. " / " .. tostring(reason))
-            end
-        end
-        local accessories = {}
-        for _, item in pairs({sound = matSound, lamp = tardisLight, portal = tardisPortal}) do
-            if item then table.insert(accessories, item) end
-        end
-        for _, accessory in ipairs(accessories) do
-            local okMember, reason = addRigMember(accessory, false, 2)
-            if not okMember then
-                rigFailure("ACCESSORY",
-                    tostring(getDisplayName(accessory) or "unnamed") .. " / " .. tostring(reason))
-            end
-        end
-
-        for i, part in ipairs(rigMembers) do
-            if part ~= rigRoot then
-                local success, weldErr = pcall(function()
-                    local name = "TardisRigidWeld_" .. tostring(i)
-                    local weld = rigRoot:FindFirstChild(name)
-                    if not weld then
-                        weld = Instance.new("WeldConstraint")
-                        weld.Name = name
-                        weld.Part0 = rigRoot
-                        weld.Part1 = part
-                        weld.Parent = rigRoot
-                    else
-                        weld.Part0, weld.Part1 = rigRoot, part
-                    end
+        -- Only remove our previous client-side welds, not map/game joints.
+        -- After a V7 explosion, restore the saved exterior BEFORE this step.
+        local removedWelds = 0
+        local childrenOK, children = pcall(function()
+            return rigRoot:GetChildren()
+        end)
+        if childrenOK and type(children) == "table" then
+            for _, item in ipairs(children) do
+                local jointName, className = nil, nil
+                pcall(function()
+                    jointName, className = item.Name, item.ClassName
                 end)
-                if not success then
-                    rigFailure("WELD " .. tostring(i), weldErr)
+                if type(jointName) == "string"
+                    and string.sub(jointName, 1, 16) == "TardisRigidWeld_"
+                    and className == "WeldConstraint" then
+                    local ok, err = pcall(function() item:Destroy() end)
+                    if ok then removedWelds = removedWelds + 1
+                    else rigFailure("OLD WELD CLEANUP", tostring(err)) end
                 end
             end
+        else
+            rigFailure("OLD WELD SCAN", tostring(children))
         end
+        print("TARDIS PROXY RIG: removed", removedWelds,
+            "old client welds (no map joints touched)")
 
-        if rigReady then
-            detachExternalRigidJoints()
-        end
-
-        if rigReady then
-            for _, member in ipairs(rigMembers) do
-                local okUnanchor, unanchorErr = pcall(function()
-                    member.Anchored = false
-                end)
-                local readOK, anchored = pcall(function() return member.Anchored end)
-                if not okUnanchor or not readOK or anchored ~= false then
-                    rigFailure("UNANCHOR " .. tostring(member.Name),
-                        okUnanchor and "Anchored remained true/unreadable" or unanchorErr)
-                end
-            end
-        end
-
-        -- Physics assembly mass can be stale immediately after changing
-        -- Anchored and creating welds. Let the joint graph settle before
-        -- deciding whether the shell is movable.
-        if rigReady then task.wait(0.10) end
-        local massOK, mass = pcall(function() return rigRoot.AssemblyMass end)
-        if rigReady and (not massOK or mass == math.huge or
-                type(mass) ~= "number" or mass ~= mass or mass <= 0) then
-            -- An infinite AssemblyMass normally means some rigidly connected
-            -- part remains anchored. Detect that part instead of removing
-            -- the safety check or unanchoring unrelated game geometry.
-            local function readableName(part)
-                local okName, fullName = pcall(function() return part:GetFullName() end)
-                if okName and type(fullName) == "string" then return fullName end
-                local okShort, shortName = pcall(function() return part.Name end)
-                return okShort and tostring(shortName) or "<unnamed>"
-            end
-
-            print("TARDIS RIG MASS DIAGNOSTIC:", tostring(mass),
-                "root anchored", tostring(rigRoot.Anchored),
-                "registered exterior parts", #rigMembers)
-            local rootOK, chosenRoot = pcall(function()
-                return rigRoot.AssemblyRootPart
-            end)
-            if rootOK and chosenRoot then
-                print("TARDIS ASSEMBLY ROOT:", readableName(chosenRoot),
-                    "anchored", tostring(chosenRoot.Anchored))
-            end
-
-            local foundAnchor = false
-            local connectedOK, connected = pcall(function()
-                return rigRoot:GetConnectedParts(true)
-            end)
-            if connectedOK and type(connected) == "table" then
-                local seen = {}
-                local function checkConnected(part)
-                    if not part or seen[part] then return end
-                    seen[part] = true
-                    local anchorOK, anchored = pcall(function() return part.Anchored end)
-                    if anchorOK and anchored == true then
-                        foundAnchor = true
-                        local ownership = rigMemberSet[part]
-                            and "registered exterior" or "EXTERNAL CONNECTION"
-                        rigFailure("CONNECTED ANCHOR",
-                            readableName(part) .. " / " .. ownership)
-                    end
-                end
-                checkConnected(rigRoot)
-                for _, part in ipairs(connected) do checkConnected(part) end
-                if not foundAnchor then
-                    print("TARDIS RIG: connected scan found no anchored parts;",
-                        "possible stale physics data or FIU simulation mismatch")
-                end
+        -- Set Anchored through each editable UB proxy, not just the raw
+        -- client BasePart. Prevent the 155 pieces from free-falling while
+        -- individual replicated CFrame writes are in progress.
+        local anchorFailures, writes = 0, 0
+        for i, block in ipairs(moveParts) do
+            local ok, err = pcall(function() block.Anchored = true end)
+            if ok then
+                writes = writes + 1
             else
-                print("TARDIS RIG: GetConnectedParts unavailable:",
-                    tostring(connected))
+                anchorFailures = anchorFailures + 1
+                if anchorFailures <= 4 then
+                    print("TARDIS PROXY ANCHOR ERROR:", i, tostring(err))
+                end
             end
-            rigFailure("ASSEMBLY MASS",
-                massOK and ("invalid mass " .. tostring(mass)) or "cannot read AssemblyMass")
+            if i % 25 == 0 then task.wait(0.02) end
         end
-        local flagsOK = pcall(function()
+        task.wait(0.20)
+        local unresolved = 0
+        for i, block in ipairs(moveParts) do
+            local ok, value = pcall(function() return block.Anchored end)
+            if not ok or value ~= true then
+                unresolved = unresolved + 1
+                if unresolved <= 4 then
+                    print("TARDIS PROXY ANCHOR UNCONFIRMED:", i,
+                        "read", tostring(ok), "value", tostring(value))
+                end
+            end
+        end
+        if anchorFailures > 0 or unresolved > 0 then
+            rigFailure("ANCHOR",
+                tostring(anchorFailures) .. " rejected / "
+                .. tostring(unresolved) .. " unconfirmed")
+        end
+        local rawOK, rawAnchored = pcall(function() return rigRoot.Anchored end)
+        if not rawOK or rawAnchored ~= true then
+            rigFailure("ROOT PHYSICS", "underlying root anchored="
+                .. tostring(rawAnchored) .. " read=" .. tostring(rawOK))
+        end
+        if #moveParts < 2 then rigFailure("SHELL", "not enough exterior blocks") end
+
+        local flagsOK, flagsError = pcall(function()
             rigRoot:SetAttribute("TardisRigRoot", true)
+            rigRoot:SetAttribute("TardisRigMode", "PROXY_V8")
             rigRoot:SetAttribute("TardisRigReady", rigReady)
             rigRoot:SetAttribute("TardisRigError", rigIssues[1] or "")
             rigRoot:SetAttribute("TardisRigIssueCount", #rigIssues)
@@ -751,62 +592,48 @@ if #shellParts > 0 and startingPivot then
                 -tardisBottomOffset + rigRootOffset.Position.Y + 0.8)
         end)
         if not flagsOK then
-            rigFailure("ATTRIBUTES", "FIU rejected SetAttribute")
+            rigFailure("ATTRIBUTES", tostring(flagsError))
             pcall(function() rigRoot:SetAttribute("TardisRigReady", false) end)
         end
         if rigReady then
-            print("TARDIS RIG READY: one unanchored assembly;", #rigMembers,
-                "physical parts; mass", rigRoot.AssemblyMass)
+            print("TARDIS PROXY RIG READY:", #moveParts,
+                "independent anchored exterior proxies; no welds")
         else
-            print("TARDIS RIG INCOMPLETE:", #rigIssues, "issue(s); first:",
-                rigIssues[1] or "unknown; check FIU API capabilities")
+            print("TARDIS PROXY RIG INCOMPLETE:", #rigIssues,
+                "issue(s); first", rigIssues[1] or "unknown")
         end
     end
+else
+    rigFailure("SHELL", "No starting pivot or exterior shell parts")
 end
 
--- Because a hidden unanchored box would fall out of the world, create an
--- invisible stationary support under the OFF-MAP staging position. The box
--- itself is never anchored; ordinary landings have no artificial support.
-if rigReady then
-    pcall(function()
-        local old = workspace:FindFirstChild("TardisHiddenSupport")
-        if old then old:Destroy() end
-        local pad = Instance.new("Part")
-        pad.Name = "TardisHiddenSupport"
-        pad.Size = Vector3.new(48, 2, 48)
-        pad.CFrame = CFrame.new(
-            HIDDEN_POSITION + Vector3.new(0, tardisBottomOffset - 1, 0)
-        )
-        pad.Transparency = 1
-        pad.Anchored = true
-        pad.CanCollide = true
-        pad.CanQuery = false
-        pad.Parent = workspace
-    end)
-end
+-- No off-map gravity support is needed; all exterior UB blocks are anchored.
+local oldStage = nil
+pcall(function() oldStage = workspace:FindFirstChild("TardisHiddenSupport") end)
+if oldStage then pcall(function() oldStage:Destroy() end) end
 
 local function moveTardis(pivot)
-    if rigReady and rigRoot then
-        -- One CFrame write moves the welded assembly; no shell-by-shell
-        -- desync, and no per-frame CFrame flight.
-        pcall(function()
-            rigRoot.AssemblyLinearVelocity = Vector3.zero
-            rigRoot.AssemblyAngularVelocity = Vector3.zero
-            rigRoot.CFrame = pivot * rigRootOffset
-        end)
-    else
-        -- Compatibility for a game sandbox that rejects physical welds.
-        -- This path is only used for legacy demat/materialize, never flight.
-        for _, part in ipairs(moveParts) do
-            local offset = relativeCFrames[part]
-            if offset then pcall(function() part.CFrame = pivot * offset end) end
+    if not pivot then return end
+    -- Demat/recall must use the same server-facing proxies as flight.
+    -- One source pivot preserves every exterior block's exact original offset.
+    local failures = 0
+    for _, block in ipairs(moveParts) do
+        local offset = relativeCFrames[block]
+        if offset then
+            local ok, err = pcall(function()
+                block.CFrame = pivot * offset
+            end)
+            if not ok then
+                failures = failures + 1
+                if failures <= 3 then
+                    print("TARDIS CONTROLLER MOVE ERROR:", tostring(err))
+                end
+            end
         end
-        if matSoundRaw and matSoundRawOffset then
-            pcall(function() matSoundRaw.CFrame = pivot * matSoundRawOffset end)
-        end
-        if tardisPortalRaw and tardisPortalRawOffset then
-            pcall(function() tardisPortalRaw.CFrame = pivot * tardisPortalRawOffset end)
-        end
+    end
+    if failures > 0 then
+        print("TARDIS CONTROLLER MOVE: failed", failures,
+            "of", #moveParts, "proxy writes")
     end
     forcePortalTransparent()
 end
@@ -1395,27 +1222,8 @@ local function startTransition(kind, targetFade, fast)
     -- Disable flight propulsion before any transition touches the assembly.
     setRigFlag("TardisTransitioning", true)
     setRigFlag("TardisFlightActive", false)
-    if rigRoot then pcall(function()
-        -- Do not wait for the pilot's next poll. Release the flight motors
-        -- and its TEMPORARY anchored root before a controller teleport.
-        local linearMotor = rigRoot:FindFirstChild("TardisFlightVelocity")
-        local angularMotor = rigRoot:FindFirstChild("TardisFlightSpin")
-        if linearMotor then linearMotor.Enabled = false end
-        if angularMotor then angularMotor.Enabled = false end
-        rigRoot.AssemblyLinearVelocity = Vector3.zero
-        rigRoot.AssemblyAngularVelocity = Vector3.zero
-    end) end
-    if rigRoot and shellParts[1] then
-        local rootAnchored = false
-        pcall(function() rootAnchored = rigRoot.Anchored == true end)
-        if rootAnchored then
-            local releaseOK = setBlockValue(shellParts[1], "Anchored", false)
-            if not releaseOK then
-                print("TARDIS CONTROLLER: flight root proxy unanchor rejected")
-            end
-            pcall(function() rigRoot.Anchored = false end)
-        end
-    end
+    -- Flight watches TardisTransitioning and stops proxy writes before travel.
+    -- Exterior parts are independently anchored; do not unanchor them here.
 
     if targetFade <= 0 and not prepareMaterialization(kind) then
         print("Materialization destination unavailable")
