@@ -575,6 +575,49 @@ if #shellParts > 0 and startingPivot then
         end
         if #moveParts < 2 then rigFailure("SHELL", "not enough exterior blocks") end
 
+        -- A restored build can still contain auto-joints to the anchored
+        -- map floor. Remove only rigid joints crossing the exterior boundary.
+        -- This never unanchors/deletes the map or modifies unrelated joints.
+        if rigReady then
+            local exteriorSet, exteriorList = {}, {}
+            for _, block in ipairs(moveParts) do
+                local raw = asBasePart(block)
+                if raw and not exteriorSet[raw] then
+                    exteriorSet[raw] = true
+                    table.insert(exteriorList, raw)
+                end
+            end
+            local seenJoint, removedExternal = {}, 0
+            local rigid = {
+                Weld = true, ManualWeld = true, WeldConstraint = true,
+                Snap = true, Motor = true, Motor6D = true,
+            }
+            for _, raw in ipairs(exteriorList) do
+                local ok, joints = pcall(function() return raw:GetJoints() end)
+                if not ok or type(joints) ~= "table" then
+                    rigFailure("JOINT SCAN", tostring(joints))
+                    break
+                end
+                for _, joint in ipairs(joints) do
+                    if joint and not seenJoint[joint] then
+                        seenJoint[joint] = true
+                        local a, b, class = nil, nil, nil
+                        pcall(function()
+                            a, b, class = joint.Part0, joint.Part1, joint.ClassName
+                        end)
+                        if rigid[class] and a and b
+                            and (exteriorSet[a] == true) ~= (exteriorSet[b] == true) then
+                            local removed, err = pcall(function() joint:Destroy() end)
+                            if removed then removedExternal = removedExternal + 1
+                            else rigFailure("EXTERNAL JOINT", tostring(err)) end
+                        end
+                    end
+                end
+            end
+            print("TARDIS PROXY RIG:", removedExternal,
+                "cross-boundary map joints detached")
+        end
+
         if rigReady then
             -- Only remove our previous client-side welds, not map/game joints.
             -- After a V7 explosion, restore the saved exterior BEFORE this step.
