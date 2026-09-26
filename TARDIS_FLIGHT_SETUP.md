@@ -1,118 +1,91 @@
-# TARDIS physics-flight rebuild (FIU code blocks)
+# TARDIS Flight V8 | Ultimate Build FIU
 
-Install all three matching files **as a set**. The main controller creates the
-physical rig; flight will not run against the older per-part CFrame controller.
-Stop the old running blocks before replacing their code, then start the
-controller first, flight second, navigation third.
+**Restore a healthy saved TARDIS before installing.** V7 moved the root
+without the rest of the exterior. No script can reconstruct the original
+relative positions of parts already scattered by that failed flight.
 
-## 1. Controller: `tardis_controller.luau`
+Stop all old controller and flight Code Blocks. Replace the controller and
+flight scripts **together**, then start only one controller followed by one
+flight block. Navigation remains unchanged.
 
-Existing inputs are preserved:
+## Why V8 is different
 
-| Input | Meaning |
-|---|---|
-| A | TRUE materialized / FALSE dematerialized |
-| B | Optional player target |
-| C | Normal teleport destination (Vector3 or CFrame) |
-| D | Fast travel |
-| E | Quick recall |
-| F | Quick destination |
-| J | Normal recall |
+The old chat-cube test proved that an anchored UB *part proxy* accepts
+replicated CFrame edits. It did not prove that a client-created WeldConstraint
+replicates. V7 anchored one root and moved it, leaving the exterior scattered
+on other clients.
 
-The controller retains the sound-synced fades, roof lamp, exterior portal,
-floor placement, quick travel and interior time rotor. It creates a heavy
-unanchored `WeldConstraint` assembly, an invisible support at the hidden
-staging location, and two root attributes:
+V8 removes only prior `TardisRigidWeld_*` constraints on the TARDIS root,
+anchors each exterior UB block through the editable proxy, and drives **one
+shared desired pivot**. At the network cadence, each block receives
+`proxy.CFrame = pivot * originalRelativeOffset`. This preserves the whole
+restored shape while each part is server-edited. The interior/time rotor are
+independent. Flight does not use raw-part velocity, local root CFrame writes,
+or a client weld graph.
 
-- `TardisRigReady`: TRUE only if assembly construction succeeded.
-- `TardisTransitioning`: TRUE during transitions and while hidden.
+The default cruise speed is 24 studs/sec; +/- changes it in 5-stud increments.
+Updates are capped at 12 Hz and ~1,900 proxy edits/second. Camera smoothing
+does not increase network edits. This architecture avoids physics fights and
+catastrophic separation, but 155 independent server property writes are not
+atomic: perfect spectator-side animation would require a documented native
+server-side group-movement mechanism or a much smaller union-based exterior.
 
-Exterior parts and accessories must expose real Roblox `BasePart` instances
-through `.Part` or directly, so WeldConstraints can operate. If the sandbox
-denies this, the controller logs `TARDIS RIG INCOMPLETE` and flight refuses
-to run instead of silently reverting to jerky individual CFrame movement.
+## Controller: tardis_controller.luau
 
-## 2. Flight: `tardis_manual_flight.luau`
+Inputs are unchanged: A materialization state; B optional player target;
+C destination; D fast travel; E quick recall; F quick destination; J normal
+recall. The controller still handles audio, visual fades, portal, lamp,
+time rotor and teleportation. Normal teleport movement also uses the UB
+exterior part proxies, rather than the raw client root.
 
-A compact coordinate-and-controls GUI provides TAKEOFF, GO, speed +/-,
-HOVER and DROP. The controller still constructs a heavy welded assembly with
-its root normally unanchored.
+Required ready messages:
 
-**Powered-flight tradeoff (V7.0):** The pilot temporarily anchors just the
-root *through the editable UB proxy*, then updates only its CFrame at up to
-30 Hz. Roblox's weld behavior is designed to carry the connected parts
-together. This removes V6's roughly 155 independent proxy writes per tick.
-When you press DROP or initiate controller travel, the root is unanchored
-again so normal gravity can act. The root is therefore NOT always unanchored
-while flight is active. Press DROP **before stopping the flight Code Block**;
-abruptly killing a running block may prevent cleanup.
+```text
+TARDIS PROXY RIG READY: ... independent anchored exterior proxies; no welds
+```
 
-The old cloned-cube test established that an anchored UB proxy could move on
-another client. It did not prove that the entire controller-created welded
-assembly follows one anchored root on other clients. Test this with a second
-client, checking the entire shell, light, portal and sound block. If only the
-root moves, the engine's client-created welds may not be server-authoritative.
-Do not reactivate the 155-write backend: it was visibly unsmooth.
+It sets `TardisRigMode = PROXY_V8`, `TardisRigReady`, and transition
+attributes on the physical root for the flight block to read. Flight refuses
+to engage if the controller is mismatched, a shell is too far from the
+restored pivot, or an exterior anchor cannot be verified.
 
-Camera: try the native Custom orbit camera first, then FIU-compatible right-
-mouse drag and wheel zoom if CameraSubject rejects the proxy table. Camera
-position follows the calculated flight position rather than inheriting the
-exterior spin. Input B and the GUI use world X/Y/Z coordinates. Output C
-optionally publishes the desired full CFrame.
+## Flight: tardis_manual_flight.luau
 
-| Port | Meaning |
-|---|---|
-| Input A | Pulse TRUE to engage or drop |
-| Input B | Vector3 / CFrame / string `x, y, z` target |
-| Input C | Pulse TRUE to toggle autopilot |
-| Input D | Optional numeric speed limit (10–265) |
-| Output A | Flight active boolean |
-| Output B | Desired exterior position Vector3 |
-| Output C | Optional desired full CFrame, connect only to a native movement block with a documented CFrame input |
+Input A (optional): pulse to take off or begin descent.
+Input B: optional Vector3, CFrame or coordinate string.
+Input C: optional autopilot pulse.
+Input D: optional cruise speed (5-90).
+Output A: powered-flight active.
+Output B: desired world position.
+Output C: full desired pivot CFrame.
 
-Keyboard: W/S forward/back; A/D steer travel independently of the spin;
-Q/E descend/ascend; Shift boost; Space brake/hover; + and - adjust speed by 10;
-G toggles autopilot; V toggles camera; X or Escape drops out of flight.
+The compact GUI has TAKEOFF, GO with X/Y/Z fields, HOVER/ABORT, DROP
+and speed +/- buttons. Keyboard: W/S thrust, A/D steer, E/Q up/down,
+Shift boost, Space brake, G autopilot, V switch camera, X begin descent.
+The independent shell spins and gently wobbles around the shared pivot.
+The FIU-compatible camera supports orbiting and zoom, independently of spin.
 
-The GUI is visible even when flight is off. Click TAKEOFF, type X/Y/Z, click GO;
-use HOVER/ABORT or DROP at any time. The status line reports rig failures and
-whether the powered-flight root and CFrame writes are available.
+**DROP IS SCRIPTED, NOT REAL PHYSICS.** The entire independently anchored
+exterior descends together using increasing vertical speed and an available
+ground raycast, with fallback to the takeoff floor. It remains anchored when
+landed. Unanchoring 155 separately replicated parts without server-authority
+welds would scatter the box, as the previous experiment proved. Wait until
+the panel reports LANDED before stopping the flight block.
 
-With autopilot active, normal steering thrust or Space cancels autopilot.
-The target stays set until a new one is supplied. When the ship arrives, the powered root remains at its final CFrame until DROP.
+## Navigation: tardis_navigation.luau
 
-**Drop** unanchors the replicated UB root and lets Roblox gravity act on the
-heavy physical assembly. If the unanchor write fails, the script reports a
-release error rather than claiming success. Greater density increases
-mass and collision inertia, not gravity's acceleration. It does not make
-the box fall faster in a vacuum. The hidden stage is the only special support.
+Unchanged. Output A -> controller input C; output B -> flight input C;
+output C -> flight input B. Navigation input A opens/closes the map.
 
-## 3. Navigation: `tardis_navigation.luau`
+## Test in Ultimate Build
 
-The overhead map remains separate from the compact flight control panel.
+1. Restore the healthy saved build. Replace controller and flight as a set.
+2. Start controller, confirm `TARDIS PROXY RIG READY` and correct shell count.
+3. Start flight, confirm `TARDIS FLIGHT 8.0 READY`.
+4. Click TAKEOFF, test W and E at the default speed, then GO with coordinates.
+5. Have another client confirm that the entire exterior follows, not just
+   a root or sound/light block.
+6. Press DROP and allow the scripted descent to finish; test normal recall.
 
-| Output | Wire to |
-|---|---|
-| A | Controller input C (normal teleport landing hint) |
-| B | Flight input C (autopilot pulse) |
-| C | Flight input B (root target at ground + measured box clearance) |
-
-Navigation input A opens/closes the overhead selector. Click the destination.
-If flight is running, it holds while navigation owns the camera and follows
-the selected destination when navigation closes. If flight is off, the
-destination is still available to the normal teleport controller.
-
-## Tests to run in Ultimate Build
-
-1. On starting the controller, find `TARDIS RIG READY` in logs and verify
-   `AssemblyMass` is finite. If `RIG INCOMPLETE` appears, do not test flight.
-2. Check materialize, demat, quick travel, portal, roof light and time rotor.
-3. Engage flight using GUI TAKEOFF (no input A required), verify motion and controls.
-4. Enter GUI coordinates, e.g. `500, 150, 500`, click GO and check braking/hover. Input B/C remain optional for map wiring.
-5. Use map destination; verify output C is ground-adjusted and output A is ground-biased.
-6. Test with a second client. Confirm **the whole exterior** moves, not only the root, and check movement after reconnecting. Then press X to verify the box can fall.
-7. Dematerialize while flying; the controller should release the flight anchor before travel.
-8. Press DROP before stopping the flight Code Block. Ensure no two pilot/controller copies are running.
-
-These scripts have static checks and GitHub content verification, but require
-a real Ultimate Build runtime test for engine permissions and network ownership.
+A successful proxy setter does not by itself prove two-client behavior. This
+code is committed but still needs a live multiplayer runtime test.
