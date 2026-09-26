@@ -514,36 +514,16 @@ if #shellParts > 0 and startingPivot then
         rigReady = true
         rigRootOffset = startingPivot:ToObjectSpace(rigRoot.CFrame)
 
-        -- Only remove our previous client-side welds, not map/game joints.
-        -- After a V7 explosion, restore the saved exterior BEFORE this step.
-        local removedWelds = 0
-        local childrenOK, children = pcall(function()
-            return rigRoot:GetChildren()
-        end)
-        if childrenOK and type(children) == "table" then
-            for _, item in ipairs(children) do
-                local jointName, className = nil, nil
-                pcall(function()
-                    jointName, className = item.Name, item.ClassName
-                end)
-                if type(jointName) == "string"
-                    and string.sub(jointName, 1, 16) == "TardisRigidWeld_"
-                    and className == "WeldConstraint" then
-                    local ok, err = pcall(function() item:Destroy() end)
-                    if ok then removedWelds = removedWelds + 1
-                    else rigFailure("OLD WELD CLEANUP", tostring(err)) end
-                end
-            end
-        else
-            rigFailure("OLD WELD SCAN", tostring(children))
-        end
-        print("TARDIS PROXY RIG: removed", removedWelds,
-            "old client welds (no map joints touched)")
-
         -- Set Anchored through each editable UB proxy, not just the raw
         -- client BasePart. Prevent the 155 pieces from free-falling while
         -- individual replicated CFrame writes are in progress.
         local anchorFailures, writes = 0, 0
+        local firstAnchorOK, firstAnchorError = pcall(function()
+            shellParts[1].Anchored = true
+        end)
+        if not firstAnchorOK then
+            rigFailure("ROOT ANCHOR", tostring(firstAnchorError))
+        end
         for i, block in ipairs(moveParts) do
             local ok, err = pcall(function() block.Anchored = true end)
             if ok then
@@ -556,7 +536,7 @@ if #shellParts > 0 and startingPivot then
             end
             if i % 25 == 0 then task.wait(0.02) end
         end
-        task.wait(0.20)
+        task.wait(0.55)
         local unresolved = 0
         for i, block in ipairs(moveParts) do
             local ok, value = pcall(function() return block.Anchored end)
@@ -579,6 +559,37 @@ if #shellParts > 0 and startingPivot then
                 .. tostring(rawAnchored) .. " read=" .. tostring(rawOK))
         end
         if #moveParts < 2 then rigFailure("SHELL", "not enough exterior blocks") end
+
+        if rigReady then
+            -- Only remove our previous client-side welds, not map/game joints.
+            -- After a V7 explosion, restore the saved exterior BEFORE this step.
+            local removedWelds = 0
+            local childrenOK, children = pcall(function()
+                return rigRoot:GetChildren()
+            end)
+            if childrenOK and type(children) == "table" then
+                for _, item in ipairs(children) do
+                    local jointName, className = nil, nil
+                    pcall(function()
+                        jointName, className = item.Name, item.ClassName
+                    end)
+                    if type(jointName) == "string"
+                        and string.sub(jointName, 1, 16) == "TardisRigidWeld_"
+                        and className == "WeldConstraint" then
+                        local ok, err = pcall(function() item:Destroy() end)
+                        if ok then removedWelds = removedWelds + 1
+                        else rigFailure("OLD WELD CLEANUP", tostring(err)) end
+                    end
+                end
+            else
+                rigFailure("OLD WELD SCAN", tostring(children))
+            end
+            print("TARDIS PROXY RIG: removed", removedWelds,
+                "old client welds (no map joints touched)")
+
+        else
+            print("TARDIS PROXY RIG: anchor verification failed, retaining existing joints")
+        end
 
         local flagsOK, flagsError = pcall(function()
             rigRoot:SetAttribute("TardisRigRoot", true)
