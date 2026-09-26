@@ -50,6 +50,7 @@ if Players then pcall(function() player = Players.LocalPlayer end) end
 local root, rootWrapper = nil, nil
 local exteriorProxies, exteriorOffsets, exteriorRawParts = {}, {}, {}
 local dropping, dropVelocity, dropGroundY, initialFloorY = false, 0, nil, nil
+local writerBusy, writerFault, writerEpoch = false, nil, 0
 local lastReplicationWrite, replicationWrites = 0, 0
 local replicationWriteFailures, lastFailureLog = 0, 0
 local lastSuccessfulWriteCount, lastProxySummary = 0, 0
@@ -221,40 +222,77 @@ local function prepareExteriorProxies(pivot)
     return true
 end
 
+-- Writes are sliced into short batches, rather than blocking one Heartbeat
+-- with 155 proxy setter calls. Each burst uses ONE immutable pose snapshot;
+-- the input/camera calculation keeps running while the edits are sent.
 local function replicateExterior(pivot, now, force)
-    if not force and now - lastReplicationWrite < REPLICATION_INTERVAL then
+    if writerFault then return false end
+    if not force and (writerBusy or now - lastReplicationWrite < REPLICATION_INTERVAL) then
         return true
     end
-    lastReplicationWrite = now
-    local wrote, failed = 0, 0
-    -- No raw part writes, no constraints and no WeldConstraints.
-    -- Each replicated write gets its pose from the SAME pivot.
-    for _, proxy in ipairs(exteriorProxies) do
-        local offset = exteriorOffsets[proxy]
-        if offset then
-            local ok, err = pcall(function()
-                proxy.CFrame = pivot * offset
-            end)
-            if ok then
-                wrote = wrote + 1
-            else
-                failed = failed + 1
-                if failed <= 3 and now - lastFailureLog > 1 then
-                    lastFailureLog = now
-                    print("TARDIS V8 PROXY WRITE ERROR:", tostring(err))
-                end
-            end
+    if force and writerBusy then
+        local waitStart = os.clock()
+        while writerBusy and os.clock() - waitStart < 1.2 do
+            task.wait(.02)
+        end
+        if writerBusy then
+            writerFault = "prior network burst did not finish"
+            return false
         end
     end
-    replicationWrites = replicationWrites + wrote
-    replicationWriteFailures = replicationWriteFailures + failed
-    lastSuccessfulWriteCount = wrote
-    if now - lastProxySummary > 5 then
-        lastProxySummary = now
-        print("TARDIS V8 SYNC:", wrote, "/", #exteriorProxies,
-            "writes per tick; total errors", replicationWriteFailures)
+    lastReplicationWrite = now
+    local epoch = writerEpoch
+    local snapshot = pivot
+    local function sendBurst()
+        local wrote, failed, cancelled = 0, 0, false
+        for i, proxy in ipairs(exteriorProxies) do
+            if epoch ~= writerEpoch or attr(root, "TardisTransitioning") == true then
+                cancelled = true
+                break
+            end
+            local offset = exteriorOffsets[proxy]
+            if offset then
+                local ok, err = pcall(function()
+                    proxy.CFrame = snapshot * offset
+                end)
+                if ok then
+                    wrote = wrote + 1
+                else
+                    failed = failed + 1
+                    if failed <= 3 and os.clock() - lastFailureLog > 1 then
+                        lastFailureLog = os.clock()
+                        print("TARDIS V8 PROXY WRITE ERROR:", tostring(err))
+                    end
+                end
+            end
+            -- Allow input, camera and the GUI to run between small chunks.
+            if i % 24 == 0 then task.wait() end
+        end
+        if epoch ~= writerEpoch then
+            writerBusy = false
+            return
+        end
+        replicationWrites = replicationWrites + wrote
+        replicationWriteFailures = replicationWriteFailures + failed
+        lastSuccessfulWriteCount = wrote
+        if failed > 0 or (not cancelled and wrote ~= #exteriorProxies) then
+            writerFault = "only " .. tostring(wrote) .. "/"
+                .. tostring(#exteriorProxies) .. " proxy edits accepted"
+        end
+        if os.clock() - lastProxySummary > 5 then
+            lastProxySummary = os.clock()
+            print("TARDIS V8 SYNC:", wrote, "/", #exteriorProxies,
+                "writes; total errors", replicationWriteFailures)
+        end
+        writerBusy = false
     end
-    return failed == 0 and wrote == #exteriorProxies
+    writerBusy = true
+    if force then
+        sendBurst()
+    else
+        task.spawn(sendBurst)
+    end
+    return writerFault == nil
 end
 
 local function rigReady()
@@ -456,6 +494,7 @@ local function stopFlight(reason)
     -- Controller transitions and failed writes stop here. They do NOT
     -- unanchor or destroy any part of the restored exterior.
     flying, dropping, autopilot = false, false, false
+    writerEpoch = writerEpoch + 1
     desiredVelocity, keyDown = Vector3.zero, {}
     kinematicFallback, kinematicPose = false, nil
     output(outputA, false)
@@ -508,6 +547,8 @@ local function takeoff()
     kinematicPose, kinematicStallChecks = initialPose, 0
     lastReplicationWrite, replicationWrites, replicationWriteFailures = 0, 0, 0
     lastSuccessfulWriteCount, lastProxySummary, lastFailureLog = 0, 0, 0
+    writerFault, writerBusy = nil, false
+    writerEpoch = writerEpoch + 1
     desiredVelocity = Vector3.zero
     initialFloorY = estimateGroundY(initialPose)
     local flat = Vector3.new(initialPose.LookVector.X, 0, initialPose.LookVector.Z)
@@ -784,6 +825,7 @@ end
 -- every block anchored is essential when the client welds do not replicate.
 local function updateDrop(dt)
     if not dropping or not kinematicPose then return end
+    if writerFault then stopFlight("DESCENT NETWORK ERROR: " .. writerFault); return end
     dt = math.clamp(dt or UPDATE, .002, .10)
     if attr(root, "TardisTransitioning") == true then
         stopFlight("CONTROLLER HANDOFF")
@@ -822,6 +864,7 @@ local function updatePhysics(dt)
         return
     end
     if not flying or not root then return end
+    if writerFault then stopFlight("FLIGHT NETWORK ERROR: " .. writerFault); return end
     dt = math.clamp(dt or UPDATE, .002, .10)
     local now = os.clock()
 
