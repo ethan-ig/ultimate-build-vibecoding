@@ -363,6 +363,8 @@ local function restoreCamera()
     end
     savedCamera = nil
     orbitFocus, orbitCameraPose = nil, nil
+    -- Earlier builds created a disposable camera proxy; V8 now follows the
+    -- existing root directly and never creates this extra part.
     if cameraTarget then
         pcall(function() cameraTarget:Destroy() end)
         cameraTarget = nil
@@ -399,52 +401,24 @@ local function engageCamera()
 
     local followPosition = cameraFocusPosition()
     if not followPosition then return end
-    if not cameraTarget then
-        -- This FIU may return a table proxy rather than a Roblox Instance.
-        -- Native CameraSubject gets only ONE guarded attempt per candidate.
-        local created, err = pcall(function()
-            local old = workspace:FindFirstChild("TardisFlightCameraTarget")
-            if old then old:Destroy() end
-            local part = Instance.new("Part")
-            part.Name = "TardisFlightCameraTarget"
-            part.Size = Vector3.new(.2, .2, .2)
-            part.Transparency = 1
-            part.Anchored = true
-            part.CanCollide = false
-            pcall(function() part.CanTouch = false end)
-            pcall(function() part.CanQuery = false end)
-            part.CFrame = CFrame.new(followPosition)
-            part.Parent = workspace
-            cameraTarget = part
-        end)
-        if not created then print("TARDIS CAMERA PROXY:", tostring(err)) end
-    end
-
+    -- The V8 test showed FIU rejects Instance.new("Part") here, but the
+    -- existing physical root IS already a real camera-compatible Instance.
+    -- No need to create an invisible proxy or invoke the failing constructor.
+    cameraTarget = nil
     nativeSubject = nil
-    local rawTarget = nil
-    if cameraTarget then pcall(function() rawTarget = cameraTarget.Part end) end
-    -- Try native Roblox subject first; FIU sometimes provides a real .Part.
-    -- Do not retry a rejected table on every tick.
-    local candidates = {}
-    if rawTarget then table.insert(candidates, rawTarget) end
-    if cameraTarget then table.insert(candidates, cameraTarget) end
-    if root then table.insert(candidates, root) end
-    for _, candidate in ipairs(candidates) do
-        if candidate then
-            local ok = pcall(function()
-                cam.CameraSubject = candidate
-                cam.CameraType = Enum.CameraType.Custom
-            end)
-            if ok then
-                nativeSubject = candidate
-                cameraMode = "NATIVE"
-                break
-            end
-        end
+    local ok, err = pcall(function()
+        cam.CameraSubject = root
+        cam.CameraType = Enum.CameraType.Custom
+    end)
+    if ok then
+        nativeSubject = root
+        cameraMode = "NATIVE"
+    else
+        print("TARDIS CAMERA ROOT SUBJECT:", tostring(err))
     end
 
     if nativeSubject then
-        print("TARDIS CAMERA: native Roblox orbit enabled")
+        print("TARDIS CAMERA: native Roblox orbit following existing TARDIS root")
     else
         -- CameraSubject rejects FIU table proxies. Preserve mouse orbit/zoom
         -- without relying on that property at all.
