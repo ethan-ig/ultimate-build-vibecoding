@@ -649,6 +649,33 @@ if #shellParts > 0 and startingPivot then
             print("TARDIS PROXY RIG: anchor verification failed, retaining existing joints")
         end
 
+        -- Fail safely if a cross-boundary joint survived cleanup. This is
+        -- the exact failure that previously attached the TARDIS to Map.Base.
+        if rigReady then
+            local members = {}
+            for _, block in ipairs(moveParts) do
+                local raw = asBasePart(block)
+                if raw then members[raw] = true end
+            end
+            local connectedOK, connected = pcall(function()
+                return rigRoot:GetConnectedParts(true)
+            end)
+            if connectedOK and type(connected) == "table" then
+                for _, connectedPart in ipairs(connected) do
+                    if not members[connectedPart] then
+                        local label = nil
+                        pcall(function() label = connectedPart:GetFullName() end)
+                        rigFailure("EXTERNAL ASSEMBLY",
+                            tostring(label or "non-TARDIS connected part"))
+                        break
+                    end
+                end
+            else
+                rigFailure("ASSEMBLY CHECK",
+                    "GetConnectedParts unavailable: " .. tostring(connected))
+            end
+        end
+
         local flagsOK, flagsError = pcall(function()
             rigRoot:SetAttribute("TardisRigRoot", true)
             rigRoot:SetAttribute("TardisRigMode", "PROXY_V8")
