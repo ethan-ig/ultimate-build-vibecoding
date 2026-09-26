@@ -1,4 +1,4 @@
--- TARDIS FLIGHT 7.0 | Ultimate Build FIU
+-- TARDIS FLIGHT 7.1 | Ultimate Build FIU
 -- Standalone physics flight with a SMALL, STATIC destination/control GUI.
 -- No per-frame GUI updates. The server-facing movement backend commands ONE
 -- anchored UB root proxy's CFrame; existing WeldConstraints move its assembly.
@@ -174,6 +174,51 @@ local function replicateExterior(pivot, now, force)
             "single-root frames; write errors", replicationWriteFailures)
     end
     return true
+end
+
+-- A FIU proxy may acknowledge a property write before its backing BasePart
+-- reflects the change. Verify both values over a bounded period; never treat
+-- a successful pcall as proof that the server/physics state actually changed.
+local function setRootAnchorState(expected, timeoutSeconds)
+    if not root or not rootWrapper then
+        return false, "missing root or UB wrapper"
+    end
+    local writeOK, writeErr = pcall(function()
+        rootWrapper.Anchored = expected
+    end)
+    if not writeOK then
+        return false, "UB Anchored setter rejected: " .. tostring(writeErr)
+    end
+    local startedAt = os.clock()
+    local retried = false
+    local wrapperOK, wrapperValue, rawOK, rawValue = false, nil, false, nil
+    repeat
+        wrapperOK, wrapperValue = pcall(function()
+            return rootWrapper.Anchored
+        end)
+        rawOK, rawValue = pcall(function()
+            return root.Anchored
+        end)
+        if wrapperOK and rawOK
+            and wrapperValue == expected and rawValue == expected then
+            return true
+        end
+        if not retried and os.clock() - startedAt > .30 then
+            retried = true
+            local retryOK, retryErr = pcall(function()
+                rootWrapper.Anchored = expected
+            end)
+            if not retryOK then
+                return false, "retry rejected: " .. tostring(retryErr)
+            end
+        end
+        if os.clock() - startedAt >= timeoutSeconds then break end
+        task.wait(.05)
+    until false
+    return false, "setter accepted; UB proxy=" .. tostring(wrapperValue)
+        .. " (read=" .. tostring(wrapperOK) .. "), physical root="
+        .. tostring(rawValue) .. " (read=" .. tostring(rawOK)
+        .. "), expected=" .. tostring(expected)
 end
 
 local function rigReady()
@@ -414,13 +459,10 @@ local function dropFlight(reason)
     -- only the local raw BasePart is not enough for the other clients.
     local released = true
     if poweredRootAnchor and rootWrapper then
-        local ok, err = pcall(function() rootWrapper.Anchored = false end)
-        local readOK, anchoredValue = pcall(function()
-            return rootWrapper.Anchored
-        end)
-        released = ok and readOK and anchoredValue == false
+        local releaseReason
+        released, releaseReason = setRootAnchorState(false, .75)
         if not released then
-            print("TARDIS ROOT UNANCHOR FAILED:", tostring(err))
+            print("TARDIS ROOT UNANCHOR FAILED:", releaseReason)
         end
     end
     poweredRootAnchor = false
@@ -477,20 +519,23 @@ local function takeoff()
     -- Takeoff must use the SAME property path as the replicated anchored
     -- cube. Unlike V5's unanchored root, this is driven as a kinematic
     -- assembly during flight. Only the root is anchored, not all 155 parts.
-    local anchorOK, anchorError = pcall(function()
-        rootWrapper.Anchored = true
-    end)
-    local readOK, wrapperAnchored = pcall(function()
-        return rootWrapper.Anchored
-    end)
-    local rawOK, rawAnchored = pcall(function() return root.Anchored end)
-    if not anchorOK or not readOK or wrapperAnchored ~= true
-        or not rawOK or rawAnchored ~= true then
-        pcall(function() rootWrapper.Anchored = false end)
-        status("FLIGHT ANCHOR FAILED / " .. tostring(anchorError))
+    local anchorOK, anchorReason = setRootAnchorState(true, 1.0)
+    if not anchorOK then
+        print("TARDIS ANCHOR DIAGNOSTIC:", anchorReason)
+        local released, releaseReason = setRootAnchorState(false, .75)
+        if not released then
+            print("TARDIS ANCHOR CLEANUP FAILED:", releaseReason)
+        end
+        status("FLIGHT ANCHOR FAILED / " .. anchorReason)
         return false
     end
     poweredRootAnchor = true
+    -- The unanchored box may fall slightly while the server applies the
+    -- anchor. Start from its CURRENT pose, not the old pre-anchor position.
+    local freshOK, freshPose = pcall(function()
+        return rootWrapper.CFrame
+    end)
+    if freshOK and typeof(freshPose) == "CFrame" then initialPose = freshPose end
     prepareExteriorProxies(initialPose)
     clearMotors()
     velocityFallback, kinematicFallback = true, true
@@ -1070,7 +1115,7 @@ end)
 
 output(outputA, false)
 buildGUI()
-print("TARDIS FLIGHT 7.0 READY / single welded root / 30 Hz")
+print("TARDIS FLIGHT 7.1 READY / verified single-root anchor / 30 Hz")
 while true do
     local now = os.clock()
     local dt = math.clamp(now - lastTick, .002, .1)
