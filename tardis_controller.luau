@@ -134,8 +134,26 @@ local function firstNamed(name)
     end
     return list[1]
 end
-exteriorSound, interiorSound = firstNamed(SOUND_OUT), firstNamed(SOUND_IN)
-roofLight, portal = firstNamed(LIGHT), firstNamed(PORTAL)
+-- Portal and time rotor are sometimes named on their raw Roblox Part rather
+-- than through the Ultimate Build DisplayName field.
+local function flexibleNamed(wanted)
+    local direct=firstNamed(wanted)
+    if direct then return direct end
+    local proxy,rawMatch=nil,nil
+    for _,block in ipairs(all) do
+        local r=raw(block)
+        local own=prop(block,"Name")
+        local underlying=r and prop(r,"Name")
+        if (type(own)=="string" and own:lower()==wanted)
+            or (type(underlying)=="string" and underlying:lower()==wanted) then
+            if r and r~=block and readCF(block) then proxy=block;break end
+            if not rawMatch and readCF(block) then rawMatch=block end
+        end
+    end
+    return proxy or rawMatch
+end
+exteriorSound, interiorSound = flexibleNamed(SOUND_OUT), flexibleNamed(SOUND_IN)
+roofLight, portal = flexibleNamed(LIGHT), flexibleNamed(PORTAL)
 local seenShell={}
 for pass=1,2 do
     for _,block in ipairs(named[SHELL] or {}) do
@@ -153,7 +171,24 @@ add(moving,exteriorSound)
 add(moving,roofLight)
 add(moving,portal)
 if exteriorSound then add(faded,exteriorSound) end
-for _, block in ipairs(named[ROTOR] or {}) do add(rotor,block) end
+local rotorSeen={}
+for pass=1,2 do
+    for _,block in ipairs(all) do
+        local r=raw(block) or block
+        local own=prop(block,"Name")
+        local underlying=prop(r,"Name")
+        local matches=label(block)==ROTOR
+            or (type(own)=="string" and own:lower()==ROTOR)
+            or (type(underlying)=="string" and underlying:lower()==ROTOR)
+        local isProxy=r~=block
+        if matches and not rotorSeen[r]
+            and ((pass==1 and isProxy) or (pass==2 and not isProxy))
+            and readCF(block) then
+            rotorSeen[r]=true
+            add(rotor,block)
+        end
+    end
+end
 
 local originalPivot = shell[1] and readCF(shell[1]) or nil
 local lastVisiblePivot = originalPivot
@@ -192,6 +227,9 @@ end
 local bottomOffset = lowestBottom < math.huge and lowestBottom-originalPivot.Position.Y or -7
 local rootBlock = shell[1]
 rootRaw = shell[1] and raw(shell[1]) or nil
+if not rootRaw then
+    eligible, failure=false, "root physical BasePart unavailable"
+end
 local rotorBase = {}
 for _, block in ipairs(rotor) do rotorBase[block]=readCF(block) end
 
@@ -323,7 +361,7 @@ local function actualSound(block)
     return sound
 end
 local realOuter,realInner=actualSound(exteriorSound),actualSound(interiorSound)
-for _,block in ipairs({exteriorSound,interiorSound}) do
+for _,block in pairs({exteriorSound,interiorSound}) do
     if block then
         put(block,"Repeat",false)
         put(block,"ResetTimePosition",false)
@@ -332,7 +370,7 @@ for _,block in ipairs({exteriorSound,interiorSound}) do
     end
 end
 local function stopAudio()
-    for _,b in ipairs({exteriorSound,interiorSound}) do
+    for _,b in pairs({exteriorSound,interiorSound}) do
         if b then powerSound(b,false) end
     end
     activeSound=nil
