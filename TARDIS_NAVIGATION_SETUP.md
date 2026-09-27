@@ -1,37 +1,53 @@
-# TARDIS Controller + Navigation | Ultimate Build FIU
+# TARDIS Controller + Navigation 2.0
 
-Manual flight is paused. The manual flight code block was removed from this branch. The navigation selector now sends destinations **only** to the normal controller. There are no manual-flight or autopilot outputs to wire.
+**This is a matched two-Code-Block rewrite.** Stop both old Code Blocks, restore a healthy saved exterior if previous flight testing scattered it, then replace controller and navigation together. Manual flight remains removed. A backup of the previous three-file setup is on branch `tardis-pre-navigation-rewrite`.
 
-## Files
+## Exact wiring
 
-- `tardis_controller.luau`: exterior, materialization/dematerialization, travel, sound, lights, portal, and time rotor.
-- `tardis_navigation.luau`: overhead destination map and mouse-controlled location selection.
+| From | To | Signal |
+| --- | --- | --- |
+| Navigation **Output A** | Controller **Input C** | Chosen landing destination (Vector3) |
+| Navigation **Output B** | Controller **Input F** | TRUE pulse to dematerialize, travel, rematerialize |
+| Your existing NAV button/switch (optional) | Navigation **Input A** | TRUE pulse opens/closes the overhead map |
+| Your existing materialization switch (optional) | Controller **Input A** | Boolean level: TRUE = show, FALSE = hide, changes only |
+| Player target string (optional) | Controller **Input B** | Player name or prefix |
+| Fast-mode switch (optional) | Controller **Input D** | Boolean: quick transition sounds/effects |
+| Quick recall button (optional) | Controller **Input E** | TRUE pulse to recall to your character |
+| Normal recall button (optional) | Controller **Input J** | TRUE pulse to recall to your character |
 
-## Wiring
+**NEW REQUIRED CONNECTION:** Navigation Output B to Controller Input F. Previously, navigation only loaded C and required separate travel input. The new map's CONFIRM TRAVEL button now sends C first, waits 0.18 seconds, then pulses F for 0.22 seconds to avoid input race conditions.
 
-| Connection | Purpose |
-| --- | --- |
-| Navigation input A | Pulse TRUE to open/cancel the destination map |
-| Navigation output A -> controller input C | Send the chosen destination as a Vector3 |
-| Controller input A | TRUE = materialized; FALSE = dematerialized |
-| Controller input B (optional) | Player-name target |
-| Controller input D (optional) | Fast travel toggle |
-| Controller input E (optional) | Quick recall to the local player |
-| Controller input F (optional) | Quick destination cycle |
-| Controller input J | Normal recall |
+If you leave Navigation Output B disconnected, the map still loads Controller Input C, but you must pulse Controller Input F yourself to initiate travel.
 
-The navigation map chooses a coordinate but **does not independently start a teleport**. Use the controller's existing materialization/dematerialization controls or quick destination input after selecting a destination. The lowered Y value is intentional: the controller resolves the actual ground height.
+Controller outputs are all optional: Output A = status text, Output B = transition-busy boolean, Output C = current exterior pivot CFrame. Navigation requires output A; output B is needed for automatic travel on confirmation.
 
-## Navigation controls
+## How to use
 
-Left click chooses land; right-mouse drag pans; mouse wheel zooms; Escape cancels. Input A toggles the map. The navigation script restores the ordinary camera after selection or cancellation.
+The navigation script creates its own persistent **NAV / MAP** GUI button, even without a wired navigation input A.
 
-## Installation
+1. Open the map with NAV / MAP or input A.
+2. Left-click a collidable surface to preview it. This does not travel yet.
+3. Right-drag to pan, scroll to zoom; select a different location if necessary.
+4. Press **CONFIRM TRAVEL**. The script sets destination C and triggers F automatically when wired.
+5. The controller dematerializes, teleports the hidden exterior via its UB proxies, and rematerializes at the selected grounded coordinate.
 
-1. Restore a healthy saved TARDIS build if a previous flight test scattered parts.
-2. Stop and remove the old manual flight Code Block; deleting the GitHub file does not stop a script already running in Roblox.
-3. Run one copy of the controller and one copy of navigation.
-4. Wire navigation output A to controller input C. Disconnect obsolete flight wiring.
-5. Select a destination, then initiate travel through the controller.
+The normal controller materialization switch still works. Changing controller input A to FALSE hides the exterior; TRUE shows it. A travel pulse works independently of the switch's previous value.
 
-The controller is currently based on the independently anchored proxy exterior from V8, which avoids the client-only weld behavior that scattered the old build. Its existing materialization and destination systems remain; physical/manual flight and gravity-drop are not part of this focused setup.
+The controller also retains quick recall (E), normal recall (J), optional player target B, fast mode D, exterior sound plus mirrored interior SoundBlock, roof-light pulse, translucent shell waveform, portal and independently animated interior time rotor.
+
+## Exterior and safety behavior
+
+The controller operates on separately anchored existing Ultimate Build exterior proxies. It verifies anchors before removing only previously generated `TardisRigidWeld_*` joints. It NEVER moves the map, never creates physics flight constraints and never touches the interior when moving the exterior. The last saved shell arrangement is captured as fixed offsets from one pivot. Partial teleport writes trigger a best-effort rollback.
+
+The controller refuses to initialize if the saved exterior is incomplete or scattered. Restore a healthy backup before installing; no script can guess the original positions of scattered parts.
+
+Normal materialization follows the audio when available, with a bounded wall-clock fallback. Quick transitions use separate quick sound profiles and a short end sting. The time rotor animates while the exterior is dematerialized or transitioning, then pauses.
+
+## Expected startup messages
+
+```text
+TARDIS: CONTROLLER 2.0 / ... SHELL / ... MOVING / READY
+NAVIGATION 2.0 / A -> CONTROLLER C, B -> CONTROLLER F
+```
+
+Check one full two-client travel before trusting the new version for normal use. A successful proxy assignment alone does not verify remote visibility. Nothing in this rewrite claims to provide manual physical flight or a real gravity drop.
