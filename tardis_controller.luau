@@ -270,6 +270,55 @@ if eligible and rootRaw then
         eligible=false; failure="cannot inspect old flight joints"
     end
 end
+-- A build placed directly on a floor may have automatic joints to Map.Base.
+-- After all exterior parts are independently anchored, detach ONLY rigid
+-- joints crossing from a registered exterior part to an unrelated part.
+-- Never destroy or unanchor the unrelated map geometry.
+if eligible then
+    local seenJoints,removedExternal={},0
+    local rigid={Weld=true,WeldConstraint=true,ManualWeld=true,
+        Snap=true,Motor=true,Motor6D=true}
+    for _,member in ipairs(rawMoving) do
+        local ok,joints=pcall(function() return member:GetJoints() end)
+        if not ok or type(joints)~="table" then
+            eligible,failure=false,"external joint scan unavailable"
+            break
+        end
+        for _,joint in ipairs(joints) do
+            if joint and not seenJoints[joint] then
+                seenJoints[joint]=true
+                local a,b,kind=nil,nil,nil
+                pcall(function() a,b,kind=joint.Part0,joint.Part1,joint.ClassName end)
+                if rigid[kind] and a and b and (rawSet[a]==true)~=(rawSet[b]==true) then
+                    local removed,err=pcall(function() joint:Destroy() end)
+                    if removed then
+                        removedExternal=removedExternal+1
+                    else
+                        eligible,failure=false,"cross-boundary joint: "..tostring(err)
+                    end
+                end
+            end
+        end
+        if not eligible then break end
+    end
+    print("TARDIS JOINT ISOLATION:",removedExternal,"map/exterior crossings removed")
+end
+if eligible then
+    local ok,connected=pcall(function()
+        return rootRaw:GetConnectedParts(true)
+    end)
+    if not ok or type(connected)~="table" then
+        eligible,failure=false,"cannot verify exterior assembly isolation"
+    else
+        for _,other in ipairs(connected) do
+            if not rawSet[other] then
+                eligible,failure=false,"exterior still linked to map or unrelated part"
+                break
+            end
+        end
+    end
+end
+
 if rootRaw then
     pcall(function()
         rootRaw:SetAttribute("TardisRigRoot",true)
