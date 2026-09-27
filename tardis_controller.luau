@@ -1,1928 +1,839 @@
--- TARDIS controller
--- A: true=materialized, false=dematerialized
--- B: optional player name target (partial names accepted)
--- C: normal destination (Vector3/CFrame)
--- D: fast travel toggle (fast demat + fast remat)
--- E: quick recall to local player (fast demat + fast remat)
--- F: quick destination cycle (fast demat + B/C fast remat)
--- J: normal recall (demat, then remat on local player)
--- No Code outputs are required.
+-- TARDIS CONTROLLER 2.0 | Ultimate Build FIU | navigation-first
+-- This script is NOT a manual flight system. No raw root flight, no new welds.
+--
+-- INPUTS
+-- A (optional boolean level): true=materialize, false=dematerialize; changes only.
+-- B (optional string): player-name destination for manual show/fallback travel.
+-- C (required Vector3/CFrame or "X,Y,Z"): world destination from navigation.
+-- D (optional boolean level): fast sound/effects for subsequent commands.
+-- E (optional boolean PULSE): quick recall to your character.
+-- F (optional boolean PULSE): travel to C (fallback B).
+-- J (optional boolean PULSE): normal recall to your character.
+-- OUTPUTS (all optional): A=status string, B=transition busy, C=exterior pivot.
+--
+-- FIU only: editable UB proxy CFrame updates move an independently anchored
+-- exterior. No client-created weld is trusted for server replication.
+-- Restore a healthy saved build if a previous experiment scattered its shell.
 
-local inputA = script.inputs["a"]
-local inputB = nil
-pcall(function() inputB = script.inputs["b"] end)
-local inputC = script.inputs["c"]
-local inputD = nil
-local inputE = nil
-local inputF = nil
-pcall(function() inputD = script.inputs["d"] end)
-pcall(function() inputE = script.inputs["e"] end)
-pcall(function() inputF = script.inputs["f"] end)
-local inputJ = script.inputs["j"]
-
-local SHELL_NAME = "Tardis"
-local MAT_SOUND_NAME = "TardisMatSound"
-local INTERIOR_MAT_SOUND_NAME = "InteriorTardisMatSound"
-local LIGHT_NAME = "Tardislight"
-local PORTAL_NAME = "tardisportal"
-
--- Audio is the master clock.
-local VISUAL_START_TIME = 0.20
-local SOUND_TAIL_TIME = 3
-local AGGRESSIVE_PROGRESS_POWER = 0.62
-local SHELL_WAVE_STRENGTH = 0.30
-local WAVE_ATTACK = 0.78
-local WAVE_RELEASE = 0.20
-local WAVE_GAMMA = 0.55
-local MIN_LOUDNESS_PEAK = 80
-local SYNTH_WAVE_RATE_A = 18.0
-local SYNTH_WAVE_RATE_B = 31.0
-local FALLBACK_FADE_TIME = 14
-local FALLBACK_TAIL_TIME = 3
-local SOUND_START_TIMEOUT = 4
-local MAIN_UPDATE_INTERVAL = 1 / 60
-local MAX_FADE_WRITES_PER_SECOND = 2200
-
--- Roof lamp reacts harder than the shell.
-local LIGHT_QUIET_VISIBILITY = 0.12
-local LIGHT_QUIET_BRIGHTNESS = 0.15
-local LIGHT_PEAK_BRIGHTNESS_MULT = 4.0
-
-local HIDDEN_POSITION = Vector3.new(-2000, 1, 2772)
-local RECALL_GROUND_CLEARANCE = 0.10
-local SOUND_VOLUME = 1
-
--- One exterior SoundBlock + one mirrored interior SoundBlock are reused for every
--- transition. The controller swaps the asset and pitch immediately before playback.
-local SOUND_PROFILES = {
-    materialize_normal = { id = "142277519", pitch = 1.000 },
-    materialize_quick = { id = "140477091", pitch = 0.735 },
-    demat_normal = { id = "135858826", pitch = 0.633 },
-    demat_quick = { id = "135858448", pitch = 1.000 },
-    quick_end = { id = "134966578", pitch = 1.000 },
+local VERSION = "CONTROLLER 2.0"
+local SHELL = "tardis"
+local SOUND_OUT = "tardismatsound"
+local SOUND_IN = "interiortardismatsound"
+local LIGHT = "tardislight"
+local PORTAL = "tardisportal"
+local ROTOR = "timerotor"
+local HIDDEN = Vector3.new(-2000, 1, 2772)
+local SHELL_RADIUS_LIMIT = 75
+local MIN_SHELL = 10
+local CLEARANCE = .12
+local FADE_HZ, ROTOR_HZ, LOOP = 12, 20, 1/30
+local NORMAL_SECONDS, QUICK_SECONDS = 11.0, 1.35
+local SOUND_TAIL, MIN_SOUND_LENGTH = 2.2, 1.6
+local SOUND = {
+    show = {id="142277519", pitch=1},
+    showFast = {id="140477091", pitch=.735},
+    hide = {id="135858826", pitch=.633},
+    hideFast = {id="135858448", pitch=1},
+    endFast = {id="134966578", pitch=1},
 }
 
-local QUICK_END_STING_SECONDS = 3
-
-local FAST_FADE_TIME = 1.15 -- fallback only when the SoundBlock clock is unavailable
-local FAST_TAIL_TIME = 0.15
-local FAST_DEMAT_VISUAL_END_FRACTION = 0.70 -- fully gone/teleported by 70% of quick demat audio
-local FAST_MAT_VISUAL_END_FRACTION = 0.90 -- fully solid by 90% of quick materialize audio
-local FAST_DEMAT_PROGRESS_POWER = 0.34 -- demat gets aggressive much earlier
-local FAST_MAT_PROGRESS_POWER = 0.42 -- remat keeps the current feel
-
-local function getBlockValue(block, key)
-    if not block then return nil end
-
-    local ok, value = pcall(function() return block[key] end)
-    if ok and value ~= nil then return value end
-
-    ok, value = pcall(function() return block:GetAttribute(key) end)
-    if ok and value ~= nil then return value end
-
-    ok, value = pcall(function() return block.attributes[key] end)
-    if ok then return value end
-
-    return nil
+local function port(tableName, letter)
+    local p = nil
+    pcall(function() p = script[tableName][letter] end)
+    return p
 end
-
-local function setBlockValue(block, key, value)
-    if not block then return false end
-
-    local ok = pcall(function() block[key] = value end)
+local input = {}
+local output = {}
+for _, letter in ipairs({"a","b","c","d","e","f","j"}) do
+    input[letter] = port("inputs",letter)
+end
+for _, letter in ipairs({"a","b","c"}) do
+    output[letter] = port("outputs",letter)
+end
+local function emit(letter, value)
+    local p = output[letter]
+    if p then pcall(function() p:SetState(value) end) end
+end
+local function state(letter)
+    local p = input[letter]
+    if not p then return nil, false end
+    local ok, value = pcall(function() return p:GetState() end)
+    return value, ok
+end
+local function prop(object, key)
+    if not object then return nil end
+    local ok, value = pcall(function() return object[key] end)
+    if ok and value ~= nil then return value end
+    ok, value = pcall(function() return object:GetAttribute(key) end)
+    if ok and value ~= nil then return value end
+    ok, value = pcall(function() return object.attributes[key] end)
+    return ok and value or nil
+end
+local function put(object, key, value)
+    if not object then return false end
+    local ok = pcall(function() object[key] = value end)
     if ok then return true end
-
-    ok = pcall(function() block:SetAttribute(key, value) end)
+    ok = pcall(function() object:SetAttribute(key, value) end)
     if ok then return true end
-
-    ok = pcall(function() block.attributes[key] = value end)
+    ok = pcall(function() object.attributes[key] = value end)
     return ok
 end
-
-local function getDisplayName(part)
-    local value = getBlockValue(part, "DisplayName")
-    if type(value) == "string" and value ~= "" then return value end
-    return nil
-end
-
-local function getOptionalBoolInput(input)
-    if not input then return false end
-    local state = false
-    pcall(function() state = input:GetState() == true end)
-    return state
-end
-
-local function fastTravelEnabled()
-    return getOptionalBoolInput(inputD)
-end
-
-local function findNamedBlock(name)
-    for _, part in ipairs(workspace:GetDescendants()) do
-        if part ~= script then
-            local displayName = getDisplayName(part)
-            if displayName and string.lower(displayName) == string.lower(name) then
-                return part
-            end
-        end
-    end
-    return nil
-end
-
-local matSound = findNamedBlock(MAT_SOUND_NAME)
-local interiorMatSound = findNamedBlock(INTERIOR_MAT_SOUND_NAME)
-local tardisLight = findNamedBlock(LIGHT_NAME)
-
-print(matSound and "FOUND: TardisMatSound" or "ERROR: missing TardisMatSound")
-print(interiorMatSound and "FOUND: InteriorTardisMatSound" or "WARNING: missing InteriorTardisMatSound")
-print(tardisLight and "FOUND: Tardislight" or "WARNING: missing Tardislight")
-
-local function getSoundInput(block)
-    if not block then return nil end
-
-    for _, name in ipairs({"Input", "input", "Toggle", "toggle", "a", "A"}) do
-        local ok, value = pcall(function() return block.inputs[name] end)
-        if ok and value then return value end
-    end
-
-    local ok, inputTable = pcall(function() return block.inputs end)
-    if ok and inputTable then
-        local success, result = pcall(function()
-            for _, value in pairs(inputTable) do return value end
-        end)
-        if success and result then return result end
-    end
-
-    return nil
-end
-
-local function setSoundPowered(block, state)
-    if not block then return false end
-
-    local input = getSoundInput(block)
-    if input then
-        local ok = pcall(function() input:Fire(state, true) end)
-        if ok then return true end
-
-        ok = pcall(function() input:SetState(state) end)
-        if ok then return true end
-    end
-
-    for _, name in ipairs({"Input", "input", "Toggle", "toggle", "a"}) do
-        local ok = pcall(function() block:FireInput(name, state) end)
-        if ok then return true end
-    end
-
-    print("Could not control SoundBlock:", getDisplayName(block))
-    return false
-end
-
-local function configureSound(block)
-    if not block then return end
-    setBlockValue(block, "Repeat", false)
-    setBlockValue(block, "ResetTimePosition", false)
-    setBlockValue(block, "Volume", SOUND_VOLUME)
-    setBlockValue(block, "Effects", false)
-end
-
-configureSound(matSound)
-configureSound(interiorMatSound)
-
-local function getMirroredSound(block)
-    if block == matSound then return interiorMatSound end
-    if block == interiorMatSound then return matSound end
-    return nil
-end
-
-local function stopSound(block)
-    if not block then return end
-
-    local mirror = getMirroredSound(block)
-
-    setSoundPowered(block, false)
-    if mirror then setSoundPowered(mirror, false) end
-
-    task.wait()
-
-    setBlockValue(block, "TimePosition", 0)
-    if mirror then setBlockValue(mirror, "TimePosition", 0) end
-end
-
-local function playSound(block, position)
-    if not block then return false end
-
-    local mirror = getMirroredSound(block)
-    local startPosition = position or 0
-
-    setSoundPowered(block, false)
-    if mirror then setSoundPowered(mirror, false) end
-
-    task.wait()
-
-    setBlockValue(block, "TimePosition", startPosition)
-    if mirror then setBlockValue(mirror, "TimePosition", startPosition) end
-
-    setSoundPowered(block, true)
-    if mirror then setSoundPowered(mirror, true) end
-
-    return true
-end
-
--- Try to reach the real Roblox Sound so PlaybackLoudness can drive the effect.
-local function findActualSoundInstance(block)
-    if not block then return nil end
-
-    local rawPart = nil
-    pcall(function() rawPart = block.Part end)
-    if not rawPart then return nil end
-
-    local found = nil
-    pcall(function() found = rawPart:FindFirstChildWhichIsA("Sound", true) end)
-    if found then return found end
-
-    local descendants = nil
-    pcall(function() descendants = rawPart:GetDescendants() end)
-    if descendants then
-        for _, child in ipairs(descendants) do
-            local isSound = false
-            pcall(function() isSound = child:IsA("Sound") end)
-            if isSound then return child end
-        end
-    end
-
-    return nil
-end
-
-local matSoundInstance = findActualSoundInstance(matSound)
-local interiorMatSoundInstance = findActualSoundInstance(interiorMatSound)
-
-print(matSoundInstance and "TARDIS transition PlaybackLoudness available" or "TARDIS transition loudness fallback enabled")
-
-local function getPlaybackLoudness(block, actualSound)
-    if actualSound then
-        local ok, value = pcall(function() return actualSound.PlaybackLoudness end)
-        if ok and type(value) == "number" then return value, true end
-    end
-
-    local value = getBlockValue(block, "PlaybackLoudness")
-    if type(value) == "number" then return value, true end
-    return 0, false
-end
-
--- shellParts determine ground height.
--- moveParts include shell + sounds + roof light + portal.
--- fadeParts include shell + sounds. Roof light gets a stronger custom effect.
-local shellParts = {}
-local moveParts = {}
-local fadeParts = {}
-local relativeCFrames = {}
-
-local function contains(list, part)
-    for _, existing in ipairs(list) do
-        if existing == part then return true end
-    end
-    return false
-end
-
-local function addPart(list, part)
-    if not part or contains(list, part) then return end
-    local ok = pcall(function() return part.CFrame end)
-    if ok then table.insert(list, part) end
-end
-
-for _, part in ipairs(workspace:GetDescendants()) do
-    if part ~= script then
-        local displayName = getDisplayName(part)
-        if displayName and string.lower(displayName) == string.lower(SHELL_NAME) then
-            local ok = pcall(function() return part.CFrame end)
-            if ok then
-                table.insert(shellParts, part)
-                addPart(moveParts, part)
-                addPart(fadeParts, part)
-            end
-        end
-    end
-end
-
-addPart(moveParts, matSound)
-addPart(moveParts, tardisLight)
-addPart(fadeParts, matSound)
-
-local function getRawPart(block)
-    if not block then return nil end
-
-    local raw = nil
-    pcall(function() raw = block.Part end)
-    if raw then return raw end
-
+local function raw(block)
+    local value = nil
+    if block then pcall(function() value = block.Part end) end
+    if value then return value end
     if typeof(block) == "Instance" then return block end
     return nil
 end
+local function label(block)
+    local name = prop(block, "DisplayName") or prop(block, "Display name")
+    return type(name) == "string" and string.lower(name) or nil
+end
+local function readCF(block)
+    local ok, cf = pcall(function() return block.CFrame end)
+    return ok and typeof(cf) == "CFrame" and cf or nil
+end
+local function showMessage(message)
+    print("TARDIS:", message)
+    emit("a", message)
+end
+local rootRaw = nil
+local function rootFlag(name, value)
+    if rootRaw then pcall(function() rootRaw:SetAttribute(name,value) end) end
+end
 
-local function blockNameMatches(block, name)
-    if not block then return false end
-    local wanted = string.lower(name)
-
-    local displayName = getDisplayName(block)
-    if type(displayName) == "string" and string.lower(displayName) == wanted then
-        return true
-    end
-
-    local objectName = getBlockValue(block, "Name")
-    if type(objectName) == "string" and string.lower(objectName) == wanted then
-        return true
-    end
-
-    local raw = getRawPart(block)
-    if raw then
-        local rawName = nil
-        pcall(function() rawName = raw.Name end)
-        if type(rawName) == "string" and string.lower(rawName) == wanted then
-            return true
+-- One inventory scan. Keep an identity set to avoid duplicate wrapper/raw
+-- entries. The controller only moves its own explicitly named exterior.
+local shell, moving, faded, originalAlpha, offsets = {}, {}, {}, {}, {}
+local rawMoving, rawSet, named, rotor = {}, {}, {}, {}
+local exteriorSound, interiorSound, roofLight, portal = nil,nil,nil,nil
+local all = workspace:GetDescendants()
+local function add(list, block)
+    if not block or table.find(list,block) then return end
+    if readCF(block) then table.insert(list,block) end
+end
+for _, block in ipairs(all) do
+    if block ~= script then
+        local name = label(block)
+        if name then
+            if not named[name] then named[name] = {} end
+            table.insert(named[name],block)
         end
     end
-
-    return false
 end
-
-local function findBlockFlexible(name)
-    for _, block in ipairs(workspace:GetDescendants()) do
-        if block ~= script and blockNameMatches(block, name) then
-            return block
+local function firstNamed(name)
+    local list = named[name]
+    if not list then return nil end
+    -- Prefer the editable Ultimate Build proxy over its underlying BasePart.
+    for _, item in ipairs(list) do
+        local r=raw(item)
+        if r and r~=item and readCF(item) then return item end
+    end
+    for _, item in ipairs(list) do
+        if readCF(item) then return item end
+    end
+    return list[1]
+end
+-- Portal and time rotor are sometimes named on their raw Roblox Part rather
+-- than through the Ultimate Build DisplayName field.
+local function flexibleNamed(wanted)
+    local direct=firstNamed(wanted)
+    if direct then return direct end
+    local proxy,rawMatch=nil,nil
+    for _,block in ipairs(all) do
+        local r=raw(block)
+        local own=prop(block,"Name")
+        local underlying=r and prop(r,"Name")
+        if (type(own)=="string" and own:lower()==wanted)
+            or (type(underlying)=="string" and underlying:lower()==wanted) then
+            if r and r~=block and readCF(block) then proxy=block;break end
+            if not rawMatch and readCF(block) then rawMatch=block end
         end
     end
-    return nil
+    return proxy or rawMatch
 end
-
--- Replace the old click-to-enter system with a portal that physically follows
--- the exterior TARDIS. The portal is never included in fadeParts.
-local tardisPortal = findBlockFlexible(PORTAL_NAME)
-local tardisPortalRaw = getRawPart(tardisPortal)
-local tardisPortalMoveTarget = nil
-
-if tardisPortal then
-    local cf = nil
-    pcall(function() cf = tardisPortal.CFrame end)
-    if cf then
-        tardisPortalMoveTarget = tardisPortal
-    elseif tardisPortalRaw then
-        pcall(function() cf = tardisPortalRaw.CFrame end)
-        if cf then tardisPortalMoveTarget = tardisPortalRaw end
-    end
-end
-
-addPart(moveParts, tardisPortalMoveTarget)
-
-local function forcePortalTransparent()
-    if tardisPortal then
-        setBlockValue(tardisPortal, "Transparency", 1)
-    end
-    if tardisPortalRaw then
-        pcall(function() tardisPortalRaw.Transparency = 1 end)
-    end
-end
-
-forcePortalTransparent()
-
--- Clean up ClickDetectors created by older versions of this controller.
-for _, part in ipairs(shellParts) do
-    local raw = getRawPart(part)
-    if raw then
-        local detector = nil
-        pcall(function() detector = raw:FindFirstChild("TardisEnterClick") end)
-        if detector then pcall(function() detector:Destroy() end) end
-    end
-end
-
-local oldInteriorTarget = findBlockFlexible("interiortardisteleportspot")
-local oldInteriorRaw = getRawPart(oldInteriorTarget)
-if oldInteriorRaw then
-    local detector = nil
-    pcall(function() detector = oldInteriorRaw:FindFirstChild("TardisExitClick") end)
-    if detector then pcall(function() detector:Destroy() end) end
-end
-
-print("TARDIS shell blocks:", #shellParts)
-print("TARDIS moving blocks:", #moveParts)
-print("TARDIS wave-fading blocks:", #fadeParts)
-print("TARDIS portal found:", tardisPortal ~= nil)
-
-local lightOriginalTransparency = 0
-local lightOriginalBrightness = 2
-
-if tardisLight then
-    local t = tonumber(getBlockValue(tardisLight, "Transparency"))
-    if t then lightOriginalTransparency = math.clamp(t, 0, 1) end
-
-    local b = tonumber(getBlockValue(tardisLight, "Brightness"))
-    if b then lightOriginalBrightness = b end
-end
-
-local startingPivot = nil
-if #shellParts > 0 then startingPivot = shellParts[1].CFrame end
-
-if startingPivot then
-    for _, part in ipairs(moveParts) do
-        relativeCFrames[part] = startingPivot:ToObjectSpace(part.CFrame)
-    end
-end
-
-local matSoundRaw = nil
-local matSoundRawOffset = nil
-if startingPivot and matSound then
-    pcall(function() matSoundRaw = matSound.Part end)
-    if matSoundRaw then
-        pcall(function()
-            matSoundRawOffset = startingPivot:ToObjectSpace(matSoundRaw.CFrame)
-        end)
-    end
-end
-
-local tardisPortalRawOffset = nil
-if startingPivot and tardisPortalRaw then
-    pcall(function()
-        tardisPortalRawOffset = startingPivot:ToObjectSpace(tardisPortalRaw.CFrame)
-    end)
-end
-
-local defaultRotation = startingPivot
-    and (startingPivot - startingPivot.Position)
-    or CFrame.identity
-
-local tardisBottomOffset = 0
-if startingPivot then
-    local lowestBottom = math.huge
-
-    for _, part in ipairs(shellParts) do
-        pcall(function()
-            local cf = part.CFrame
-            local size = part.Size
-            local halfHeight =
-                math.abs(cf.RightVector.Y) * (size.X / 2)
-                + math.abs(cf.UpVector.Y) * (size.Y / 2)
-                + math.abs(cf.LookVector.Y) * (size.Z / 2)
-
-            local bottom = cf.Position.Y - halfHeight
-            if bottom < lowestBottom then lowestBottom = bottom end
-        end)
-    end
-
-    if lowestBottom < math.huge then
-        tardisBottomOffset = lowestBottom - startingPivot.Position.Y
-    end
-end
-
--- PHYSICS RIG: the exterior is always unanchored. All physical shell
--- pieces, roof lamp, exterior sound emitter and portal are welded to ONE root.
--- In flight, only that root receives velocity/angular-velocity constraints.
--- The time rotor and interior are independent and are never part of this rig.
-local rigRoot, rigReady, rigRootOffset = nil, false, nil
-local rigMembers = {}
-local rigMemberSet = {}
-local function asBasePart(block)
-    local raw = getRawPart(block)
-    local valid = false
-    if raw then pcall(function() valid = raw:IsA("BasePart") end) end
-    return valid and raw or nil
-end
-
-local function setRigFlag(name, value)
-    if rigRoot then pcall(function() rigRoot:SetAttribute(name, value) end) end
-end
-
-local function addRigMember(block, shouldCollide, density)
-    local raw = asBasePart(block)
-    if not raw then return false end
-    if not rigMemberSet[raw] then
-        rigMemberSet[raw] = true
-        table.insert(rigMembers, raw)
-        local success = pcall(function()
-            -- Keep the original anchor state until every weld succeeds.
-            -- If the sandbox rejects a weld, an incomplete rig must not
-            -- scatter the user's unjoined exterior across the map.
-            raw.Massless = false
-            raw.CanCollide = shouldCollide
-            raw.CustomPhysicalProperties = PhysicalProperties.new(
-                density, shouldCollide and 1.3 or 0.3, 0, 100, 100
-            )
-        end)
-        if not success then
-            print("TARDIS RIG: failed physical properties on", raw.Name)
-            return false
+exteriorSound, interiorSound = flexibleNamed(SOUND_OUT), flexibleNamed(SOUND_IN)
+roofLight, portal = flexibleNamed(LIGHT), flexibleNamed(PORTAL)
+local seenShell={}
+for pass=1,2 do
+    for _,block in ipairs(named[SHELL] or {}) do
+        local r=raw(block) or block
+        local isProxy=r~=block
+        if ((pass==1 and isProxy) or (pass==2 and not isProxy))
+            and not seenShell[r] and readCF(block) then
+            seenShell[r]=true
+            add(shell,block)
         end
     end
-    return true
+end
+for _, block in ipairs(shell) do add(moving,block); add(faded,block) end
+add(moving,exteriorSound)
+add(moving,roofLight)
+add(moving,portal)
+if exteriorSound then add(faded,exteriorSound) end
+local rotorSeen={}
+for pass=1,2 do
+    for _,block in ipairs(all) do
+        local r=raw(block) or block
+        local own=prop(block,"Name")
+        local underlying=prop(r,"Name")
+        local matches=label(block)==ROTOR
+            or (type(own)=="string" and own:lower()==ROTOR)
+            or (type(underlying)=="string" and underlying:lower()==ROTOR)
+        local isProxy=r~=block
+        if matches and not rotorSeen[r]
+            and ((pass==1 and isProxy) or (pass==2 and not isProxy))
+            and readCF(block) then
+            rotorSeen[r]=true
+            add(rotor,block)
+        end
+    end
 end
 
-if #shellParts > 0 and startingPivot then
-    rigRoot = asBasePart(shellParts[1])
-    if rigRoot then
-        rigReady = true
-        rigRootOffset = startingPivot:ToObjectSpace(rigRoot.CFrame)
+local originalPivot = shell[1] and readCF(shell[1]) or nil
+local lastVisiblePivot = originalPivot
+local defaultRotation = originalPivot and (originalPivot-originalPivot.Position) or CFrame.identity
+local lowestBottom = math.huge
+local lightAlpha = tonumber(prop(roofLight,"Transparency")) or 0
+local lightBrightness = tonumber(prop(roofLight,"Brightness")) or 2
+local eligible, failure = originalPivot ~= nil and #shell >= MIN_SHELL, nil
+if not eligible then failure="shell not found or incomplete" end
+for _, block in ipairs(moving) do
+    local cf = readCF(block)
+    if cf and originalPivot then
+        offsets[block] = originalPivot:ToObjectSpace(cf)
+        originalAlpha[block] = math.clamp(tonumber(prop(block,"Transparency")) or 0,0,1)
+        if label(block) == SHELL and offsets[block].Position.Magnitude > SHELL_RADIUS_LIMIT then
+            eligible, failure = false, "scattered shell; restore a saved build"
+        end
+        local r = raw(block)
+        if r and not rawSet[r] then
+            rawSet[r]=true
+            table.insert(rawMoving,r)
+        end
+    else
+        eligible, failure = false, "unreadable exterior CFrame"
+    end
+end
+for _, block in ipairs(shell) do
+    local cf, size = readCF(block), prop(block,"Size")
+    if cf and typeof(size)=="Vector3" then
+        local half = math.abs(cf.RightVector.Y)*size.X/2
+            + math.abs(cf.UpVector.Y)*size.Y/2
+            + math.abs(cf.LookVector.Y)*size.Z/2
+        lowestBottom=math.min(lowestBottom,cf.Position.Y-half)
+    end
+end
+local bottomOffset = lowestBottom < math.huge and lowestBottom-originalPivot.Position.Y or -7
+local rootBlock = shell[1]
+rootRaw = shell[1] and raw(shell[1]) or nil
+if not rootRaw then
+    eligible, failure=false, "root physical BasePart unavailable"
+end
+local rotorBase = {}
+for _, block in ipairs(rotor) do rotorBase[block]=readCF(block) end
 
-        for _, shell in ipairs(shellParts) do
-            if not addRigMember(shell, true, shell == shellParts[1] and 65 or 12) then
-                rigReady = false
-                print("TARDIS RIG: a shell part has no physical BasePart")
+-- Refuse to detach old welds if ANY backing exterior part is not anchored.
+-- Only our own old named joints may be removed. Map geometry stays untouched.
+if eligible then
+    local problems=0
+    for i, block in ipairs(moving) do
+        local ok, err=pcall(function() block.Anchored=true end)
+        if not ok then
+            problems=problems+1
+            if problems <= 3 then print("TARDIS ANCHOR:",i,tostring(err)) end
+        end
+        if i%24==0 then task.wait(.02) end
+    end
+    task.wait(.40)
+    for _, block in ipairs(moving) do
+        local r=raw(block)
+        local ok1,a=pcall(function() return block.Anchored end)
+        local ok2,b=pcall(function() return r.Anchored end)
+        if not ok1 or a~=true or not ok2 or b~=true then problems=problems+1 end
+    end
+    if problems>0 then eligible=false; failure=tostring(problems).." exterior anchors unconfirmed" end
+end
+if eligible and rootRaw then
+    local childrenOK,children=pcall(function() return rootRaw:GetChildren() end)
+    if childrenOK and type(children)=="table" then
+        for _, joint in ipairs(children) do
+            local name,kind=nil,nil
+            pcall(function() name,kind=joint.Name,joint.ClassName end)
+            if type(name)=="string" and name:sub(1,16)=="TardisRigidWeld_"
+                and kind=="WeldConstraint" then
+                local ok,err=pcall(function() joint:Destroy() end)
+                if not ok then eligible=false; failure="old weld: "..tostring(err) end
             end
         end
-        local accessories = {}
-        for _, item in pairs({sound = matSound, lamp = tardisLight, portal = tardisPortal}) do
-            if item then table.insert(accessories, item) end
+    else
+        eligible=false; failure="cannot inspect old flight joints"
+    end
+end
+-- A build placed directly on a floor may have automatic joints to Map.Base.
+-- After all exterior parts are independently anchored, detach ONLY rigid
+-- joints crossing from a registered exterior part to an unrelated part.
+-- Never destroy or unanchor the unrelated map geometry.
+if eligible then
+    local seenJoints,removedExternal={},0
+    local rigid={Weld=true,WeldConstraint=true,ManualWeld=true,
+        Snap=true,Motor=true,Motor6D=true}
+    for _,member in ipairs(rawMoving) do
+        local ok,joints=pcall(function() return member:GetJoints() end)
+        if not ok or type(joints)~="table" then
+            eligible,failure=false,"external joint scan unavailable"
+            break
         end
-        for _, accessory in ipairs(accessories) do
-            if not addRigMember(accessory, false, 2) then
-                rigReady = false
-                print("TARDIS RIG: missing physical accessory", getDisplayName(accessory))
-            end
-        end
-
-        for i, part in ipairs(rigMembers) do
-            if part ~= rigRoot then
-                local success = pcall(function()
-                    local name = "TardisRigidWeld_" .. tostring(i)
-                    local weld = rigRoot:FindFirstChild(name)
-                    if not weld then
-                        weld = Instance.new("WeldConstraint")
-                        weld.Name = name
-                        weld.Part0 = rigRoot
-                        weld.Part1 = part
-                        weld.Parent = rigRoot
+        for _,joint in ipairs(joints) do
+            if joint and not seenJoints[joint] then
+                seenJoints[joint]=true
+                local a,b,kind=nil,nil,nil
+                pcall(function() a,b,kind=joint.Part0,joint.Part1,joint.ClassName end)
+                if rigid[kind] and a and b and (rawSet[a]==true)~=(rawSet[b]==true) then
+                    local removed,err=pcall(function() joint:Destroy() end)
+                    if removed then
+                        removedExternal=removedExternal+1
                     else
-                        weld.Part0, weld.Part1 = rigRoot, part
+                        eligible,failure=false,"cross-boundary joint: "..tostring(err)
                     end
-                end)
-                if not success then rigReady = false end
-            end
-        end
-
-        if rigReady then
-            for _, member in ipairs(rigMembers) do
-                local okUnanchor = pcall(function() member.Anchored = false end)
-                if not okUnanchor or member.Anchored ~= false then
-                    rigReady = false
-                    print("TARDIS RIG: could not unanchor", member.Name)
                 end
             end
         end
-
-        local massOK, mass = pcall(function() return rigRoot.AssemblyMass end)
-        if massOK and mass == math.huge then
-            rigReady = false
-            print("TARDIS RIG: assembly is connected to another anchored part")
-        end
-        local flagsOK = pcall(function()
-            rigRoot:SetAttribute("TardisRigRoot", true)
-            rigRoot:SetAttribute("TardisRigReady", rigReady)
-            rigRoot:SetAttribute("TardisTransitioning", false)
-            rigRoot:SetAttribute("TardisFlightActive", false)
-            rigRoot:SetAttribute("TardisPilotGroundOffset",
-                -tardisBottomOffset + rigRootOffset.Position.Y + 0.8)
-        end)
-        if not flagsOK then
-            rigReady = false
-            print("TARDIS RIG: FIU does not expose required Instance attributes")
-        end
-        if rigReady then
-            print("TARDIS RIG READY: one unanchored assembly;", #rigMembers,
-                "physical parts; mass", rigRoot.AssemblyMass)
-        else
-            print("TARDIS RIG INCOMPLETE: manual physics flight will refuse to arm")
-        end
+        if not eligible then break end
     end
+    print("TARDIS JOINT ISOLATION:",removedExternal,"map/exterior crossings removed")
 end
-
--- Because a hidden unanchored box would fall out of the world, create an
--- invisible stationary support under the OFF-MAP staging position. The box
--- itself is never anchored; ordinary landings have no artificial support.
-if rigReady then
-    pcall(function()
-        local old = workspace:FindFirstChild("TardisHiddenSupport")
-        if old then old:Destroy() end
-        local pad = Instance.new("Part")
-        pad.Name = "TardisHiddenSupport"
-        pad.Size = Vector3.new(48, 2, 48)
-        pad.CFrame = CFrame.new(
-            HIDDEN_POSITION + Vector3.new(0, tardisBottomOffset - 1, 0)
-        )
-        pad.Transparency = 1
-        pad.Anchored = true
-        pad.CanCollide = true
-        pad.CanQuery = false
-        pad.Parent = workspace
+if eligible then
+    local ok,connected=pcall(function()
+        return rootRaw:GetConnectedParts(true)
     end)
-end
-
-local function moveTardis(pivot)
-    if rigReady and rigRoot then
-        -- One CFrame write moves the welded assembly; no shell-by-shell
-        -- desync, and no per-frame CFrame flight.
-        pcall(function()
-            rigRoot.AssemblyLinearVelocity = Vector3.zero
-            rigRoot.AssemblyAngularVelocity = Vector3.zero
-            rigRoot.CFrame = pivot * rigRootOffset
-        end)
+    if not ok or type(connected)~="table" then
+        eligible,failure=false,"cannot verify exterior assembly isolation"
     else
-        -- Compatibility for a game sandbox that rejects physical welds.
-        -- This path is only used for legacy demat/materialize, never flight.
-        for _, part in ipairs(moveParts) do
-            local offset = relativeCFrames[part]
-            if offset then pcall(function() part.CFrame = pivot * offset end) end
-        end
-        if matSoundRaw and matSoundRawOffset then
-            pcall(function() matSoundRaw.CFrame = pivot * matSoundRawOffset end)
-        end
-        if tardisPortalRaw and tardisPortalRawOffset then
-            pcall(function() tardisPortalRaw.CFrame = pivot * tardisPortalRawOffset end)
-        end
-    end
-    forcePortalTransparent()
-end
-
-local function setFadePartsTransparency(value)
-    value = math.clamp(value, 0, 1)
-    for _, part in ipairs(fadeParts) do
-        pcall(function() part.Transparency = value end)
-    end
-end
-
-local function setLightEffect(baseFade, wave, active)
-    if not tardisLight then return end
-
-    baseFade = math.clamp(baseFade, 0, 1)
-    wave = math.clamp(wave or 0, 0, 1)
-
-    if not active then
-        if baseFade >= 0.999 then
-            pcall(function() tardisLight.Transparency = 1 end)
-            setBlockValue(tardisLight, "Brightness", 0)
-        else
-            pcall(function() tardisLight.Transparency = lightOriginalTransparency end)
-            setBlockValue(tardisLight, "Brightness", lightOriginalBrightness)
-        end
-        return
-    end
-
-    local shellVisibility = 1 - baseFade
-    local wavePunch = math.pow(wave, 0.45)
-
-    -- Lamp glass flashes with peaks.
-    local pulseVisibility =
-        LIGHT_QUIET_VISIBILITY
-        + (1 - LIGHT_QUIET_VISIBILITY) * wavePunch
-    local finalVisibility = shellVisibility * pulseVisibility
-    local finalTransparency = 1 - finalVisibility * (1 - lightOriginalTransparency)
-
-    pcall(function()
-        tardisLight.Transparency = math.clamp(finalTransparency, 0, 1)
-    end)
-
-    -- Emitted light also follows the waveform, much harder.
-    local brightnessFactor =
-        LIGHT_QUIET_BRIGHTNESS
-        + (LIGHT_PEAK_BRIGHTNESS_MULT - LIGHT_QUIET_BRIGHTNESS) * wavePunch
-    local brightness = lightOriginalBrightness * shellVisibility * brightnessFactor
-    setBlockValue(tardisLight, "Brightness", math.max(0, brightness))
-end
-
-local function getAggressiveProgress(progress)
-    return math.pow(math.clamp(progress, 0, 1), AGGRESSIVE_PROGRESS_POWER)
-end
-
-local function getWaveDrivenFade(targetFade, baseFade, wave)
-    baseFade = math.clamp(baseFade, 0, 1)
-    wave = math.clamp(wave or 0, 0, 1)
-
-    local punch = math.pow(wave, WAVE_GAMMA) * SHELL_WAVE_STRENGTH
-
-    if targetFade >= 1 then
-        -- Demat: sound peaks punch it further invisible.
-        return math.clamp(baseFade + punch * (1 - baseFade), 0, 1)
-    else
-        -- Materialize: sound peaks punch it further visible.
-        return math.clamp(baseFade - punch * baseFade, 0, 1)
-    end
-end
-
-local fadePartCount = math.max(#fadeParts, 1)
-local fadeUpdateRate = math.floor(MAX_FADE_WRITES_PER_SECOND / fadePartCount)
-fadeUpdateRate = math.clamp(fadeUpdateRate, 15, 60)
-local fadeUpdateInterval = 1 / fadeUpdateRate
-local lastFadeWrite = 0
-print("TARDIS fade refresh:", fadeUpdateRate, "Hz")
-
-local findFloorY
-local findFloorNearY
-
-local function getInputDestination()
-    local value = inputC:GetState()
-    local requested = nil
-
-    if typeof(value) == "Vector3" then
-        requested = CFrame.new(value) * defaultRotation
-    elseif typeof(value) == "CFrame" then
-        requested = value
-    else
-        print("Input C must be Vector3 or CFrame. Got:", typeof(value))
-        requested = startingPivot
-    end
-
-    if not requested then return nil end
-
-    local position = requested.Position
-    local groundY = findFloorNearY(position.X, position.Z, position.Y)
-    if groundY == nil then
-        return requested
-    end
-
-    local rotation = requested - position
-    local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
-    print("C LANDING:", "hintY", position.Y, "groundY", groundY, "pivotY", pivotY)
-    return CFrame.new(position.X, pivotY, position.Z) * rotation
-end
-
-local function getLocalPlayerRoot()
-    local Players = nil
-    pcall(function() Players = game:GetService("Players") end)
-    if not Players then return nil end
-
-    local player = nil
-    pcall(function() player = Players.LocalPlayer end)
-    if not player then return nil end
-
-    local character = nil
-    pcall(function() character = player.Character end)
-    if not character then return nil end
-
-    local root = nil
-    pcall(function() root = character:FindFirstChild("HumanoidRootPart") end)
-    return root
-end
-
-local function getPlayerGroundY(root)
-    local groundY = root.Position.Y - 3
-    local character = root.Parent
-    if not character then return groundY end
-
-    local humanoid = nil
-    pcall(function() humanoid = character:FindFirstChildOfClass("Humanoid") end)
-
-    if humanoid then
-        local hipHeight = humanoid.HipHeight
-        local rootHeight = root.Size.Y
-        if hipHeight and hipHeight > 0.5 then
-            groundY = root.Position.Y - (rootHeight / 2) - hipHeight
-        end
-    end
-
-    return groundY
-end
-
--- Find the highest collidable surface directly below the player without using
--- Roblox raycast APIs that Ultimate Build may wrap differently. This only runs
--- when calculating a recall destination; the rest of the controller is unchanged.
-local function updateFloorSlab(originCoord, directionCoord, minCoord, maxCoord, tMin, tMax)
-    local epsilon = 0.000001
-
-    if math.abs(directionCoord) <= epsilon then
-        if originCoord < minCoord or originCoord > maxCoord then
-            return tMin, tMax, false
-        end
-        return tMin, tMax, true
-    end
-
-    local t1 = (minCoord - originCoord) / directionCoord
-    local t2 = (maxCoord - originCoord) / directionCoord
-    if t1 > t2 then
-        local swap = t1
-        t1 = t2
-        t2 = swap
-    end
-
-    if t1 > tMin then tMin = t1 end
-    if t2 < tMax then tMax = t2 end
-    return tMin, tMax, tMin <= tMax
-end
-
-local function floorHitY(part, x, z, maxY)
-    if not part or part == script or contains(moveParts, part) then return nil end
-
-    local cf = nil
-    local size = nil
-    local rawPart = nil
-
-    pcall(function() rawPart = part.Part end)
-
-    local ok = pcall(function()
-        cf = part.CFrame
-        size = part.Size
-    end)
-
-    if (not ok or not cf or not size) and rawPart then
-        ok = pcall(function()
-            cf = rawPart.CFrame
-            size = rawPart.Size
-        end)
-    end
-
-    if not ok or not cf or not size then return nil end
-
-    local canCollide = getBlockValue(part, "CanCollide")
-    if canCollide == nil and rawPart then
-        pcall(function() canCollide = rawPart.CanCollide end)
-    end
-    if canCollide == false then return nil end
-
-    local startY = maxY + 2
-    local distance = 20000
-    local worldOrigin = Vector3.new(x, startY, z)
-    local worldEnd = Vector3.new(x, startY - distance, z)
-
-    local localOrigin = nil
-    local localEnd = nil
-    ok = pcall(function()
-        localOrigin = cf:PointToObjectSpace(worldOrigin)
-        localEnd = cf:PointToObjectSpace(worldEnd)
-    end)
-    if not ok or not localOrigin or not localEnd then return nil end
-
-    local direction = localEnd - localOrigin
-    local tMin = 0
-    local tMax = 1
-    local hit = true
-
-    tMin, tMax, hit = updateFloorSlab(localOrigin.X, direction.X, -size.X / 2, size.X / 2, tMin, tMax)
-    if not hit then return nil end
-    tMin, tMax, hit = updateFloorSlab(localOrigin.Y, direction.Y, -size.Y / 2, size.Y / 2, tMin, tMax)
-    if not hit then return nil end
-    tMin, tMax, hit = updateFloorSlab(localOrigin.Z, direction.Z, -size.Z / 2, size.Z / 2, tMin, tMax)
-    if not hit or tMin < 0 or tMin > 1 then return nil end
-
-    local hitY = startY - distance * tMin
-    if hitY > maxY + 0.5 then return nil end
-    return hitY
-end
-
-findFloorY = function(x, z, maxY)
-    local bestY = nil
-
-    for _, part in ipairs(workspace:GetDescendants()) do
-        local hitY = floorHitY(part, x, z, maxY)
-        if hitY and (bestY == nil or hitY > bestY) then
-            bestY = hitY
-        end
-    end
-
-    return bestY
-end
-
-local function raycastCoordinateGroundY(x, z, preferredCeiling)
-    local params = nil
-
-    pcall(function()
-        params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-
-        local exclude = {}
-
-        for _, part in ipairs(moveParts) do
-            local raw = getRawPart(part)
-            if raw and typeof(raw) == "Instance" then
-                table.insert(exclude, raw)
-            end
-            if typeof(part) == "Instance" then
-                table.insert(exclude, part)
+        for _,other in ipairs(connected) do
+            if not rawSet[other] then
+                eligible,failure=false,"exterior still linked to map or unrelated part"
+                break
             end
         end
-
-        local Players = game:GetService("Players")
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player.Character then
-                table.insert(exclude, player.Character)
-            end
-        end
-
-        params.FilterDescendantsInstances = exclude
-        pcall(function() params.RespectCanCollide = true end)
-    end)
-
-    local result = nil
-    local origin = Vector3.new(x, preferredCeiling + 2, z)
-    local direction = Vector3.new(0, -20000, 0)
-
-    local ok = pcall(function()
-        result = workspace:Raycast(origin, direction, params)
-    end)
-
-    if ok and result then
-        local position = nil
-        pcall(function() position = result.Position end)
-        if position then
-            return position.Y
-        end
     end
+end
 
+if rootRaw then
+    pcall(function()
+        rootRaw:SetAttribute("TardisRigRoot",true)
+        rootRaw:SetAttribute("TardisRigMode","NAV_V2")
+        rootRaw:SetAttribute("TardisRigReady",eligible)
+        rootRaw:SetAttribute("TardisRigError",failure or "")
+        rootRaw:SetAttribute("TardisTransitioning",false)
+        rootRaw:SetAttribute("TardisFlightActive",false)
+        rootRaw:SetAttribute("TardisPilotGroundOffset",-bottomOffset + .8)
+    end)
+end
+showMessage("CONTROLLER 2.0 / "..#shell.." SHELL / "
+    ..#moving.." MOVING / "..(eligible and "READY" or tostring(failure)))
+if not eligible then
+    -- Do not continue with a controller that could destroy an incomplete build.
+    return
+end
+
+local hiddenPivot = CFrame.new(HIDDEN)*defaultRotation
+local phase = (originalPivot.Position-HIDDEN).Magnitude < 95 and "HIDDEN" or "SOLID"
+local currentFade = phase=="HIDDEN" and 1 or 0
+local pendingDestination, queued, transition = nil,nil,nil
+local rotorTime,lastRotor,lastFade = 0,0,0
+local activeSound, soundStarted, quickStingUntil = nil,0,0
+local busy = false
+local latestDestination = nil
+local inputHistory = {}
+local function setBusy(flag)
+    busy=flag
+    rootFlag("TardisTransitioning",flag)
+    emit("b",flag)
+end
+local function setFade(fade,wave)
+    fade=math.clamp(fade,0,1)
+    for _,block in ipairs(faded) do
+        local original=originalAlpha[block] or 0
+        local visual=math.clamp(fade + wave*(1-fade)*.15,0,1)
+        put(block,"Transparency",original+(1-original)*visual)
+    end
+    if roofLight then
+        local visibility=1-fade
+        local pulse=.2+.8*wave
+        put(roofLight,"Transparency",math.clamp(
+            1-visibility*pulse*(1-lightAlpha),0,1))
+        put(roofLight,"Brightness",math.max(0,
+            lightBrightness*visibility*(.15+3.3*wave)))
+    end
+    if portal then put(portal,"Transparency",1) end
+end
+local function setFinalFade(fade)
+    currentFade=fade
+    for _,block in ipairs(faded) do
+        local original=originalAlpha[block] or 0
+        put(block,"Transparency",original+(1-original)*fade)
+    end
+    if roofLight then
+        put(roofLight,"Transparency",fade>=1 and 1 or lightAlpha)
+        put(roofLight,"Brightness",fade>=1 and 0 or lightBrightness)
+    end
+    if portal then put(portal,"Transparency",1) end
+end
+setFinalFade(currentFade)
+
+local function soundInput(block)
+    if not block then return nil end
+    for _,key in ipairs({"Input","input","Toggle","toggle","a","A"}) do
+        local ok,value=pcall(function() return block.inputs[key] end)
+        if ok and value then return value end
+    end
     return nil
 end
-
--- Coordinate destinations use Y as a rough ceiling hint. Prefer a real Roblox
--- downward ray so unions/terrain use their actual visible surface; only fall
--- back to the older wrapper-box scan if raycasting is unavailable in Fiu.
-findFloorNearY = function(x, z, hintY)
-    local preferredCeiling = hintY + 8
-
-    local rayY = raycastCoordinateGroundY(x, z, preferredCeiling)
-    if rayY ~= nil then
-        return rayY
+local function powerSound(block,on)
+    if not block then return false end
+    local p=soundInput(block)
+    if p then
+        if pcall(function() p:Fire(on,true) end) then return true end
+        if pcall(function() p:SetState(on) end) then return true end
     end
-
-    local bestY = nil
-    for _, part in ipairs(workspace:GetDescendants()) do
-        local hitY = floorHitY(part, x, z, preferredCeiling)
-        if hitY and (bestY == nil or hitY > bestY) then
-            bestY = hitY
-        end
+    for _,key in ipairs({"Input","input","Toggle","a"}) do
+        if pcall(function() block:FireInput(key,on) end) then return true end
     end
-
-    return bestY
-end
-
-local function getCharacterDestination()
-    local root = getLocalPlayerRoot()
-    if not root then
-        print("J RECALL: player root not found")
-        return nil
-    end
-
-    local groundY = findFloorY(root.Position.X, root.Position.Z, root.Position.Y + 1)
-    if groundY == nil then
-        groundY = getPlayerGroundY(root)
-    end
-
-    local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
-    return CFrame.new(root.Position.X, pivotY, root.Position.Z) * defaultRotation
-end
-
-local function getPlayerQuery()
-    if not inputB then return nil end
-
-    local value = nil
-    pcall(function() value = inputB:GetState() end)
-    if type(value) ~= "string" then return nil end
-
-    local query = string.match(value, "^%s*(.-)%s*$")
-    if not query or query == "" then return nil end
-    return string.lower(query)
-end
-
-local function resolvePlayerByQuery(query)
-    if not query then return nil end
-
-    local Players = nil
-    pcall(function() Players = game:GetService("Players") end)
-    if not Players then return nil end
-
-    local players = nil
-    pcall(function() players = Players:GetPlayers() end)
-    if not players then return nil end
-
-    local exactDisplay = nil
-    local prefixUser = nil
-    local prefixDisplay = nil
-
-    for _, player in ipairs(players) do
-        local username = string.lower(player.Name or "")
-        local displayName = string.lower(player.DisplayName or "")
-
-        if username == query then
-            return player
-        end
-        if displayName == query and not exactDisplay then
-            exactDisplay = player
-        end
-        if string.sub(username, 1, #query) == query and not prefixUser then
-            prefixUser = player
-        end
-        if string.sub(displayName, 1, #query) == query and not prefixDisplay then
-            prefixDisplay = player
-        end
-    end
-
-    return exactDisplay or prefixUser or prefixDisplay
-end
-
-local function getPlayerInputDestination()
-    local query = getPlayerQuery()
-    if not query then return nil end
-
-    local player = resolvePlayerByQuery(query)
-    if not player then
-        print("B TARGET NOT FOUND:", query)
-        return nil
-    end
-
-    local character = nil
-    pcall(function() character = player.Character end)
-    if not character then return nil end
-
-    local root = nil
-    pcall(function() root = character:FindFirstChild("HumanoidRootPart") end)
-    if not root then return nil end
-
-    local groundY = findFloorY(root.Position.X, root.Position.Z, root.Position.Y + 1)
-    if groundY == nil then
-        groundY = getPlayerGroundY(root)
-    end
-
-    print("B TARGET:", player.Name)
-
-    local pivotY = groundY - tardisBottomOffset + RECALL_GROUND_CLEARANCE
-    return CFrame.new(root.Position.X, pivotY, root.Position.Z) * defaultRotation
-end
-
-local hiddenPivot = CFrame.new(HIDDEN_POSITION) * defaultRotation
-
-local function setActualSoundProfile(actualSound, assetId, pitch)
-    if not actualSound then return end
-    pcall(function() actualSound.SoundId = "rbxassetid://" .. tostring(assetId) end)
-    pcall(function() actualSound.PlaybackSpeed = pitch end)
-end
-
-local function applySoundProfile(profile)
-    if not profile then return end
-
-    local assetId = tostring(profile.id)
-    local soundId = "rbxassetid://" .. assetId
-    local pitch = tonumber(profile.pitch) or 1
-
-    for _, block in ipairs({ matSound, interiorMatSound }) do
-        if block then
-            -- SoundBlock builds have used both numeric-looking and Roblox-style IDs;
-            -- setting SoundId to the canonical Roblox string covers the normal property.
-            setBlockValue(block, "SoundId", soundId)
-            setBlockValue(block, "Pitch", pitch)
-        end
-    end
-
-    setActualSoundProfile(matSoundInstance, assetId, pitch)
-    setActualSoundProfile(interiorMatSoundInstance, assetId, pitch)
-
-    print("TARDIS SOUND:", assetId, "pitch", pitch)
-end
-
-local function getTransitionSoundProfile(targetFade, quick)
-    if targetFade >= 1 then
-        return quick and SOUND_PROFILES.demat_quick or SOUND_PROFILES.demat_normal
-    end
-    return quick and SOUND_PROFILES.materialize_quick or SOUND_PROFILES.materialize_normal
-end
-
-local function getSoundLength(block)
-    return tonumber(getBlockValue(block, "TimeLength")) or 0
-end
-
-local function soundIdMatches(soundId, assetId)
-    if type(soundId) ~= "string" or not assetId then return false end
-    return string.find(soundId, tostring(assetId), 1, true) ~= nil
-end
-
--- Every transition must follow the sound that is actually playing, not a stale
--- Ultimate Build wrapper clock left over from the previous SoundId.
-local function getTransitionSoundClock(block, actualSound, expectedAssetId)
-    if actualSound then
-        local actualId = nil
-        local actualTime = nil
-        local actualLength = nil
-        local actualPlaying = nil
-
-        pcall(function() actualId = actualSound.SoundId end)
-        pcall(function() actualTime = actualSound.TimePosition end)
-        pcall(function() actualLength = actualSound.TimeLength end)
-        pcall(function() actualPlaying = actualSound.IsPlaying end)
-
-        if soundIdMatches(actualId, expectedAssetId)
-        and type(actualTime) == "number"
-        and type(actualLength) == "number"
-        and actualLength > 0 then
-            return actualTime, actualLength, actualPlaying == true, "actual"
-        end
-    end
-
-    local wrapperTime = tonumber(getBlockValue(block, "TimePosition"))
-    local wrapperLength = tonumber(getBlockValue(block, "TimeLength"))
-    local wrapperPlaying = getBlockValue(block, "IsPlaying") == true
-
-    if wrapperTime ~= nil
-    and wrapperLength ~= nil
-    and wrapperLength > 0 then
-        return wrapperTime, wrapperLength, wrapperPlaying, "wrapper"
-    end
-
-    return nil, nil, false, "wall"
-end
-
-local function getVisualEndTime(block)
-    local length = getSoundLength(block)
-    if length > VISUAL_START_TIME + SOUND_TAIL_TIME + 0.1 then
-        return length - SOUND_TAIL_TIME
-    end
-    return VISUAL_START_TIME + FALLBACK_FADE_TIME
-end
-
-local inputState = inputA:GetState() == true
-local currentFade = inputState and 0 or 1
-local hidden = not inputState
-local lastInputState = inputState
-local lastJState = false
-local lastEState = false
-local lastFState = false
-local activeTransition = nil
-local autoSequence = false
-setRigFlag("TardisTransitioning", not inputState)
-
-if inputState then
-    setFadePartsTransparency(0)
-    setLightEffect(0, 0, false)
-else
-    setFadePartsTransparency(1)
-    setLightEffect(1, 0, false)
-    moveTardis(hiddenPivot)
-end
-
-local function prepareMaterialization(kind)
-    if not hidden then return true end
-
-    setFadePartsTransparency(1)
-    setLightEffect(1, 0, false)
-
-    local destination
-    if kind == "auto_materialize"
-    or kind == "quick_recall_materialize" then
-        destination = getCharacterDestination()
-    else
-        destination = getPlayerInputDestination()
-        if not destination then
-            destination = getInputDestination()
-        end
-    end
-
-    if not destination then return false end
-
-    moveTardis(destination)
-    hidden = false
-    currentFade = 1
-    return true
-end
-
-local function syntheticWave(soundTime)
-    local a = 0.5 + 0.5 * math.sin(soundTime * SYNTH_WAVE_RATE_A)
-    local b = 0.5 + 0.5 * math.sin(soundTime * SYNTH_WAVE_RATE_B + 1.7)
-    return math.clamp(a * 0.68 + b * 0.32, 0, 1)
-end
-
-local function updateWaveEnvelope(transition, soundTime)
-    local raw, available = getPlaybackLoudness(transition.sound, transition.actualSound)
-    local normalized
-
-    if available then
-        transition.loudnessPeak = math.max(
-            MIN_LOUDNESS_PEAK,
-            transition.loudnessPeak * 0.995,
-            raw
-        )
-        normalized = math.clamp(raw / transition.loudnessPeak, 0, 1)
-        normalized = math.pow(normalized, WAVE_GAMMA)
-    else
-        normalized = syntheticWave(soundTime or 0)
-    end
-
-    local envelope = transition.waveEnvelope or 0
-    local alpha = normalized > envelope and WAVE_ATTACK or WAVE_RELEASE
-    envelope = envelope + (normalized - envelope) * alpha
-    transition.waveEnvelope = math.clamp(envelope, 0, 1)
-    return transition.waveEnvelope
-end
-
-local function startTransition(kind, targetFade, fast)
-    if activeTransition and activeTransition.sound then
-        stopSound(activeTransition.sound)
-    end
-    activeTransition = nil
-    -- Disable flight propulsion before any transition touches the assembly.
-    setRigFlag("TardisTransitioning", true)
-    setRigFlag("TardisFlightActive", false)
-    if rigRoot then pcall(function()
-        -- Do not wait for the pilot's next poll. Physically release both motors
-        -- before demat/recall can move the shell.
-        local linearMotor = rigRoot:FindFirstChild("TardisFlightVelocity")
-        local angularMotor = rigRoot:FindFirstChild("TardisFlightSpin")
-        if linearMotor then linearMotor.Enabled = false end
-        if angularMotor then angularMotor.Enabled = false end
-        rigRoot.AssemblyLinearVelocity = Vector3.zero
-        rigRoot.AssemblyAngularVelocity = Vector3.zero
-    end) end
-
-    if targetFade <= 0 and not prepareMaterialization(kind) then
-        print("Materialization destination unavailable")
-        setRigFlag("TardisTransitioning", hidden)
-        return
-    end
-
-    local useFast = fast == true
-    local profile = getTransitionSoundProfile(targetFade, useFast)
-    applySoundProfile(profile)
-
-    -- Let the SoundBlock/underlying Sound accept the new asset before playback.
-    task.wait()
-
-    local sound = matSound
-    local actualSound = matSoundInstance
-    local visualEnd = getVisualEndTime(sound)
-    local visualProgress = targetFade >= 1 and currentFade or (1 - currentFade)
-    visualProgress = math.clamp(visualProgress, 0, 1)
-
-    -- Normal reversals can resume partway through their selected source. Quick
-    -- transitions always start their dedicated quick asset from the beginning.
-    local linearProgress = math.pow(visualProgress, 1 / AGGRESSIVE_PROGRESS_POWER)
-    local seekPosition = 0
-    if not useFast and visualProgress > 0.01 then
-        seekPosition = VISUAL_START_TIME + linearProgress * (visualEnd - VISUAL_START_TIME)
-    end
-
-    playSound(sound, seekPosition)
-
-    activeTransition = {
-        kind = kind,
-        targetFade = targetFade,
-        sound = sound,
-        actualSound = actualSound,
-        soundPitch = tonumber(profile.pitch) or 1,
-        soundId = profile.id,
-        visualEnd = visualEnd,
-        requestTime = os.clock(),
-        startFade = currentFade,
-        fast = useFast,
-        fastSawPlaying = false,
-        fastEndpointApplied = false,
-        fastClockLogged = false,
-        quickEndStingActive = false,
-        quickEndStingStart = nil,
-        quickEndStingSawPlaying = false,
-        quickEndStingMaxTime = 0,
-        maxSoundTime = seekPosition,
-        visualComplete = false,
-        fallback = false,
-        fallbackStart = 0,
-        fallbackTailStart = nil,
-        waveEnvelope = 0,
-        loudnessPeak = MIN_LOUDNESS_PEAK,
-    }
-end
-
-local function requestDemat(kind, forceFast)
-    local useFast = forceFast == true or fastTravelEnabled()
-    startTransition(kind, 1, useFast)
-end
-
-local function requestMaterialize(kind, forceFast)
-    local useFast = forceFast == true or fastTravelEnabled()
-    startTransition(kind, 0, useFast)
-end
-
-local function finishTransition(transition)
-    if activeTransition ~= transition then return end
-
-    activeTransition = nil
-    stopSound(transition.sound)
-
-    if transition.targetFade >= 1 then
-        currentFade = 1
-        setFadePartsTransparency(1)
-        setLightEffect(1, 0, false)
-        moveTardis(hiddenPivot)
-        hidden = true
-        setRigFlag("TardisTransitioning", true)
-
-        if transition.kind == "auto_demat" then
-            requestMaterialize("auto_materialize")
-        elseif transition.kind == "quick_recall_demat" then
-            requestMaterialize("quick_recall_materialize", true)
-        elseif transition.kind == "quick_destination_demat" then
-            requestMaterialize("quick_destination_materialize", true)
-        end
-    else
-        currentFade = 0
-        setFadePartsTransparency(0)
-        setLightEffect(0, 0, false)
-        hidden = false
-        setRigFlag("TardisTransitioning", false)
-
-        if transition.kind == "auto_materialize" then
-            autoSequence = false
-            lastInputState = inputA:GetState() == true
-            print("J RECALL COMPLETE")
-        elseif transition.kind == "quick_recall_materialize" then
-            autoSequence = false
-            lastInputState = inputA:GetState() == true
-            print("E QUICK RECALL COMPLETE")
-        elseif transition.kind == "quick_destination_materialize" then
-            autoSequence = false
-            lastInputState = inputA:GetState() == true
-            print("F QUICK DESTINATION COMPLETE")
-        end
-    end
-end
-
-local function startQuickEndSting(transition)
-    if transition.quickEndStingActive then return end
-
-    -- Keep the exterior pinned at its completed quick-travel state while the
-    -- three-second end sting plays.
-    currentFade = transition.targetFade
-    setFadePartsTransparency(transition.targetFade)
-    setLightEffect(transition.targetFade, 0, false)
-
-    stopSound(transition.sound)
-    applySoundProfile(SOUND_PROFILES.quick_end)
-    task.wait()
-    playSound(transition.sound, 0)
-
-    transition.quickEndStingActive = true
-    transition.quickEndStingStart = os.clock()
-    transition.quickEndStingSawPlaying = false
-    transition.quickEndStingMaxTime = 0
-
-    print("QUICK END STING:", SOUND_PROFILES.quick_end.id, "first", QUICK_END_STING_SECONDS, "seconds")
-end
-
-local function updateQuickEndSting(transition, now)
-    if not transition.quickEndStingActive then return false end
-
-    local elapsed = now - (transition.quickEndStingStart or now)
-    local soundTime, _, isPlaying =
-        getTransitionSoundClock(
-            transition.sound,
-            transition.actualSound,
-            SOUND_PROFILES.quick_end.id
-        )
-
-    if isPlaying then
-        transition.quickEndStingSawPlaying = true
-    end
-
-    if soundTime and soundTime > transition.quickEndStingMaxTime then
-        transition.quickEndStingMaxTime = soundTime
-    end
-
-    local finished = false
-
-    -- Preferred path: stop at exactly the first three seconds of the real Sound.
-    if soundTime and soundTime >= QUICK_END_STING_SECONDS then
-        finished = true
-    end
-
-    -- If the sting itself is shorter than three seconds, do not hang the travel.
-    if transition.quickEndStingSawPlaying
-    and not isPlaying
-    and transition.quickEndStingMaxTime > 0.01 then
-        finished = true
-    end
-
-    -- Safety fallback if the engine does not expose this replacement asset's clock.
-    if not soundTime and elapsed >= QUICK_END_STING_SECONDS then
-        finished = true
-    end
-
-    if finished then
-        finishTransition(transition)
-        return true
-    end
-
-    return true
-end
-
-local function updateTransition()
-    local transition = activeTransition
-    if not transition then return end
-
-    local now = os.clock()
-
-    if transition.fast then
-        if transition.quickEndStingActive then
-            updateQuickEndSting(transition, now)
-            return
-        end
-
-        local elapsed = now - transition.requestTime
-        local soundTime, timeLength, isPlaying, clockSource =
-            getTransitionSoundClock(
-                transition.sound,
-                transition.actualSound,
-                transition.soundId
-            )
-
-        if not transition.fastClockLogged then
-            if clockSource == "actual"
-            or clockSource == "wrapper"
-            or elapsed >= 0.25 then
-                transition.fastClockLogged = true
-                print(
-                    "FAST SOUND CLOCK:",
-                    clockSource,
-                    "id", transition.soundId,
-                    "time", soundTime,
-                    "length", timeLength,
-                    "pitch", transition.soundPitch
-                )
-            end
-        end
-
-        if isPlaying then
-            transition.fastSawPlaying = true
-        end
-        if soundTime and soundTime > transition.maxSoundTime then
-            transition.maxSoundTime = soundTime
-        end
-
-        -- The quick assets have their own requested pitch. Use the complete
-        -- pitched playback duration as the wall-clock fallback if the SoundBlock
-        -- does not expose a reliable IsPlaying/TimePosition clock.
-        local pitchedSoundDuration = nil
-        local soundPitch = math.max(transition.soundPitch or 1, 0.01)
-        if timeLength and timeLength > 0 then
-            pitchedSoundDuration = timeLength / soundPitch
-        end
-
-        local startFade = transition.startFade or currentFade
-        local fadeDistance = math.abs(transition.targetFade - startFade)
-
-        -- Drive quick visuals from the sound itself. Prefer the SoundBlock source
-        -- timeline (TimePosition / TimeLength); only use wall-clock math if that
-        -- clock is unavailable. Full visual completion happens near the end.
-        local audioProgress = nil
-        if timeLength and timeLength > 0 and soundTime and soundTime >= 0 then
-            audioProgress = math.clamp(soundTime / timeLength, 0, 1)
-        elseif pitchedSoundDuration then
-            audioProgress = math.clamp(elapsed / pitchedSoundDuration, 0, 1)
-        else
-            audioProgress = math.clamp(elapsed / FAST_FADE_TIME, 0, 1)
-        end
-
-        local visualEndFraction
-        local progressPower
-        if transition.targetFade >= 1 then
-            visualEndFraction = FAST_DEMAT_VISUAL_END_FRACTION
-            progressPower = FAST_DEMAT_PROGRESS_POWER
-        else
-            visualEndFraction = FAST_MAT_VISUAL_END_FRACTION
-            progressPower = FAST_MAT_PROGRESS_POWER
-        end
-
-        local linearProgress = math.clamp(
-            audioProgress / visualEndFraction,
-            0,
-            1
-        )
-        local progress = math.pow(linearProgress, progressPower)
-        local baseFade = startFade
-            + (transition.targetFade - startFade) * progress
-        currentFade = baseFade
-
-        local waveTime = soundTime or (elapsed * (transition.soundPitch or 1))
-        local wave = updateWaveEnvelope(transition, waveTime)
-        local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
-
-        if linearProgress >= 1 then
-            -- Once quick travel reaches its endpoint, pin it there. Do not let
-            -- waveform modulation make the box look partly present again.
-            waveFade = transition.targetFade
-            currentFade = transition.targetFade
-        end
-
-        setLightEffect(waveFade, wave, true)
-
-        if now - lastFadeWrite >= fadeUpdateInterval then
-            lastFadeWrite = now
-            setFadePartsTransparency(waveFade)
-        end
-
-        if linearProgress >= 1 and not transition.visualComplete then
-            transition.visualComplete = true
-            currentFade = transition.targetFade
-            setFadePartsTransparency(transition.targetFade)
-            setLightEffect(transition.targetFade, wave, true)
-
-            -- For a quick demat, teleport the exterior away as soon as it is fully
-            -- invisible near the end of the sound. The final audio tail can then
-            -- finish naturally before any chained rematerialization begins.
-            if transition.targetFade >= 1
-            and not transition.fastEndpointApplied then
-                transition.fastEndpointApplied = true
-                moveTardis(hiddenPivot)
-                hidden = true
-            end
-        end
-
-        local soundFinished = false
-
-        -- Best signal: the source timeline actually reached the end.
-        if timeLength
-        and timeLength > 0
-        and transition.maxSoundTime >= timeLength - 0.05 then
-            soundFinished = true
-        end
-
-        -- If the block exposes IsPlaying reliably, accept a completed stop only
-        -- after we have observed it playing at least once.
-        if transition.fastSawPlaying
-        and not isPlaying
-        and transition.maxSoundTime > 0.01 then
-            soundFinished = true
-        end
-
-        -- Ultimate Build sometimes fails to expose IsPlaying/TimePosition. In that
-        -- case wait the full mathematically sped-up duration before stopping it.
-        if pitchedSoundDuration
-        and elapsed >= pitchedSoundDuration + 0.05 then
-            soundFinished = true
-        end
-
-        -- Last-resort fallback when no SoundBlock length/clock is available.
-        if not pitchedSoundDuration
-        and not transition.fastSawPlaying
-        and elapsed >= FAST_FADE_TIME + FAST_TAIL_TIME then
-            soundFinished = true
-        end
-
-        if transition.visualComplete and soundFinished then
-            startQuickEndSting(transition)
-        end
-        return
-    end
-
-    local sound = transition.sound
-    local soundTime, timeLength, isPlaying, clockSource =
-        getTransitionSoundClock(
-            transition.sound,
-            transition.actualSound,
-            transition.soundId
-        )
-
-    if not transition.fastClockLogged then
-        if clockSource == "actual"
-        or clockSource == "wrapper"
-        or now - transition.requestTime >= 0.25 then
-            transition.fastClockLogged = true
-            print(
-                "SOUND CLOCK:",
-                clockSource,
-                "id", transition.soundId,
-                "time", soundTime,
-                "length", timeLength,
-                "pitch", transition.soundPitch
-            )
-        end
-    end
-
-    if not transition.fallback and soundTime then
-        if soundTime > transition.maxSoundTime then transition.maxSoundTime = soundTime end
-
-        if timeLength
-        and timeLength > VISUAL_START_TIME + SOUND_TAIL_TIME + 0.1 then
-            transition.visualEnd = timeLength - SOUND_TAIL_TIME
-        end
-
-        local wave = updateWaveEnvelope(transition, soundTime)
-        setLightEffect(currentFade, wave, true)
-
-        if not transition.visualComplete and soundTime >= VISUAL_START_TIME then
-            local linearProgress = math.clamp(
-                (soundTime - VISUAL_START_TIME)
-                / math.max(transition.visualEnd - VISUAL_START_TIME, 0.01),
-                0,
-                1
-            )
-
-            local progress = getAggressiveProgress(linearProgress)
-            local baseFade = transition.targetFade >= 1 and progress or (1 - progress)
-            currentFade = baseFade
-
-            local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
-            setLightEffect(waveFade, wave, true)
-
-            if now - lastFadeWrite >= fadeUpdateInterval then
-                lastFadeWrite = now
-                setFadePartsTransparency(waveFade)
-            end
-
-            if linearProgress >= 1 then
-                transition.visualComplete = true
-                currentFade = transition.targetFade
-                setFadePartsTransparency(transition.targetFade)
-                setLightEffect(transition.targetFade, wave, true)
-            end
-        end
-
-        local soundFinished = false
-        if transition.visualComplete then
-            if timeLength
-            and timeLength > 0
-            and transition.maxSoundTime >= timeLength - 0.08 then
-                soundFinished = true
-            end
-            if not isPlaying and transition.maxSoundTime > VISUAL_START_TIME then
-                soundFinished = true
-            end
-        end
-
-        if soundFinished then
-            finishTransition(transition)
-            return
-        end
-
-        if now - transition.requestTime >= SOUND_START_TIMEOUT
-        and transition.maxSoundTime <= 0.01 then
-            print("Audio clock unavailable; using fallback")
-            transition.fallback = true
-            transition.fallbackStart = now
-        end
-
-    elseif not transition.fallback then
-        if now - transition.requestTime >= SOUND_START_TIMEOUT then
-            transition.fallback = true
-            transition.fallbackStart = now
-        end
-    end
-
-    if transition.fallback then
-        local elapsed = now - transition.fallbackStart
-        local wave = updateWaveEnvelope(transition, elapsed)
-
-        if elapsed <= FALLBACK_FADE_TIME then
-            local linearProgress = math.clamp(elapsed / FALLBACK_FADE_TIME, 0, 1)
-            local progress = getAggressiveProgress(linearProgress)
-            local baseFade = transition.targetFade >= 1 and progress or (1 - progress)
-            currentFade = baseFade
-
-            local waveFade = getWaveDrivenFade(transition.targetFade, baseFade, wave)
-            setLightEffect(waveFade, wave, true)
-
-            if now - lastFadeWrite >= fadeUpdateInterval then
-                lastFadeWrite = now
-                setFadePartsTransparency(waveFade)
-            end
-        elseif not transition.visualComplete then
-            transition.visualComplete = true
-            currentFade = transition.targetFade
-            setFadePartsTransparency(transition.targetFade)
-            setLightEffect(transition.targetFade, wave, true)
-            transition.fallbackTailStart = now
-        elseif transition.fallbackTailStart
-        and now - transition.fallbackTailStart >= FALLBACK_TAIL_TIME then
-            finishTransition(transition)
-        else
-            setLightEffect(currentFade, wave, true)
-        end
-    end
-end
-
-local function startAutoRecall()
-    print("J RECALL START")
-    autoSequence = true
-
-    if hidden or currentFade >= 1 then
-        currentFade = 1
-        setFadePartsTransparency(1)
-        setLightEffect(1, 0, false)
-        hidden = true
-        requestMaterialize("auto_materialize")
-    else
-        requestDemat("auto_demat")
-    end
-end
-
-local function startQuickRecall()
-    print("E QUICK RECALL START")
-    autoSequence = true
-
-    if hidden or currentFade >= 1 then
-        currentFade = 1
-        setFadePartsTransparency(1)
-        setLightEffect(1, 0, false)
-        hidden = true
-        requestMaterialize("quick_recall_materialize", true)
-    else
-        requestDemat("quick_recall_demat", true)
-    end
-end
-
-local function startQuickDestination()
-    print("F QUICK DESTINATION START")
-    autoSequence = true
-
-    if hidden or currentFade >= 1 then
-        currentFade = 1
-        setFadePartsTransparency(1)
-        setLightEffect(1, 0, false)
-        hidden = true
-        requestMaterialize("quick_destination_materialize", true)
-    else
-        requestDemat("quick_destination_demat", true)
-    end
-end
-
-print("TARDIS fast controls: D=quick-sound demat+remat, E=quick recall, F=quick B/C cycle")
-print("TARDIS audio: one exterior + one mirrored interior SoundBlock")
-
--- Interior time rotor animation. It runs while dematting, fully dematerialized,
--- and rematerializing. Once the exterior is fully solid again it pauses exactly
--- where it is until the next dematerialization cycle.
-local TIME_ROTOR_NAME = "timerotor"
-local TIME_ROTOR_TRAVEL = 6
-local TIME_ROTOR_TWEEN_TIME = 1.4 -- seconds from bottom to top
-local timeRotorParts = {}
-local timeRotorTweens = {}
-local timeRotorFallbackBases = {}
-local timeRotorFallbackStartTime = os.clock()
-local TweenService = nil
-
-pcall(function() TweenService = game:GetService("TweenService") end)
-
-local function rotorNameMatches(block)
-    local wanted = string.lower(TIME_ROTOR_NAME)
-
-    local displayName = getDisplayName(block)
-    if type(displayName) == "string" and string.lower(displayName) == wanted then
-        return true
-    end
-
-    local objectName = getBlockValue(block, "Name")
-    if type(objectName) == "string" and string.lower(objectName) == wanted then
-        return true
-    end
-
-    local raw = nil
-    pcall(function() raw = block.Part end)
-    if raw then
-        local rawName = nil
-        pcall(function() rawName = raw.Name end)
-        if type(rawName) == "string" and string.lower(rawName) == wanted then
-            return true
-        end
-    end
-
     return false
 end
-
-for _, block in ipairs(workspace:GetDescendants()) do
-    if block ~= script and rotorNameMatches(block) then
-        local target = nil
-        local cf = nil
-        local raw = nil
-
-        pcall(function() raw = block.Part end)
-        if raw then
-            pcall(function() cf = raw.CFrame end)
-            if cf then target = raw end
-        end
-
-        if not target then
-            pcall(function() cf = block.CFrame end)
-            if cf then target = block end
-        end
-
-        if target and cf and not contains(timeRotorParts, target) then
-            table.insert(timeRotorParts, target)
-            timeRotorFallbackBases[target] = cf
-            pcall(function() target.Anchored = true end)
-        end
+local function actualSound(block)
+    local r=raw(block)
+    if not r then return nil end
+    local sound=nil
+    pcall(function() sound=r:FindFirstChildWhichIsA("Sound",true) end)
+    return sound
+end
+local realOuter,realInner=actualSound(exteriorSound),actualSound(interiorSound)
+for _,block in pairs({exteriorSound,interiorSound}) do
+    if block then
+        put(block,"Repeat",false)
+        put(block,"ResetTimePosition",false)
+        put(block,"Volume",1)
+        put(block,"Effects",false)
     end
 end
+local function stopAudio()
+    for _,b in pairs({exteriorSound,interiorSound}) do
+        if b then powerSound(b,false) end
+    end
+    activeSound=nil
+end
+local function startAudio(key)
+    local profile=SOUND[key]
+    if not profile then return end
+    stopAudio()
+    for _,pair in ipairs({{exteriorSound,realOuter},{interiorSound,realInner}}) do
+        local block,instance=pair[1],pair[2]
+        if block then
+            put(block,"SoundId","rbxassetid://"..profile.id)
+            put(block,"Pitch",profile.pitch)
+            put(block,"TimePosition",0)
+        end
+        if instance then
+            pcall(function()
+                instance.SoundId="rbxassetid://"..profile.id
+                instance.PlaybackSpeed=profile.pitch
+                instance.TimePosition=0
+            end)
+        end
+    end
+    task.wait()
+    powerSound(exteriorSound,true)
+    powerSound(interiorSound,true)
+    activeSound=key
+    soundStarted=os.clock()
+end
+local function audioClock()
+    for _,sound in pairs({realOuter,exteriorSound}) do
+        if sound then
+            local t=tonumber(prop(sound,"TimePosition"))
+            local length=tonumber(prop(sound,"TimeLength"))
+            if t and length and length>MIN_SOUND_LENGTH and t>0 then
+                return t,length
+            end
+        end
+    end
+    return nil,nil
+end
+local function wave(time)
+    local loudness=tonumber(prop(realOuter,"PlaybackLoudness"))
+        or tonumber(prop(exteriorSound,"PlaybackLoudness"))
+    if loudness and loudness>0 then
+        return math.clamp(math.sqrt(loudness/250),0,1)
+    end
+    return .55+.27*math.sin(time*17)+.18*math.sin(time*30+1.2)
+end
 
-local timeRotorTweening = false
+local function move(pivot)
+    -- One immutable pivot, no root-only writes. This runs only while hidden.
+    if not pivot then return false end
+    local old=readCF(rootBlock)
+    local count=0
+    for i,block in ipairs(moving) do
+        local offset=offsets[block]
+        if offset then
+            local ok=pcall(function() block.CFrame=pivot*offset end)
+            if ok then count=count+1 end
+        end
+        if i%24==0 then task.wait() end
+    end
+    if count~=#moving then
+        -- Best-effort rollback of a partial teleport, keeping the last
+        -- known exterior intact instead of announcing successful travel.
+        if old then
+            for i,block in ipairs(moving) do
+                local offset=offsets[block]
+                if offset then pcall(function() block.CFrame=old*offset end) end
+                if i%24==0 then task.wait() end
+            end
+        end
+        showMessage("MOVE FAILED: "..count.."/"..#moving.." PROXIES / ROLLBACK")
+        return false
+    end
+    emit("c",pivot)
+    if portal then put(portal,"Transparency",1) end
+    return true
+end
 
-if TweenService and #timeRotorParts > 0 then
-    local tweenInfo = nil
-    local infoOk = pcall(function()
-        tweenInfo = TweenInfo.new(
-            TIME_ROTOR_TWEEN_TIME,
-            Enum.EasingStyle.Sine,
-            Enum.EasingDirection.InOut,
-            -1,
-            true,
-            0
-        )
+-- Raycast terrain/unions when available. Geometry-box fallback handles FIU
+-- wrappers without functional RaycastParams. Never land on our own shell.
+local function slab(o,d,low,high,t0,t1)
+    if math.abs(d)<1e-7 then
+        return t0,t1,o>=low and o<=high
+    end
+    local a,b=(low-o)/d,(high-o)/d
+    if a>b then a,b=b,a end
+    t0,t1=math.max(t0,a),math.min(t1,b)
+    return t0,t1,t0<=t1
+end
+local function hitBox(block,x,z,ceiling)
+    local part=raw(block) or block
+    if rawSet[part] or part==script then return nil end
+    if prop(block,"CanCollide")==false or prop(part,"CanCollide")==false then return nil end
+    local cf=readCF(block) or readCF(part)
+    local size=prop(block,"Size") or prop(part,"Size")
+    if not cf or typeof(size)~="Vector3" then return nil end
+    local origin=cf:PointToObjectSpace(Vector3.new(x,ceiling+2,z))
+    local direction=cf:VectorToObjectSpace(Vector3.new(0,-20000,0))
+    local lo,hi,ok=0,1,true
+    lo,hi,ok=slab(origin.X,direction.X,-size.X/2,size.X/2,lo,hi)
+    if not ok then return nil end
+    lo,hi,ok=slab(origin.Y,direction.Y,-size.Y/2,size.Y/2,lo,hi)
+    if not ok then return nil end
+    lo,hi,ok=slab(origin.Z,direction.Z,-size.Z/2,size.Z/2,lo,hi)
+    if not ok or lo<0 or lo>1 then return nil end
+    local y=ceiling+2-20000*lo
+    return y<=ceiling+.4 and y or nil
+end
+local function groundAt(x,z,ceiling)
+    local params=nil
+    pcall(function()
+        params=RaycastParams.new()
+        params.FilterType=Enum.RaycastFilterType.Exclude
+        local exclude={}
+        for _,r in ipairs(rawMoving) do
+            if typeof(r)=="Instance" then table.insert(exclude,r) end
+        end
+        local Players=game:GetService("Players")
+        for _,p in ipairs(Players:GetPlayers()) do
+            if p.Character then table.insert(exclude,p.Character) end
+        end
+        params.FilterDescendantsInstances=exclude
+        pcall(function() params.RespectCanCollide=true end)
     end)
+    if params then
+        local ok,hit=pcall(function()
+            return workspace:Raycast(
+                Vector3.new(x,ceiling+2,z),Vector3.new(0,-20000,0),params)
+        end)
+        if ok and hit then
+            local pos=prop(hit,"Position")
+            if typeof(pos)=="Vector3" then return pos.Y end
+        end
+    end
+    local best=nil
+    for _,block in ipairs(all) do
+        local name=label(block)
+        if name~=SHELL and name~=SOUND_OUT and name~=LIGHT and name~=PORTAL then
+            local y=hitBox(block,x,z,ceiling)
+            if y and (not best or y>best) then best=y end
+        end
+    end
+    return best
+end
+local function validPos(value)
+    return typeof(value)=="Vector3" and value.X==value.X
+        and value.Y==value.Y and value.Z==value.Z
+        and math.max(math.abs(value.X),math.abs(value.Y),math.abs(value.Z))<1e7
+end
+local function parseDestination(value)
+    local kind=typeof(value)
+    if kind=="CFrame" then return value end
+    if kind=="Vector3" and validPos(value) then
+        return CFrame.new(value)*defaultRotation
+    end
+    if type(value)=="string" then
+        local fields={}
+        for field in string.gmatch(value,"[^,%s]+") do
+            table.insert(fields,tonumber(field))
+        end
+        if #fields==3 and fields[1] and fields[2] and fields[3] then
+            local pos=Vector3.new(fields[1],fields[2],fields[3])
+            if validPos(pos) then return CFrame.new(pos)*defaultRotation end
+        end
+    end
+    return nil
+end
+local function groundPivot(cf,hintIsNav)
+    if not cf then return nil end
+    local p=cf.Position
+    local ceiling=p.Y+(hintIsNav and 8 or 3)
+    local y=groundAt(p.X,p.Z,ceiling)
+    if not y then return nil end
+    return CFrame.new(p.X,y-bottomOffset+CLEARANCE,p.Z)*(cf-p)
+end
+local function playerRoot(query)
+    local players=nil
+    pcall(function() players=game:GetService("Players") end)
+    if not players then return nil end
+    if not query or query=="" then
+        local localPlayer=nil
+        pcall(function() localPlayer=players.LocalPlayer end)
+        local c=localPlayer and localPlayer.Character
+        return c and c:FindFirstChild("HumanoidRootPart") or nil
+    end
+    local match=nil
+    local wanted=string.lower(query)
+    for _,p in ipairs(players:GetPlayers()) do
+        local name=string.lower(p.Name)
+        local display=string.lower(p.DisplayName)
+        if name==wanted or display==wanted then match=p; break end
+        if not match and (name:sub(1,#wanted)==wanted
+            or display:sub(1,#wanted)==wanted) then match=p end
+    end
+    local c=match and match.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+local function toPlayer(query)
+    local r=playerRoot(query)
+    if not r then return nil end
+    local p=r.Position
+    local y=groundAt(p.X,p.Z,p.Y+2) or p.Y-3
+    return CFrame.new(p.X,y-bottomOffset+CLEARANCE,p.Z)*defaultRotation
+end
+local function coordinateTarget()
+    local value,ok=state("c")
+    local parsed=ok and parseDestination(value) or nil
+    if not parsed then return nil end
+    return groundPivot(parsed,true)
+end
+local function destinationFromInputs()
+    local playerName, readable = state("b")
+    local targetPlayer = readable and type(playerName)=="string" and playerName or nil
+    return coordinateTarget() or (
+        targetPlayer and targetPlayer~="" and toPlayer(targetPlayer) or nil)
+end
 
-    if infoOk and tweenInfo then
-        local created = 0
-
-        for _, part in ipairs(timeRotorParts) do
-            local base = timeRotorFallbackBases[part]
-            if base then
-                local tween = nil
-                local ok = pcall(function()
-                    tween = TweenService:Create(part, tweenInfo, {
-                        CFrame = base + Vector3.new(0, TIME_ROTOR_TRAVEL, 0)
-                    })
-                end)
-
-                if ok and tween then
-                    table.insert(timeRotorTweens, tween)
-                    created = created + 1
-                end
+local function changePhase(to,quick)
+    transition={
+        from=currentFade,
+        target=to=="HIDING" and 1 or 0,
+        phase=to,
+        quick=quick,
+        started=os.clock(),
+        soundKey=(to=="HIDING" and (quick and "hideFast" or "hide")
+            or (quick and "showFast" or "show")),
+    }
+    phase=to
+    setBusy(true)
+    startAudio(transition.soundKey)
+    showMessage(to..(quick and " / QUICK" or ""))
+end
+local function beginCommand(command)
+    if not command then return end
+    if phase=="HIDING" or phase=="SHOWING" then
+        queued=command
+        showMessage("QUEUED: "..command.kind)
+        return
+    end
+    local quick=command.quick==true
+    if command.kind=="HIDE" then
+        pendingDestination=nil
+        if phase=="SOLID" then
+            lastVisiblePivot=readCF(rootBlock) or lastVisiblePivot
+            changePhase("HIDING",quick)
+        else
+            showMessage("ALREADY HIDDEN")
+        end
+    elseif command.kind=="SHOW" then
+        if phase=="HIDDEN" then
+            local dest=command.target or lastVisiblePivot
+            if not dest or not move(dest) then
+                showMessage("SHOW FAILED / DESTINATION UNAVAILABLE")
+                return
+            end
+            changePhase("SHOWING",quick)
+        else
+            showMessage("ALREADY MATERIALIZED")
+        end
+    elseif command.kind=="TRAVEL" then
+        if not command.target then
+            showMessage("TRAVEL REJECTED / NO VALID GROUND OR TARGET")
+            return
+        end
+        if phase=="SOLID" then
+            lastVisiblePivot=readCF(rootBlock) or lastVisiblePivot
+            pendingDestination=command.target
+            changePhase("HIDING",quick)
+        elseif phase=="HIDDEN" then
+            if move(command.target) then
+                lastVisiblePivot=command.target
+                changePhase("SHOWING",quick)
             end
         end
-
-        timeRotorTweening = created == #timeRotorParts and created > 0
     end
 end
-
-local timeRotorRunning = false
-
-local function setTimeRotorRunning(shouldRun)
-    if shouldRun == timeRotorRunning then return end
-    timeRotorRunning = shouldRun
-
-    if timeRotorTweening then
-        for _, tween in ipairs(timeRotorTweens) do
-            pcall(function()
-                if shouldRun then
-                    tween:Play()
-                else
-                    tween:Pause()
-                end
-            end)
+local function processQueued()
+    local cmd=queued
+    queued=nil
+    if cmd then beginCommand(cmd) end
+end
+local function finishTransition()
+    local t=transition
+    if not t then return end
+    transition=nil
+    if t.phase=="HIDING" then
+        setFinalFade(1)
+        phase="HIDDEN"
+        if not move(hiddenPivot) then
+            setBusy(false); showMessage("HIDE MOVE FAILED / STOPPED"); return
         end
-    elseif shouldRun then
-        timeRotorFallbackStartTime = os.clock()
-    end
-end
-
-local function shouldRunTimeRotor()
-    if hidden then return true end
-    if activeTransition then return true end
-    -- Physical piloting is a legitimate flight state, even though the shell
-    -- stays materialized. The rotor should animate the entire time.
-    if getBlockValue(rigRoot, "TardisFlightActive") == true then return true end
-    return currentFade > 0.001
-end
-
-print("TARDIS time rotor blocks:", #timeRotorParts)
-print("TARDIS time rotor tweening:", timeRotorTweening)
-
--- Safety fallback only if TweenService is unavailable in the UB/Fiu sandbox.
-local function updateTimeRotorFallback()
-    if timeRotorTweening or not timeRotorRunning or #timeRotorParts == 0 then return end
-
-    local elapsed = os.clock() - timeRotorFallbackStartTime
-    local cycleSeconds = TIME_ROTOR_TWEEN_TIME * 2
-    local offsetY = (0.5 + 0.5 * math.sin(
-        elapsed * math.pi * 2 / cycleSeconds - math.pi / 2
-    )) * TIME_ROTOR_TRAVEL
-
-    for _, part in ipairs(timeRotorParts) do
-        local base = timeRotorFallbackBases[part]
-        if base then
-            pcall(function()
-                part.CFrame = base + Vector3.new(0, offsetY, 0)
-            end)
+        if pendingDestination then
+            local destination=pendingDestination
+            pendingDestination=nil
+            if move(destination) then
+                lastVisiblePivot=destination
+                changePhase("SHOWING",t.quick)
+                return
+            end
+        end
+        setBusy(false)
+        showMessage("DEMATERIALIZED")
+    else
+        setFinalFade(0)
+        phase="SOLID"
+        lastVisiblePivot=readCF(rootBlock) or lastVisiblePivot
+        setBusy(false)
+        showMessage("MATERIALIZED")
+        if t.quick then
+            startAudio("endFast")
+            quickStingUntil=os.clock()+2.8
+        else
+            stopAudio()
         end
     end
+    processQueued()
+end
+local function updateTransition(now)
+    local t=transition
+    if not t then
+        if quickStingUntil>0 and now>=quickStingUntil then
+            quickStingUntil=0
+            stopAudio()
+        end
+        return
+    end
+    local wall=now-t.started
+    local duration=t.quick and QUICK_SECONDS or NORMAL_SECONDS
+    local soundTime,length=audioClock()
+    if length and length>MIN_SOUND_LENGTH then
+        local visualLength=math.max(.3,length-(t.quick and .25 or SOUND_TAIL))
+        duration=t.quick and math.min(duration,visualLength) or visualLength
+    end
+    local progress=math.clamp(wall/math.max(.3,duration),0,1)
+    -- Audio is preferred while it actually advances, but wall time is the
+    -- safety clock. A stalled/unloaded SoundBlock can never freeze the box.
+    if soundTime and soundTime>0 then
+        progress=math.max(progress,math.clamp(
+            soundTime/math.max(.3,duration),0,1))
+    end
+    local shaped=math.pow(progress,t.quick and .48 or .68)
+    currentFade=t.from+(t.target-t.from)*shaped
+    if now-lastFade>=1/FADE_HZ or progress>=1 then
+        lastFade=now
+        setFade(currentFade,wave(soundTime or wall))
+    end
+    if progress>=1 then finishTransition() end
+end
+local function updateRotor(now,dt)
+    if #rotor==0 or now-lastRotor<1/ROTOR_HZ then return end
+    local elapsed=math.max(0,now-lastRotor)
+    lastRotor=now
+    if phase=="SOLID" then return end
+    rotorTime=rotorTime+math.min(elapsed,.1)
+    local cycle=(rotorTime/2.8)%1
+    local triangle=cycle<.5 and 2*cycle or 2-2*cycle
+    local smooth=triangle*triangle*(3-2*triangle)
+    local rise=6*smooth
+    for _,block in ipairs(rotor) do
+        local base=rotorBase[block]
+        if base then pcall(function() block.CFrame=base+Vector3.new(0,rise,0) end) end
+    end
 end
 
+local lastPulse={e=false,f=false,j=false}
+local latch=nil
+local lastLoop=os.clock()
+emit("b",false)
+if phase=="HIDDEN" then setFinalFade(1) else setFinalFade(0) end
+showMessage(VERSION.." / "..phase.." / NAV ONLY")
 while true do
-    local eState = getOptionalBoolInput(inputE)
-    if eState and not lastEState and not autoSequence then
-        startQuickRecall()
-    end
-    lastEState = eState
+    local now=os.clock()
+    local dt=math.clamp(now-lastLoop,.001,.1)
+    lastLoop=now
 
-    local fState = getOptionalBoolInput(inputF)
-    if fState and not lastFState and not autoSequence then
-        startQuickDestination()
-    end
-    lastFState = fState
-
-    local jState = inputJ:GetState() == true
-    if jState and not lastJState and not autoSequence then
-        startAutoRecall()
-    end
-    lastJState = jState
-
-    if not autoSequence then
-        local newState = inputA:GetState() == true
-        if newState ~= lastInputState then
-            lastInputState = newState
-            if newState then
-                requestMaterialize("manual_materialize")
-            else
-                requestDemat("manual_demat")
+    local a,aOK=state("a")
+    if aOK and type(a)=="boolean" then
+        if latch==nil then
+            -- Startup unreadability cannot trigger accidental relocation.
+            latch=a
+            if a and phase=="HIDDEN" then
+                beginCommand({kind="SHOW",target=destinationFromInputs()})
+            elseif not a and phase=="SOLID" then
+                beginCommand({kind="HIDE"})
             end
+        elseif a~=latch then
+            latch=a
+            local d=state("d")
+            beginCommand({kind=a and "SHOW" or "HIDE",
+                quick=d==true,
+                target=a and destinationFromInputs() or nil})
         end
     end
-
-    updateTransition()
-    setTimeRotorRunning(shouldRunTimeRotor())
-    updateTimeRotorFallback()
-    task.wait(MAIN_UPDATE_INTERVAL)
+    for _,letter in ipairs({"e","f","j"}) do
+        local value,ok=state(letter)
+        if ok and type(value)=="boolean" then
+            if value and not lastPulse[letter] then
+                local fast=state("d")
+                if letter=="e" then
+                    beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
+                elseif letter=="j" then
+                    beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=false})
+                else
+                    beginCommand({kind="TRAVEL",
+                        target=destinationFromInputs(),quick=fast==true})
+                end
+            end
+            lastPulse[letter]=value
+        end
+    end
+    updateTransition(now)
+    updateRotor(now,dt)
+    task.wait(LOOP)
 end
