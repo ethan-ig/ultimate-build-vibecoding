@@ -1,4 +1,4 @@
--- TARDIS CONTROLLER 2.0 | Ultimate Build FIU | navigation-first
+-- TARDIS CONTROLLER 2.1 | Ultimate Build FIU | navigation-first
 -- This script is NOT a manual flight system. No raw root flight, no new welds.
 --
 -- INPUTS
@@ -8,6 +8,7 @@
 -- D (optional boolean level): fast sound/effects for subsequent commands.
 -- E (optional boolean PULSE): quick recall to your character.
 -- F (optional boolean PULSE): travel to C (fallback B).
+-- G (optional boolean PULSE): full demat -> remat at SAME saved position.
 -- J (optional boolean PULSE): normal recall to your character.
 -- OUTPUTS (all optional): A=status string, B=transition busy, C=exterior pivot.
 --
@@ -15,7 +16,7 @@
 -- exterior. No client-created weld is trusted for server replication.
 -- Restore a healthy saved build if a previous experiment scattered its shell.
 
-local VERSION = "CONTROLLER 2.0"
+local VERSION = "CONTROLLER 2.1"
 local SHELL = "tardis"
 local SOUND_OUT = "tardismatsound"
 local SOUND_IN = "interiortardismatsound"
@@ -44,7 +45,7 @@ local function port(tableName, letter)
 end
 local input = {}
 local output = {}
-for _, letter in ipairs({"a","b","c","d","e","f","j"}) do
+for _, letter in ipairs({"a","b","c","d","e","f","g","j"}) do
     input[letter] = port("inputs",letter)
 end
 for _, letter in ipairs({"a","b","c"}) do
@@ -640,6 +641,7 @@ local function destinationFromInputs()
         targetPlayer and targetPlayer~="" and toPlayer(targetPlayer) or nil)
 end
 
+
 local function changePhase(to,quick)
     transition={
         from=currentFade,
@@ -699,6 +701,36 @@ local function beginCommand(command)
         end
     end
 end
+-- G is an independent full effects cycle, not a coordinate command.
+-- Capture the actual displayed pivot BEFORE hiding. Using C would move
+-- the box to the last map destination even when the user only wants the
+-- classic dematerialize/rematerialize effect.
+local function cycleInPlace()
+    if phase=="HIDING" or phase=="SHOWING" or busy then
+        showMessage("CYCLE BUSY / PULSE G AGAIN AFTER COMPLETION")
+        return
+    end
+    local fast=select(1,state("d"))==true
+    if phase=="SOLID" then
+        local here=readCF(rootBlock)
+        if not here then
+            showMessage("CYCLE REFUSED / CURRENT EXTERIOR POSITION UNREADABLE")
+            return
+        end
+        lastVisiblePivot=here
+        showMessage("CYCLE START / RETURN TO SAME POSITION")
+        beginCommand({kind="TRAVEL",target=here,quick=fast})
+    elseif phase=="HIDDEN" then
+        if not lastVisiblePivot then
+            showMessage("CYCLE REFUSED / NO LAST VISIBLE POSITION")
+            return
+        end
+        showMessage("CYCLE / REMATERIALIZE AT LAST VISIBLE POSITION")
+        beginCommand({kind="SHOW",target=lastVisiblePivot,quick=fast})
+    end
+end
+
+
 local function processQueued()
     local cmd=queued
     queued=nil
@@ -787,7 +819,13 @@ local function updateRotor(now,dt)
     end
 end
 
-local lastPulse={e=false,f=false,j=false}
+local lastPulse={e=false,f=false,g=false,j=false}
+-- Do not treat an already-high G input on script startup as a new pulse.
+-- It must go low, then high, to start a cycle.
+do
+    local startupG, readable=state("g")
+    if readable and type(startupG)=="boolean" then lastPulse.g=startupG end
+end
 local latch=nil
 local lastLoop=os.clock()
 emit("b",false)
@@ -816,7 +854,7 @@ while true do
                 target=a and destinationFromInputs() or nil})
         end
     end
-    for _,letter in ipairs({"e","f","j"}) do
+    for _,letter in ipairs({"e","f","g","j"}) do
         local value,ok=state(letter)
         if ok and type(value)=="boolean" then
             if value and not lastPulse[letter] then
@@ -825,6 +863,8 @@ while true do
                     beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
                 elseif letter=="j" then
                     beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=false})
+                elseif letter=="g" then
+                    cycleInPlace()
                 else
                     beginCommand({kind="TRAVEL",
                         target=destinationFromInputs(),quick=fast==true})
