@@ -97,6 +97,7 @@ local function showMessage(message)
     print("TARDIS:", message)
     emit("a", message)
 end
+local rootRaw = nil
 local function rootFlag(name, value)
     if rootRaw then pcall(function() rootRaw:SetAttribute(name,value) end) end
 end
@@ -132,7 +133,9 @@ exteriorSound, interiorSound = firstNamed(SOUND_OUT), firstNamed(SOUND_IN)
 roofLight, portal = firstNamed(LIGHT), firstNamed(PORTAL)
 for _, block in ipairs(named[SHELL] or {}) do add(shell,block) end
 for _, block in ipairs(shell) do add(moving,block); add(faded,block) end
-for _, block in ipairs({exteriorSound,roofLight,portal}) do add(moving,block) end
+add(moving,exteriorSound)
+add(moving,roofLight)
+add(moving,portal)
 if exteriorSound then add(faded,exteriorSound) end
 for _, block in ipairs(named[ROTOR] or {}) do add(rotor,block) end
 
@@ -171,7 +174,8 @@ for _, block in ipairs(shell) do
     end
 end
 local bottomOffset = lowestBottom < math.huge and lowestBottom-originalPivot.Position.Y or -7
-local rootBlock, rootRaw = shell[1], shell[1] and raw(shell[1]) or nil
+local rootBlock = shell[1]
+rootRaw = shell[1] and raw(shell[1]) or nil
 local rotorBase = {}
 for _, block in ipairs(rotor) do rotorBase[block]=readCF(block) end
 
@@ -343,7 +347,7 @@ local function startAudio(key)
     soundStarted=os.clock()
 end
 local function audioClock()
-    for _,sound in ipairs({realOuter,exteriorSound}) do
+    for _,sound in pairs({realOuter,exteriorSound}) do
         if sound then
             local t=tonumber(prop(sound,"TimePosition"))
             local length=tonumber(prop(sound,"TimeLength"))
@@ -517,7 +521,9 @@ local function coordinateTarget()
     return groundPivot(parsed,true)
 end
 local function destinationFromInputs()
-    return coordinateTarget() or toPlayer(select(1,state("b")))
+    local playerName, readable = state("b")
+    local targetPlayer = readable and type(playerName)=="string" and playerName or nil
+    return coordinateTarget() or (targetPlayer and toPlayer(targetPlayer) or nil)
 end
 
 local function changePhase(to,quick)
