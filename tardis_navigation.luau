@@ -292,8 +292,17 @@ local function corner(parent,r)
     end)
 end
 local function connectButton(b,callback)
-    local ok=pcall(function() b.Activated:Connect(callback) end)
-    if not ok then pcall(function() b.MouseButton1Click:Connect(callback) end) end
+    -- Some FIU UI proxies accept Activated connections but never dispatch
+    -- them. Listen to both events, debouncing their duplicate click reports.
+    local last=0
+    local function fire()
+        local now=os.clock()
+        if now-last<.22 then return end
+        last=now
+        callback()
+    end
+    pcall(function() b.Activated:Connect(fire) end)
+    pcall(function() b.MouseButton1Click:Connect(fire) end)
 end
 local open,close,commit
 local function buildGui()
