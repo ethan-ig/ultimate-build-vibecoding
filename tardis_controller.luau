@@ -340,6 +340,9 @@ end
 
 local hiddenPivot = CFrame.new(HIDDEN)*defaultRotation
 local phase = (originalPivot.Position-HIDDEN).Magnitude < 95 and "HIDDEN" or "SOLID"
+-- A fresh code block cannot recover the last visible location from a box
+-- already saved off-map. Refuse an unsafe hidden-location rematerialization.
+if phase=="HIDDEN" then lastVisiblePivot=nil end
 local currentFade = phase=="HIDDEN" and 1 or 0
 local pendingDestination, queued, transition = nil,nil,nil
 local rotorTime,lastRotor,lastFade = 0,0,0
@@ -710,7 +713,8 @@ local function cycleInPlace()
         showMessage("CYCLE BUSY / PULSE G AGAIN AFTER COMPLETION")
         return
     end
-    local fast=select(1,state("d"))==true
+    local fastValue, fastReadable=state("d")
+    local fast=fastReadable and fastValue==true
     if phase=="SOLID" then
         local here=readCF(rootBlock)
         if not here then
@@ -822,9 +826,13 @@ end
 local lastPulse={e=false,f=false,g=false,j=false}
 -- Do not treat an already-high G input on script startup as a new pulse.
 -- It must go low, then high, to start a cycle.
+local gInitialized=false
 do
     local startupG, readable=state("g")
-    if readable and type(startupG)=="boolean" then lastPulse.g=startupG end
+    if readable and type(startupG)=="boolean" then
+        lastPulse.g=startupG
+        gInitialized=true
+    end
 end
 local latch=nil
 local lastLoop=os.clock()
@@ -857,7 +865,11 @@ while true do
     for _,letter in ipairs({"e","f","g","j"}) do
         local value,ok=state(letter)
         if ok and type(value)=="boolean" then
-            if value and not lastPulse[letter] then
+            if letter=="g" and not gInitialized then
+                -- First readable state is a baseline, never a fresh pulse.
+                gInitialized=true
+                lastPulse.g=value
+            elseif value and not lastPulse[letter] then
                 local fast=state("d")
                 if letter=="e" then
                     beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
