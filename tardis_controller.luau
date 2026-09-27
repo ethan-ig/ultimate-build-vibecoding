@@ -124,6 +124,11 @@ end
 local function firstNamed(name)
     local list = named[name]
     if not list then return nil end
+    -- Prefer the editable Ultimate Build proxy over its underlying BasePart.
+    for _, item in ipairs(list) do
+        local r=raw(item)
+        if r and r~=item and readCF(item) then return item end
+    end
     for _, item in ipairs(list) do
         if readCF(item) then return item end
     end
@@ -131,7 +136,18 @@ local function firstNamed(name)
 end
 exteriorSound, interiorSound = firstNamed(SOUND_OUT), firstNamed(SOUND_IN)
 roofLight, portal = firstNamed(LIGHT), firstNamed(PORTAL)
-for _, block in ipairs(named[SHELL] or {}) do add(shell,block) end
+local seenShell={}
+for pass=1,2 do
+    for _,block in ipairs(named[SHELL] or {}) do
+        local r=raw(block) or block
+        local isProxy=r~=block
+        if ((pass==1 and isProxy) or (pass==2 and not isProxy))
+            and not seenShell[r] and readCF(block) then
+            seenShell[r]=true
+            add(shell,block)
+        end
+    end
+end
 for _, block in ipairs(shell) do add(moving,block); add(faded,block) end
 add(moving,exteriorSound)
 add(moving,roofLight)
@@ -370,6 +386,7 @@ end
 local function move(pivot)
     -- One immutable pivot, no root-only writes. This runs only while hidden.
     if not pivot then return false end
+    local old=readCF(rootBlock)
     local count=0
     for i,block in ipairs(moving) do
         local offset=offsets[block]
@@ -380,7 +397,16 @@ local function move(pivot)
         if i%24==0 then task.wait() end
     end
     if count~=#moving then
-        showMessage("MOVE FAILED: "..count.."/"..#moving.." PROXIES")
+        -- Best-effort rollback of a partial teleport, keeping the last
+        -- known exterior intact instead of announcing successful travel.
+        if old then
+            for i,block in ipairs(moving) do
+                local offset=offsets[block]
+                if offset then pcall(function() block.CFrame=old*offset end) end
+                if i%24==0 then task.wait() end
+            end
+        end
+        showMessage("MOVE FAILED: "..count.."/"..#moving.." PROXIES / ROLLBACK")
         return false
     end
     emit("c",pivot)
@@ -523,7 +549,8 @@ end
 local function destinationFromInputs()
     local playerName, readable = state("b")
     local targetPlayer = readable and type(playerName)=="string" and playerName or nil
-    return coordinateTarget() or (targetPlayer and toPlayer(targetPlayer) or nil)
+    return coordinateTarget() or (
+        targetPlayer and targetPlayer~="" and toPlayer(targetPlayer) or nil)
 end
 
 local function changePhase(to,quick)
