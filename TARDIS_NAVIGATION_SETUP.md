@@ -43,7 +43,7 @@ Connect a momentary button's TRUE pulse directly to **Controller Input G**. Tap 
 3. Move the invisible exterior through the usual hidden stage, then return it to that exact saved location.
 4. Play the rematerialization sound and fade the exterior back in, automatically.
 
-You do **not** have to hold the button or change Input A. Input D controls normal vs. quick timing for this cycle. Repeated pulses while a transition is active are ignored, protecting an already-running sequence. If the box is already hidden, G simply rematerializes it at the last visible location. A held-high input triggers only on its rising edge; release it before pressing again.
+You do **not** have to hold the button or change Input A. Input D controls normal vs. quick timing for this cycle. Repeated pulses while a transition is active are ignored, protecting an already-running sequence. If the box is already hidden, G rematerializes it at the last known visible location. If the controller was freshly restarted while the exterior was saved off-map and has no such location, it refuses rather than rematerializing off-map. A held-high input triggers only on its rising edge; release it before pressing again. Make each TRUE pulse at least 0.1 seconds so FIU's polling loop reliably sees it.
 
 **Input F still performs destination travel.** Use G for the classic dematerialize/rematerialize effect without traveling. Navigation wiring A→C and B→F is unchanged.
 
