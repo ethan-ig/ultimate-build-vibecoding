@@ -166,7 +166,23 @@ for pass=1,2 do
         end
     end
 end
-for _, block in ipairs(shell) do add(moving,block); add(faded,block) end
+local originalPivot = shell[1] and readCF(shell[1]) or nil
+-- A misnamed portal, lamp, or speaker elsewhere in the map must never be
+-- teleported with the shell. Sound-only blocks without a CFrame can still play.
+local function exteriorAccessory(block,role)
+    if not block then return nil end
+    local cf=readCF(block)
+    if cf and originalPivot and
+        (cf.Position-originalPivot.Position).Magnitude>SHELL_RADIUS_LIMIT then
+        print("TARDIS: SKIPPING DISTANT "..role.." / not part of exterior")
+        return nil
+    end
+    return block
+end
+exteriorSound=exteriorAccessory(exteriorSound,"SOUND")
+roofLight=exteriorAccessory(roofLight,"ROOF LIGHT")
+portal=exteriorAccessory(portal,"PORTAL")
+for _,block in ipairs(shell) do add(moving,block); add(faded,block) end
 add(moving,exteriorSound)
 add(moving,roofLight)
 add(moving,portal)
@@ -190,11 +206,11 @@ for pass=1,2 do
     end
 end
 
-local originalPivot = shell[1] and readCF(shell[1]) or nil
 local lastVisiblePivot = originalPivot
 local defaultRotation = originalPivot and (originalPivot-originalPivot.Position) or CFrame.identity
 local lowestBottom = math.huge
 local lightAlpha = tonumber(prop(roofLight,"Transparency")) or 0
+local portalAlpha = math.clamp(tonumber(prop(portal,"Transparency")) or 0,0,1)
 local lightBrightness = tonumber(prop(roofLight,"Brightness")) or 2
 local eligible, failure = originalPivot ~= nil and #shell >= MIN_SHELL, nil
 if not eligible then failure="shell not found or incomplete" end
@@ -366,7 +382,8 @@ local function setFade(fade,wave)
         put(roofLight,"Brightness",math.max(0,
             lightBrightness*visibility*(.15+3.3*wave)))
     end
-    if portal then put(portal,"Transparency",1) end
+    if portal then put(portal,"Transparency",
+        portalAlpha+(1-portalAlpha)*fade) end
 end
 local function setFinalFade(fade)
     currentFade=fade
@@ -378,7 +395,8 @@ local function setFinalFade(fade)
         put(roofLight,"Transparency",fade>=1 and 1 or lightAlpha)
         put(roofLight,"Brightness",fade>=1 and 0 or lightBrightness)
     end
-    if portal then put(portal,"Transparency",1) end
+    if portal then put(portal,"Transparency",
+        portalAlpha+(1-portalAlpha)*fade) end
 end
 setFinalFade(currentFade)
 
@@ -390,17 +408,25 @@ local function soundInput(block)
     end
     return nil
 end
+-- FIU's custom namecall bridge rejects Fire/FireInput (sometimes
+-- asynchronously). SetState is the supported and failure-reporting path.
+local warnedSoundPorts={}
 local function powerSound(block,on)
     if not block then return false end
     local p=soundInput(block)
-    if p then
-        if pcall(function() p:Fire(on,true) end) then return true end
-        if pcall(function() p:SetState(on) end) then return true end
+    if not p then
+        if not warnedSoundPorts[block] then
+            warnedSoundPorts[block]=true
+            print("TARDIS SOUND: no input port on",tostring(prop(block,"DisplayName")))
+        end
+        return false
     end
-    for _,key in ipairs({"Input","input","Toggle","a"}) do
-        if pcall(function() block:FireInput(key,on) end) then return true end
+    local ok,err=pcall(function() p:SetState(on) end)
+    if not ok and not warnedSoundPorts[block] then
+        warnedSoundPorts[block]=true
+        print("TARDIS SOUND: SetState failed:",tostring(err))
     end
-    return false
+    return ok
 end
 local function actualSound(block)
     local r=raw(block)
@@ -673,7 +699,14 @@ local function beginCommand(command)
         end
     elseif command.kind=="SHOW" then
         if phase=="HIDDEN" then
-            local dest=command.target or lastVisiblePivot
+            local dest=command.target
+            if not dest and lastVisiblePivot and
+                (lastVisiblePivot.Position-HIDDEN).Magnitude>95 then
+                dest=lastVisiblePivot
+            end
+            -- If the build boots in staging with A already high and C is
+            -- empty, show beside the player, not 2,000 studs off-map.
+            if not dest then dest=toPlayer(nil) end
             if not dest or not move(dest) then
                 showMessage("SHOW FAILED / DESTINATION UNAVAILABLE")
                 return
@@ -712,7 +745,16 @@ local function finishTransition()
         setFinalFade(1)
         phase="HIDDEN"
         if not move(hiddenPivot) then
-            setBusy(false); showMessage("HIDE MOVE FAILED / STOPPED"); return
+            -- A failed hide must not leave a visible shell stuck invisible
+            -- while the controller claims it is safely staged elsewhere.
+            phase="SOLID"
+            pendingDestination=nil
+            setFinalFade(0)
+            stopAudio()
+            setBusy(false)
+            showMessage("HIDE MOVE FAILED / FADE RESTORED; INSPECT EXTERIOR")
+            processQueued()
+            return
         end
         if pendingDestination then
             local destination=pendingDestination
@@ -722,8 +764,10 @@ local function finishTransition()
                 changePhase("SHOWING",t.quick)
                 return
             end
+            showMessage("TRAVEL FAILED / EXTERIOR STAYS HIDDEN")
         end
         setBusy(false)
+        stopAudio()
         showMessage("DEMATERIALIZED")
     else
         setFinalFade(0)

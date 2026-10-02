@@ -79,6 +79,7 @@ local function camera()
 end
 
 local opened=false
+local committing=false
 local previousCamera=nil
 local navCenter,desiredCenter=Vector3.zero,Vector3.zero
 local height,desiredHeight=NAV_HEIGHT,NAV_HEIGHT
@@ -406,7 +407,7 @@ close=function(reason)
     if reason then print("TARDIS NAV:",reason) end
 end
 open=function()
-    if opened then return end
+    if opened or committing then return end
     local cam=camera()
     if not cam then log("CAMERA UNAVAILABLE"); return end
     if not screen then buildGui() end
@@ -436,7 +437,20 @@ open=function()
     log("LEFT CLICK TO PREVIEW A LANDING")
 end
 local function selectLand()
-    if not opened or rightHeld then return end
+    if not opened or rightHeld or committing then return end
+    -- A GUI click isn't a map click, including in FIU runtimes that do
+    -- not reliably set the UserInputService gameProcessed flag.
+    local pointOnScreen=cursor()
+    if pointOnScreen and panel then
+        local ok,pos,size=pcall(function()
+            return panel.AbsolutePosition,panel.AbsoluteSize
+        end)
+        if ok and pos and size and
+            pointOnScreen.X>=pos.X and pointOnScreen.X<=pos.X+size.X and
+            pointOnScreen.Y>=pos.Y and pointOnScreen.Y<=pos.Y+size.Y then
+            return
+        end
+    end
     local now=os.clock()
     if now-lastSelect<.16 then return end
     lastSelect=now
@@ -452,13 +466,16 @@ local function selectLand()
     log("PIN SET / CONFIRM TRAVEL OR CANCEL")
 end
 commit=function()
+    if committing then return end
     if not opened or not selected then
         log("SELECT A DESTINATION FIRST")
         return
     end
+    committing=true
     local p=selected
     local hint=Vector3.new(p.X,p.Y-Y_HINT_BIAS,p.Z)
     if not emit(destinationOutput,hint) then
+        committing=false
         log("OUTPUT A MISSING / WIRE TO CONTROLLER C")
         return
     end
@@ -475,6 +492,7 @@ commit=function()
     else
         print("TARDIS NAV: B not wired; pulse controller F to travel")
     end
+    committing=false
 end
 
 local function zoom(value)
