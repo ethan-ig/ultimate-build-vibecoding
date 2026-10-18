@@ -59,7 +59,9 @@ end
 local function inputState()
     if not toggleInput then return nil end
     local ok,value=pcall(function() return toggleInput:GetState() end)
-    if ok and value~=nil then return asSwitch(value) end
+    -- NIL can be an intentional pulse release. Respect it, rather than
+    -- falling back to a stale cached State/Value property.
+    if ok then return asSwitch(value) end
     for _,key in ipairs({"State","Value"}) do
         ok,value=pcall(function() return toggleInput[key] end)
         if ok and value~=nil and type(value)~="function" then
