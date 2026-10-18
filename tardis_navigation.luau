@@ -568,6 +568,9 @@ local keyboardMouseOK=false
 if UIS then
     keyboardMouseOK=pcall(function()
         UIS.InputBegan:Connect(function(key,processed)
+            -- The NAV button must be clickable even while the map is closed.
+            if key.UserInputType==Enum.UserInputType.MouseButton1
+                and clickGuiAt(cursor()) then return end
             if not opened then return end
             if key.KeyCode==Enum.KeyCode.Escape then
                 close("CANCELLED"); return
