@@ -223,3 +223,29 @@ closed by navigation actions, or `map was CLOSED` after travel.
 If `true -> nil` happens but no accepted pulse appears, check
 whether the script is still running and whether GUI/camera operations
 logged failures. Live FIU testing is still required.
+
+## Controller buttons E/F/J: repeatable FIU pulses
+
+The same `true -> nil` issue also affected Controller inputs **E**, **F**,
+and **J**. A first pulse was accepted, but the code previously skipped a
+`nil` readback without rearming its edge detector, so the next press
+was ignored. Controller pulse inputs now interpret `nil` as **not
+asserted** (the equivalent of a release), just like an explicit
+`false`. A short 0.25-second duplicate-event guard prevents one
+button action from double-firing across multiple socket callbacks.
+
+Level-controlled inputs **A** (materialization) and **D** (fast mode)
+keep their level semantics. An unconnected/`nil` value must **not**
+instruct the TARDIS to dematerialize.
+
+After installing **both updated Code Blocks**, press an E/F/J button,
+let go, and press again. Watch the controller log for
+`TARDIS INPUT E/F/J PULSE ACCEPTED` and
+`TARDIS INPUT E/F/J PULSE REARMED (NIL)` (or `(FALSE)`).
+Navigation Input A now prints `NIL / rearmed after pulse`
+when its readback returns to nil.
+
+The input behavior was inferred from live in-game screenshots of
+`nil -> true -> nil`. Roblox FIU runtime verification is required
+after installation; code/asset structure checks are not a substitute
+for trying the physical controls.
