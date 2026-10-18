@@ -156,3 +156,37 @@ For initial testing, use a variable or switch to send FALSE for
 after confirming travel. Test NAV / MAP on-screen as an independent
 path. If neither method reopens the map, inspect the navigation
 Code Block logs to find whether it is still running.
+
+## Navigation Input A: readback versus actual button press
+
+The startup line `initial=false` reports **one startup sample**. A later
+`GetState()==true` does not establish that the physical button is held;
+the socket readback may keep its last value after a short pulse.
+
+The navigation script now prefers meaningful `Pressed`, `Released` and
+`StateChanged` events, when those events exist and dispatch in Ultimate
+Build. The generic `Changed` notification is **not** a new press event.
+After the first real input event is seen, polling no longer treats a
+latched TRUE readback as a fresh press; polling still detects FALSE to
+rearm. Environments without working input events keep the edge-detected
+polling fallback.
+
+Observe these lines in the Navigation Code Block's output:
+- `TARDIS NAV INPUT A EVENT: PRESSED ...` or
+  `STATECHANGED value=true` means a press was delivered to the script.
+- `TARDIS NAV INPUT A EVENT: RELEASED ...` or
+  `STATECHANGED value=false` means a release was delivered.
+- `TARDIS NAV A GetState CHANGED: ...` records changes in the socket's
+  **readback**, which may lag behind or differ from received events.
+- `TARDIS NAV A READBACK REMAINS TRUE` means exactly that. It is not
+  a claim about the physical button.
+
+To isolate input wiring from camera and travel, press the on-screen
+`NAV / MAP` button twice. Then press the wired control twice and
+compare the event and readback messages. If no release **event** and no
+FALSE readback is ever delivered, the script cannot distinguish the
+next press from a switch continuously held TRUE; the source must send a
+release or a distinct new press event.
+
+These changes have not been exercised inside a live Ultimate Build
+session. No HTTP loader or dynamic string execution is involved.
