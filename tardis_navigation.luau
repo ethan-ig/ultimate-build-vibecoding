@@ -59,7 +59,9 @@ end
 local function inputState()
     if not toggleInput then return nil end
     local ok,value=pcall(function() return toggleInput:GetState() end)
-    if ok and value~=nil then return asSwitch(value) end
+    -- NIL can be an intentional pulse release. Respect it, rather than
+    -- falling back to a stale cached State/Value property.
+    if ok then return asSwitch(value) end
     for _,key in ipairs({"State","Value"}) do
         ok,value=pcall(function() return toggleInput[key] end)
         if ok and value~=nil and type(value)~="function" then
@@ -628,17 +630,16 @@ end
 buildGui()
 -- Navigation Input A is a momentary action. Never mistake a readback level
 -- for proof of the physical button's current position.
-local lastA=inputState()
-if lastA==nil then lastA=false end
-local lastReadback=lastA
+local initialReadback=inputState()
+local lastA=initialReadback==true
+local lastReadback=initialReadback
 local lastAcceptedPulse=-math.huge
 local PULSE_DEBOUNCE=.30
-local sawActionEvent=false
 local highSince=lastA and os.clock() or nil
 local warnedHigh=false
 print("TARDIS NAV START:",
     toggleInput and "INPUT A FOUND" or "INPUT A NOT FOUND",
-    "initial="..tostring(lastA),
+    "initial="..tostring(initialReadback),
     player and ("local player="..tostring(player.Name))
         or "NO LOCAL PLAYER / SERVER OR RESTRICTED CONTEXT",
     camera() and "CAMERA FOUND" or "NO CAMERA")
@@ -662,8 +663,7 @@ end
 local function onToggle(value,source)
     value=asSwitch(value)
     if value==nil then return end
-    if source~="POLL" then
-        sawActionEvent=true
+    if source=="PRESSED" or source=="RELEASED" or source=="STATECHANGED" then
         print("TARDIS NAV INPUT A EVENT:",source,
             "value="..tostring(value),
             "GetState="..tostring(inputState()))
@@ -714,18 +714,28 @@ while true do
     lastLoop=now
     if toggleInput then
         local readback=inputState()
-        if readback~=lastReadback then
+        local previousReadback=lastReadback
+        if readback~=previousReadback then
             print("TARDIS NAV A GetState CHANGED:",
-                tostring(lastReadback),"->",tostring(readback))
-            lastReadback=readback
+                tostring(previousReadback),"->",tostring(readback))
         end
-        -- Events, once observed, are more reliable than a potentially
-        -- latched GetState readback. A polled FALSE can still rearm.
-        if not sawActionEvent then
-            onToggle(readback,"POLL")
-        elseif readback==false and lastA then
+        -- FIU pulse sockets can return TRUE for a pulse and NIL after
+        -- it ends, rather than returning explicit FALSE. NIL here is an
+        -- empty socket readback, not proof the physical button is held.
+        -- Crucially, an observed TRUE -> NIL must REARM the pulse latch.
+        -- Also handle events that delivered TRUE between poll iterations:
+        -- their next readback can already be NIL.
+        if readback==nil and lastA then
+            print("TARDIS NAV INPUT A: NIL / rearmed after pulse")
             onToggle(false,"POLL")
+        elseif readback==false and previousReadback~=false then
+            onToggle(false,"POLL")
+        elseif readback==true and previousReadback~=true then
+            -- Only a new readback edge may trigger a press. A stale
+            -- high readback after a Released event must not retrigger.
+            onToggle(true,"POLL")
         end
+        lastReadback=readback
         if readback==true then
             if not highSince then highSince=now end
             if not warnedHigh and now-highSince>=2 then

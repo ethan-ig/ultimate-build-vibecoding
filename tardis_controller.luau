@@ -67,8 +67,10 @@ local function state(letter)
     local p=input[letter]
     if not p then return nil,false end
     local ok,value=pcall(function() return p:GetState() end)
-    if ok and value~=nil then return value,true end
-    -- Some socket proxies expose their state as a property instead.
+    -- An explicitly successful NIL from FIU means no active pulse.
+    -- Do not replace it with a potentially stale State/Value property.
+    if ok then return value,true end
+    -- Fall back to properties only if GetState itself is unavailable.
     for _,key in ipairs({"State","Value"}) do
         ok,value=pcall(function() return p[key] end)
         if ok and value~=nil and type(value)~="function" then
@@ -817,8 +819,11 @@ end
 -- Seed the edge detectors from the actual socket levels. Starting a Code
 -- Block while a switch is already ON must not fire a phantom command.
 local lastPulse={}
+local lastPulseTime={}
+local PULSE_DEBOUNCE=.25
 for _,letter in ipairs({"e","f","j"}) do
     lastPulse[letter]=asSwitch(select(1,state(letter)))==true
+    lastPulseTime[letter]=-math.huge
 end
 local latch=asSwitch(select(1,state("a")))
 local lastLoop=os.clock()
@@ -837,43 +842,57 @@ local function onMaterialize(value)
     })
 end
 local function onPulse(letter,value)
-    value=asSwitch(value)
-    if value==nil then return end
-    if value and not lastPulse[letter] then
-        local fast=asSwitch(select(1,state("d")))==true
-        if letter=="e" then
-            beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
-        elseif letter=="j" then
-            beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=false})
-        else
-            beginCommand({kind="TRAVEL",
-                target=destinationFromInputs(),quick=fast})
+    -- FIU momentary/pulse ports often return NIL between presses, not FALSE.
+    -- Unlike level inputs A/D, NIL means the pulse is no longer asserted.
+    -- Failing to clear lastPulse here made E/F/J work exactly once.
+    local active=asSwitch(value)==true
+    if active and not lastPulse[letter] then
+        local now=os.clock()
+        if now-lastPulseTime[letter]>=PULSE_DEBOUNCE then
+            lastPulseTime[letter]=now
+            local fast=asSwitch(select(1,state("d")))==true
+            if letter=="e" then
+                beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
+            elseif letter=="j" then
+                beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=false})
+            else
+                beginCommand({kind="TRAVEL",
+                    target=destinationFromInputs(),quick=fast})
+            end
+            print("TARDIS INPUT",letter:upper(),"PULSE ACCEPTED")
         end
+    elseif not active and lastPulse[letter] then
+        print("TARDIS INPUT",letter:upper(),
+            "PULSE REARMED",value==nil and "(NIL)" or "(FALSE)")
     end
-    lastPulse[letter]=value
+    lastPulse[letter]=active
 end
 
--- Use socket events when FIU exposes them, with polling as a fallback.
--- Event delivery catches button pulses shorter than the main loop tick.
-local function watchInput(letter,handler)
+-- Prefer semantic press/release events when FIU exposes them; polling
+-- also catches TRUE -> NIL pulses. Do not subscribe to generic Changed:
+-- unrelated property updates must not look like new button presses.
+local function watchInput(letter,handler,isPulse)
     local p=input[letter]
     if not p then return end
     pcall(function()
         p.StateChanged:Connect(function(value)
-            if asSwitch(value)==nil then value=select(1,state(letter)) end
+            if value==nil then value=select(1,state(letter)) end
             handler(value)
         end)
     end)
-    pcall(function()
-        p.Changed:Connect(function()
-            handler(select(1,state(letter)))
+    if isPulse then
+        pcall(function()
+            p.Pressed:Connect(function() handler(true) end)
         end)
-    end)
+        pcall(function()
+            p.Released:Connect(function() handler(false) end)
+        end)
+    end
 end
-watchInput("a",onMaterialize)
+watchInput("a",onMaterialize,false)
 for _,letter in ipairs({"e","f","j"}) do
     local key=letter
-    watchInput(key,function(value) onPulse(key,value) end)
+    watchInput(key,function(value) onPulse(key,value) end,true)
 end
 
 emit("b",false)
