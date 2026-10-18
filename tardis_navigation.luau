@@ -724,7 +724,7 @@ while true do
         if not sawActionEvent then
             onToggle(readback,"POLL")
         elseif readback==false and lastA then
-            onToggle(false,"POLL RELEASE")
+            onToggle(false,"POLL")
         end
         if readback==true then
             if not highSince then highSince=now end
