@@ -725,7 +725,7 @@ while true do
         -- their next readback can already be NIL.
         if readback==nil and lastA then
             print("TARDIS NAV INPUT A: NIL / rearmed after pulse")
-            onToggle(false,"POLL NIL RELEASE")
+            onToggle(false,"POLL")
         elseif readback==false and previousReadback~=false then
             onToggle(false,"POLL")
         elseif readback==true and previousReadback~=true then
