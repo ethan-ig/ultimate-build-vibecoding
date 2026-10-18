@@ -626,15 +626,16 @@ if mouse and not keyboardMouseOK then
 end
 
 buildGui()
--- Navigation A is a momentary TRUE pulse, unlike the controller's
--- materialization level switch. Unknown initial state must count as FALSE.
--- In the previous revision, a first TRUE after an unreadable startup level
--- initialized the latch and silently discarded the actual button press.
+-- Navigation Input A is a momentary action. Never mistake a readback level
+-- for proof of the physical button's current position.
 local lastA=inputState()
 if lastA==nil then lastA=false end
+local lastReadback=lastA
 local lastAcceptedPulse=-math.huge
-local lastStuckNotice=-math.huge
 local PULSE_DEBOUNCE=.30
+local sawActionEvent=false
+local highSince=lastA and os.clock() or nil
+local warnedHigh=false
 print("TARDIS NAV START:",
     toggleInput and "INPUT A FOUND" or "INPUT A NOT FOUND",
     "initial="..tostring(lastA),
@@ -642,7 +643,8 @@ print("TARDIS NAV START:",
         or "NO LOCAL PLAYER / SERVER OR RESTRICTED CONTEXT",
     camera() and "CAMERA FOUND" or "NO CAMERA")
 if lastA then
-    log("NAV INPUT A STARTED TRUE / release FALSE before pressing again")
+    print("TARDIS NAV: Input A readback started TRUE; "
+        .."waiting for release or a new press event")
 end
 if not player then
     log("No LocalPlayer: input pulses can be detected but the "
@@ -657,9 +659,15 @@ local function activateNavigation(source)
         "map was",opened and "OPEN" or "CLOSED")
     if opened then close("CANCELLED") else open() end
 end
-local function onToggle(value,isEvent)
+local function onToggle(value,source)
     value=asSwitch(value)
     if value==nil then return end
+    if source~="POLL" then
+        sawActionEvent=true
+        print("TARDIS NAV INPUT A EVENT:",source,
+            "value="..tostring(value),
+            "GetState="..tostring(inputState()))
+    end
     if not value then
         if lastA then print("TARDIS NAV INPUT A: FALSE / rearmed") end
         lastA=false
@@ -667,46 +675,70 @@ local function onToggle(value,isEvent)
     end
     if not lastA then
         lastA=true
-        activateNavigation(isEvent and "EVENT" or "POLL")
-    elseif isEvent then
-        -- FIU pulse generators sometimes send another TRUE event but never
-        -- expose a readable FALSE between pulses. Treat a fresh event after
-        -- the debounce window as another press. Polling alone must NOT
-        -- retrigger a held TRUE, or the map would flicker indefinitely.
-        if os.clock()-lastAcceptedPulse>=PULSE_DEBOUNCE then
-            print("TARDIS NAV INPUT A: repeat TRUE event / no FALSE observed")
-            activateNavigation("REPEATED EVENT")
-        end
-    elseif os.clock()-lastAcceptedPulse>=1
-        and os.clock()-lastStuckNotice>=5 then
-        -- A persistent TRUE level cannot distinguish a held switch from
-        -- another pulse. Report it rather than silently trapping the latch.
-        lastStuckNotice=os.clock()
-        print("TARDIS NAV INPUT A STUCK TRUE: send FALSE then TRUE, "
-            .."or use a pulse block that emits events for each press")
+        activateNavigation(source)
+    elseif source=="PRESSED" or source=="STATECHANGED" then
+        -- A real new press event may arrive despite a stale GetState=TRUE.
+        -- The debounce prevents Pressed + StateChanged for one press from
+        -- opening and immediately closing the map.
+        activateNavigation(source.." / NEW EVENT")
     end
 end
-if toggleInput then
-    pcall(function()
-        toggleInput.StateChanged:Connect(function(value)
-            if asSwitch(value)==nil then value=inputState() end
-            onToggle(value,true)
-        end)
+
+-- Only semantic input actions count as new presses. The generic Changed
+-- event is a property notification and can cause phantom toggles, so do
+-- not subscribe to it.
+local function subscribe(eventName,callback)
+    if not toggleInput then return end
+    local ok=pcall(function()
+        toggleInput[eventName]:Connect(callback)
     end)
-    pcall(function()
-        toggleInput.Changed:Connect(function(value)
-            local parsed=asSwitch(value)
-            onToggle(parsed==nil and inputState() or parsed,true)
-        end)
-    end)
+    print("TARDIS NAV INPUT A:",eventName,
+        ok and "LISTENER CONNECTED" or "NOT AVAILABLE")
 end
+subscribe("Pressed",function()
+    onToggle(true,"PRESSED")
+end)
+subscribe("Released",function()
+    onToggle(false,"RELEASED")
+end)
+subscribe("StateChanged",function(value)
+    local normalized=asSwitch(value)
+    if normalized==nil then normalized=inputState() end
+    onToggle(normalized,"STATECHANGED")
+end)
 emit(travelOutput,false)
 print(VERSION,"/ A -> CONTROLLER C, B -> CONTROLLER F")
 while true do
     local now=os.clock()
     local dt=math.clamp(now-lastLoop,0,.1)
     lastLoop=now
-    if toggleInput then onToggle(inputState()) end
+    if toggleInput then
+        local readback=inputState()
+        if readback~=lastReadback then
+            print("TARDIS NAV A GetState CHANGED:",
+                tostring(lastReadback),"->",tostring(readback))
+            lastReadback=readback
+        end
+        -- Events, once observed, are more reliable than a potentially
+        -- latched GetState readback. A polled FALSE can still rearm.
+        if not sawActionEvent then
+            onToggle(readback,"POLL")
+        elseif readback==false and lastA then
+            onToggle(false,"POLL RELEASE")
+        end
+        if readback==true then
+            if not highSince then highSince=now end
+            if not warnedHigh and now-highSince>=2 then
+                warnedHigh=true
+                print("TARDIS NAV A READBACK REMAINS TRUE: "
+                    .."GetState() has not returned FALSE. "
+                    .."This does NOT prove the physical button is held.")
+            end
+        else
+            highSince=nil
+            warnedHigh=false
+        end
+    end
     if not opened then
         if now-lastExterior>=REFRESH_RATE then
             lastExterior=now
