@@ -632,34 +632,72 @@ buildGui()
 -- initialized the latch and silently discarded the actual button press.
 local lastA=inputState()
 if lastA==nil then lastA=false end
+local lastAcceptedPulse=-math.huge
+local lastStuckNotice=-math.huge
+local PULSE_DEBOUNCE=.30
 print("TARDIS NAV START:",
     toggleInput and "INPUT A FOUND" or "INPUT A NOT FOUND",
     "initial="..tostring(lastA),
     player and ("local player="..tostring(player.Name))
         or "NO LOCAL PLAYER / SERVER OR RESTRICTED CONTEXT",
     camera() and "CAMERA FOUND" or "NO CAMERA")
+if lastA then
+    log("NAV INPUT A STARTED TRUE / release FALSE before pressing again")
+end
 if not player then
     log("No LocalPlayer: input pulses can be detected but the "
         .."map GUI/camera cannot run server-side.")
 end
-local function onToggle(value)
+
+local function activateNavigation(source)
+    local now=os.clock()
+    if now-lastAcceptedPulse<PULSE_DEBOUNCE then return end
+    lastAcceptedPulse=now
+    print("TARDIS NAV ACCEPTED A PULSE:",source,
+        "map was",opened and "OPEN" or "CLOSED")
+    if opened then close("CANCELLED") else open() end
+end
+local function onToggle(value,isEvent)
     value=asSwitch(value)
-    if value==nil or value==lastA then return end
-    lastA=value
-    print("TARDIS NAV INPUT A:",value and "TRUE" or "FALSE")
-    if value then
-        if opened then close("CANCELLED") else open() end
+    if value==nil then return end
+    if not value then
+        if lastA then print("TARDIS NAV INPUT A: FALSE / rearmed") end
+        lastA=false
+        return
+    end
+    if not lastA then
+        lastA=true
+        activateNavigation(isEvent and "EVENT" or "POLL")
+    elseif isEvent then
+        -- FIU pulse generators sometimes send another TRUE event but never
+        -- expose a readable FALSE between pulses. Treat a fresh event after
+        -- the debounce window as another press. Polling alone must NOT
+        -- retrigger a held TRUE, or the map would flicker indefinitely.
+        if os.clock()-lastAcceptedPulse>=PULSE_DEBOUNCE then
+            print("TARDIS NAV INPUT A: repeat TRUE event / no FALSE observed")
+            activateNavigation("REPEATED EVENT")
+        end
+    elseif os.clock()-lastAcceptedPulse>=1
+        and os.clock()-lastStuckNotice>=5 then
+        -- A persistent TRUE level cannot distinguish a held switch from
+        -- another pulse. Report it rather than silently trapping the latch.
+        lastStuckNotice=os.clock()
+        print("TARDIS NAV INPUT A STUCK TRUE: send FALSE then TRUE, "
+            .."or use a pulse block that emits events for each press")
     end
 end
 if toggleInput then
     pcall(function()
         toggleInput.StateChanged:Connect(function(value)
             if asSwitch(value)==nil then value=inputState() end
-            onToggle(value)
+            onToggle(value,true)
         end)
     end)
     pcall(function()
-        toggleInput.Changed:Connect(function() onToggle(inputState()) end)
+        toggleInput.Changed:Connect(function(value)
+            local parsed=asSwitch(value)
+            onToggle(parsed==nil and inputState() or parsed,true)
+        end)
     end)
 end
 emit(travelOutput,false)

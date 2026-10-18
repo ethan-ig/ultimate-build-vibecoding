@@ -127,3 +127,32 @@ the server, simply wiring an input cannot make this script's
 The GUI must then run in an authorized client-side context, or the
 navigation controls must be redesigned for server-side/world-space use.
 Do not assume a connected wire proves that the GUI can render.
+
+## Opening the navigation map again after travel
+
+Navigation Input A is an edge-triggered button input. After a successful
+travel the map closes but the Code Block keeps running. For each new
+navigation request, send **FALSE -> TRUE -> FALSE**. A held TRUE is not
+another button press.
+
+Some Ultimate Build input/pulse blocks deliver repeated TRUE **events**
+without ever exposing the intervening FALSE state through `GetState()`.
+The navigation script now accepts a new TRUE input **event** after a
+0.30-second debounce, even if its last readable level stayed TRUE.
+Polling by itself will never repeatedly toggle on a constantly held
+TRUE, because that would open and close the map in an endless loop.
+
+Console messages now distinguish the possible cases:
+- `TARDIS NAV ACCEPTED A PULSE: ... map was CLOSED`: the reopen was
+  recognized and the script attempted to open the map
+- `TARDIS NAV INPUT A: FALSE / rearmed`: an explicit release was seen
+- `TARDIS NAV INPUT A: repeat TRUE event / no FALSE observed`:
+  a fresh button event arrived after a prior unreleased pulse
+- `TARDIS NAV INPUT A STUCK TRUE`: the Code Block still sees a high
+  level and cannot distinguish another press from a held switch
+
+For initial testing, use a variable or switch to send FALSE for
+0.3 seconds, TRUE for 0.3 seconds, then FALSE. Repeat that sequence
+after confirming travel. Test NAV / MAP on-screen as an independent
+path. If neither method reopens the map, inspect the navigation
+Code Block logs to find whether it is still running.
