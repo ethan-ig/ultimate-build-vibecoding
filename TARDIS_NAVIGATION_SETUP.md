@@ -91,3 +91,39 @@ environments that render a button but do not dispatch its click events.
 The event subscriptions and coordinate fallback are defensive integrations for
 FIU. Roblox or game-side proxy APIs may vary; these changes have not been
 validated in a live Ultimate Build session.
+
+## NAV A first-pulse troubleshooting
+
+The 2.0 input-compatibility update accidentally discarded the first TRUE
+navigation pulse whenever the startup socket state was unreadable (`nil`).
+The latest navigation fix treats an unknown initial NAV A level as FALSE,
+so the first received TRUE opens the map instead of merely arming its latch.
+
+Navigation A is **edge triggered**: supply FALSE, then TRUE, then FALSE.
+A continuous TRUE signal opens only once; send FALSE before the next press.
+A very short pulse still may be missed when FIU exposes only polling
+(no input change events). For diagnosis, keep TRUE high for 0.2 seconds.
+
+### Watch the Navigation Code Block console
+
+On startup look for `TARDIS NAV START:` followed by:
+
+- `INPUT A FOUND` versus `INPUT A NOT FOUND`: whether the script
+  resolved the input socket.
+- `local player=<name>` versus `NO LOCAL PLAYER`: whether the
+  script has the player context needed for an on-screen GUI.
+- `CAMERA FOUND` versus `NO CAMERA`: whether a usable camera is present.
+
+On each recognized level change look for `TARDIS NAV INPUT A: TRUE` or
+`FALSE`. When a TRUE arrives but no local player is present, the script
+prints `MAP CANNOT OPEN` rather than silently ignoring the pulse.
+Navigation **Output C**, when offered by the Code Block, also sends
+these diagnostic messages as text to an external display.
+
+**Architecture limitation:** Roblox only defines `Players.LocalPlayer`
+inside client-side scripts. If Ultimate Build's Code Block executes on
+the server, simply wiring an input cannot make this script's
+`PlayerGui`, `UserInputService`, and local camera navigation work.
+The GUI must then run in an authorized client-side context, or the
+navigation controls must be redesigned for server-side/world-space use.
+Do not assume a connected wire proves that the GUI can render.
