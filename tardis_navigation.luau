@@ -25,16 +25,46 @@ local FILTER_NAMES = {
 }
 
 local function port(tableName, letter)
-    local value=nil
-    pcall(function() value=script[tableName][letter] end)
-    return value
+    local bank=nil
+    pcall(function() bank=script[tableName] end)
+    if not bank then return nil end
+    for _,key in ipairs({letter,letter:upper()}) do
+        local ok,value=pcall(function() return bank[key] end)
+        if ok and value then return value end
+    end
+    return nil
 end
 local toggleInput=port("inputs","a")
 local destinationOutput=port("outputs","a")
 local travelOutput=port("outputs","b")
 local function emit(portObject,value)
     if not portObject then return false end
-    return pcall(function() portObject:SetState(value) end)
+    local ok=pcall(function() portObject:SetState(value) end)
+    if not ok then ok=pcall(function() portObject:Fire(value,true) end) end
+    return ok
+end
+local function asSwitch(value)
+    if type(value)=="boolean" then return value end
+    if value==1 then return true end
+    if value==0 then return false end
+    if type(value)=="string" then
+        local lower=value:lower():match("^%s*(.-)%s*$")
+        if lower=="true" or lower=="on" or lower=="1" then return true end
+        if lower=="false" or lower=="off" or lower=="0" then return false end
+    end
+    return nil
+end
+local function inputState()
+    if not toggleInput then return nil end
+    local ok,value=pcall(function() return toggleInput:GetState() end)
+    if ok and value~=nil then return asSwitch(value) end
+    for _,key in ipairs({"State","Value"}) do
+        ok,value=pcall(function() return toggleInput[key] end)
+        if ok and value~=nil and type(value)~="function" then
+            return asSwitch(value)
+        end
+    end
+    return nil
 end
 local function prop(object,key)
     if not object then return nil end
@@ -88,6 +118,7 @@ local lastLoop,lastHover,lastExterior=0,0,0
 local rightHeld,lastCursor,lastSelect= false,nil,0
 local candidates,exclusions,params={}, {}, nil
 local screen,button,panel,coords,status,confirm=nil,nil,nil,nil,nil,nil
+local uiClickTargets={}
 
 local function log(text)
     print("TARDIS NAV:",text)
@@ -283,6 +314,7 @@ end
 local function destroyGui()
     if screen then pcall(function() screen:Destroy() end) end
     screen,button,panel,coords,status,confirm=nil,nil,nil,nil,nil,nil
+    uiClickTargets={}
 end
 local function corner(parent,r)
     pcall(function()
@@ -292,17 +324,45 @@ local function corner(parent,r)
     end)
 end
 local function connectButton(b,callback)
-    -- Some FIU UI proxies accept Activated connections but never dispatch
-    -- them. Listen to both events, debouncing their duplicate click reports.
-    local last=0
+    -- FIU sometimes creates visible UI buttons without dispatching Roblox
+    -- Activated/MouseButton1Click. Register a cursor hit-test fallback too.
+    local last=-math.huge
     local function fire()
         local now=os.clock()
-        if now-last<.22 then return end
+        if now-last<.20 then return end
         last=now
         callback()
     end
+    table.insert(uiClickTargets,{button=b,fire=fire})
     pcall(function() b.Activated:Connect(fire) end)
     pcall(function() b.MouseButton1Click:Connect(fire) end)
+end
+local function clickGuiAt(position)
+    if not position then return false end
+    -- Check in reverse creation order, so panel actions beat the map toggle.
+    for i=#uiClickTargets,1,-1 do
+        local item=uiClickTargets[i]
+        local b=item.button
+        local ok,visible,origin,size=pcall(function()
+            return b.Visible,b.AbsolutePosition,b.AbsoluteSize
+        end)
+        local ancestorsVisible=true
+        local parent=ok and b.Parent or nil
+        while parent and parent~=screen do
+            local okParent,v=pcall(function() return parent.Visible end)
+            if okParent and v==false then ancestorsVisible=false;break end
+            local okNext,nextParent=pcall(function() return parent.Parent end)
+            if not okNext then break end
+            parent=nextParent
+        end
+        if ok and visible and ancestorsVisible and origin and size
+            and position.X>=origin.X and position.X<=origin.X+size.X
+            and position.Y>=origin.Y and position.Y<=origin.Y+size.Y then
+            item.fire()
+            return true
+        end
+    end
+    return false
 end
 local open,close,commit
 local function buildGui()
@@ -508,6 +568,9 @@ local keyboardMouseOK=false
 if UIS then
     keyboardMouseOK=pcall(function()
         UIS.InputBegan:Connect(function(key,processed)
+            -- The NAV button must be clickable even while the map is closed.
+            if key.UserInputType==Enum.UserInputType.MouseButton1
+                and clickGuiAt(cursor()) then return end
             if not opened then return end
             if key.KeyCode==Enum.KeyCode.Escape then
                 close("CANCELLED"); return
@@ -515,9 +578,11 @@ if UIS then
             if key.UserInputType==Enum.UserInputType.MouseButton2 then
                 rightHeld=true
                 lastCursor=cursor()
-            elseif key.UserInputType==Enum.UserInputType.MouseButton1
-                and not processed then
-                selectLand()
+            elseif key.UserInputType==Enum.UserInputType.MouseButton1 then
+                -- Run the fallback even when Roblox marks a GUI click processed.
+                -- Otherwise, clicking CONFIRM can accidentally select terrain.
+                if clickGuiAt(cursor()) then return end
+                if not processed then selectLand() end
             end
         end)
         UIS.InputEnded:Connect(function(key)
@@ -534,7 +599,9 @@ if UIS then
 end
 if mouse and not keyboardMouseOK then
     pcall(function()
-        mouse.Button1Down:Connect(selectLand)
+        mouse.Button1Down:Connect(function()
+            if not clickGuiAt(cursor()) then selectLand() end
+        end)
         mouse.Button2Down:Connect(function() rightHeld=true;lastCursor=cursor() end)
         mouse.Button2Up:Connect(function() rightHeld=false end)
         mouse.WheelForward:Connect(function() zoom(1) end)
@@ -543,22 +610,34 @@ if mouse and not keyboardMouseOK then
 end
 
 buildGui()
-local lastA=false
+local lastA=inputState()
+local function onToggle(value)
+    value=asSwitch(value)
+    if value==nil then return end
+    if lastA==nil then lastA=value;return end
+    if value and not lastA then
+        if opened then close("CANCELLED") else open() end
+    end
+    lastA=value
+end
+if toggleInput then
+    pcall(function()
+        toggleInput.StateChanged:Connect(function(value)
+            if asSwitch(value)==nil then value=inputState() end
+            onToggle(value)
+        end)
+    end)
+    pcall(function()
+        toggleInput.Changed:Connect(function() onToggle(inputState()) end)
+    end)
+end
 emit(travelOutput,false)
 print(VERSION,"/ A -> CONTROLLER C, B -> CONTROLLER F")
 while true do
     local now=os.clock()
     local dt=math.clamp(now-lastLoop,0,.1)
     lastLoop=now
-    if toggleInput then
-        local ok,value=pcall(function() return toggleInput:GetState() end)
-        if ok and type(value)=="boolean" then
-            if value and not lastA then
-                if opened then close("CANCELLED") else open() end
-            end
-            lastA=value
-        end
-    end
+    if toggleInput then onToggle(inputState()) end
     if not opened then
         if now-lastExterior>=REFRESH_RATE then
             lastExterior=now
