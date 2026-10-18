@@ -38,9 +38,15 @@ local SOUND = {
 }
 
 local function port(tableName, letter)
-    local p = nil
-    pcall(function() p = script[tableName][letter] end)
-    return p
+    local bank=nil
+    pcall(function() bank=script[tableName] end)
+    if not bank then return nil end
+    -- FIU builds have exposed both lowercase and uppercase socket keys.
+    for _,key in ipairs({letter,letter:upper()}) do
+        local ok,value=pcall(function() return bank[key] end)
+        if ok and value then return value end
+    end
+    return nil
 end
 local input = {}
 local output = {}
@@ -51,14 +57,36 @@ for _, letter in ipairs({"a","b","c"}) do
     output[letter] = port("outputs",letter)
 end
 local function emit(letter, value)
-    local p = output[letter]
-    if p then pcall(function() p:SetState(value) end) end
+    local p=output[letter]
+    if not p then return false end
+    local ok=pcall(function() p:SetState(value) end)
+    if not ok then ok=pcall(function() p:Fire(value,true) end) end
+    return ok
 end
 local function state(letter)
-    local p = input[letter]
-    if not p then return nil, false end
-    local ok, value = pcall(function() return p:GetState() end)
-    return value, ok
+    local p=input[letter]
+    if not p then return nil,false end
+    local ok,value=pcall(function() return p:GetState() end)
+    if ok and value~=nil then return value,true end
+    -- Some socket proxies expose their state as a property instead.
+    for _,key in ipairs({"State","Value"}) do
+        ok,value=pcall(function() return p[key] end)
+        if ok and value~=nil and type(value)~="function" then
+            return value,true
+        end
+    end
+    return nil,false
+end
+local function asSwitch(value)
+    if type(value)=="boolean" then return value end
+    if value==1 then return true end
+    if value==0 then return false end
+    if type(value)=="string" then
+        local lower=value:lower():match("^%s*(.-)%s*$")
+        if lower=="true" or lower=="on" or lower=="1" then return true end
+        if lower=="false" or lower=="off" or lower=="0" then return false end
+    end
+    return nil
 end
 local function prop(object, key)
     if not object then return nil end
@@ -345,7 +373,6 @@ local rotorTime,lastRotor,lastFade = 0,0,0
 local activeSound, soundStarted, quickStingUntil = nil,0,0
 local busy = false
 local latestDestination = nil
-local inputHistory = {}
 local function setBusy(flag)
     busy=flag
     rootFlag("TardisTransitioning",flag)
@@ -787,51 +814,78 @@ local function updateRotor(now,dt)
     end
 end
 
-local lastPulse={e=false,f=false,j=false}
-local latch=nil
+-- Seed the edge detectors from the actual socket levels. Starting a Code
+-- Block while a switch is already ON must not fire a phantom command.
+local lastPulse={}
+for _,letter in ipairs({"e","f","j"}) do
+    lastPulse[letter]=asSwitch(select(1,state(letter)))==true
+end
+local latch=asSwitch(select(1,state("a")))
 local lastLoop=os.clock()
+
+local function onMaterialize(value)
+    value=asSwitch(value)
+    if value==nil then return end
+    if latch==nil then latch=value; return end
+    if value==latch then return end
+    latch=value
+    local fast=asSwitch(select(1,state("d")))==true
+    beginCommand({
+        kind=value and "SHOW" or "HIDE",
+        quick=fast,
+        target=value and destinationFromInputs() or nil,
+    })
+end
+local function onPulse(letter,value)
+    value=asSwitch(value)
+    if value==nil then return end
+    if value and not lastPulse[letter] then
+        local fast=asSwitch(select(1,state("d")))==true
+        if letter=="e" then
+            beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
+        elseif letter=="j" then
+            beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=false})
+        else
+            beginCommand({kind="TRAVEL",
+                target=destinationFromInputs(),quick=fast})
+        end
+    end
+    lastPulse[letter]=value
+end
+
+-- Use socket events when FIU exposes them, with polling as a fallback.
+-- Event delivery catches button pulses shorter than the main loop tick.
+local function watchInput(letter,handler)
+    local p=input[letter]
+    if not p then return end
+    pcall(function()
+        p.StateChanged:Connect(function(value)
+            if asSwitch(value)==nil then value=select(1,state(letter)) end
+            handler(value)
+        end)
+    end)
+    pcall(function()
+        p.Changed:Connect(function()
+            handler(select(1,state(letter)))
+        end)
+    end)
+end
+watchInput("a",onMaterialize)
+for _,letter in ipairs({"e","f","j"}) do
+    local key=letter
+    watchInput(key,function(value) onPulse(key,value) end)
+end
+
 emit("b",false)
 if phase=="HIDDEN" then setFinalFade(1) else setFinalFade(0) end
-showMessage(VERSION.." / "..phase.." / NAV ONLY")
+showMessage(VERSION.." / "..phase.." / INPUTS ARMED")
 while true do
     local now=os.clock()
     local dt=math.clamp(now-lastLoop,.001,.1)
     lastLoop=now
-
-    local a,aOK=state("a")
-    if aOK and type(a)=="boolean" then
-        if latch==nil then
-            -- Startup unreadability cannot trigger accidental relocation.
-            latch=a
-            if a and phase=="HIDDEN" then
-                beginCommand({kind="SHOW",target=destinationFromInputs()})
-            elseif not a and phase=="SOLID" then
-                beginCommand({kind="HIDE"})
-            end
-        elseif a~=latch then
-            latch=a
-            local d=state("d")
-            beginCommand({kind=a and "SHOW" or "HIDE",
-                quick=d==true,
-                target=a and destinationFromInputs() or nil})
-        end
-    end
+    onMaterialize(select(1,state("a")))
     for _,letter in ipairs({"e","f","j"}) do
-        local value,ok=state(letter)
-        if ok and type(value)=="boolean" then
-            if value and not lastPulse[letter] then
-                local fast=state("d")
-                if letter=="e" then
-                    beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=true})
-                elseif letter=="j" then
-                    beginCommand({kind="TRAVEL",target=toPlayer(nil),quick=false})
-                else
-                    beginCommand({kind="TRAVEL",
-                        target=destinationFromInputs(),quick=fast==true})
-                end
-            end
-            lastPulse[letter]=value
-        end
+        onPulse(letter,select(1,state(letter)))
     end
     updateTransition(now)
     updateRotor(now,dt)
