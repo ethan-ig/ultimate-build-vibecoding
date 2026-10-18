@@ -712,10 +712,10 @@ while true do
     lastLoop=now
     if toggleInput then
         local readback=inputState()
-        if readback~=lastReadback then
+        local previousReadback=lastReadback
+        if readback~=previousReadback then
             print("TARDIS NAV A GetState CHANGED:",
-                tostring(lastReadback),"->",tostring(readback))
-            lastReadback=readback
+                tostring(previousReadback),"->",tostring(readback))
         end
         -- FIU pulse sockets can return TRUE for a pulse and NIL after
         -- it ends, rather than returning explicit FALSE. NIL here is an
@@ -726,13 +726,14 @@ while true do
         if readback==nil and lastA then
             print("TARDIS NAV INPUT A: NIL / rearmed after pulse")
             onToggle(false,"POLL NIL RELEASE")
-        elseif readback==false and lastReadback~=false then
+        elseif readback==false and previousReadback~=false then
             onToggle(false,"POLL")
-        elseif readback==true and lastReadback~=true then
+        elseif readback==true and previousReadback~=true then
             -- Only a new readback edge may trigger a press. A stale
             -- high readback after a Released event must not retrigger.
             onToggle(true,"POLL")
         end
+        lastReadback=readback
         if readback==true then
             if not highSince then highSince=now end
             if not warnedHigh and now-highSince>=2 then
