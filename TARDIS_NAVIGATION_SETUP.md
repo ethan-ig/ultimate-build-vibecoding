@@ -51,3 +51,43 @@ NAVIGATION 2.0 / A -> CONTROLLER C, B -> CONTROLLER F
 ```
 
 Check one full two-client travel before trusting the new version for normal use. A successful proxy assignment alone does not verify remote visibility. Nothing in this rewrite claims to provide manual physical flight or a real gravity drop.
+
+## Input reliability update
+
+These scripts now resolve FIU socket names with lowercase or uppercase keys, read
+socket state from `GetState()` (or `State`/`Value` when exposed), and accept
+boolean, 0/1, or "on"/"off" switch values.
+
+**Important: install both files together.** The controller does not act on the
+initial materialization switch position anymore. Toggle A **after startup** to
+show or hide the exterior. This prevents restarting the Code Block from launching
+an unrequested transition. E, F, and J trigger on the rising edge and should be
+released between activations. If FIU delivers `StateChanged` or `Changed`
+events, short pulses are captured by the event handlers as well as the polling
+fallback. If FIU exposes neither event, pulses must remain active for at least
+one controller poll (1/30 second plus scheduler delays).
+
+The navigation panel now listens for the native GUI button events **and** checks
+pointer coordinates against button bounds. This fallback allows NAV / MAP,
+CONFIRM TRAVEL, CANCEL / ESC, RECENTER, and CLEAR PIN to respond on FIU
+environments that render a button but do not dispatch its click events.
+
+### Checks after installation
+
+1. Ensure the controller reports `INPUTS ARMED` and does **not** immediately
+   show/hide the box on startup. If it reports `shell not found`, `scattered
+   shell`, or `anchors unconfirmed`, fix the saved exterior or proxy access
+   first: input processing cannot start until rig validation succeeds.
+2. Flip controller input A OFF then ON. Confirm each state change produces one
+   transition, rather than a transition at startup.
+3. Trigger E, F, and J individually with distinct TRUE/FALSE pulses and check
+   the controller status output A. Recall relies on a readable local player
+   root. Coordinate travel requires a grounded destination through input C.
+4. Press NAV / MAP, select terrain, use RECENTER and CLEAR PIN, select
+   again, then press CONFIRM TRAVEL. With navigation B wired to controller F,
+   confirm destination C reaches the controller before the travel pulse.
+5. Verify behavior with two clients before trusting exterior replication.
+
+The event subscriptions and coordinate fallback are defensive integrations for
+FIU. Roblox or game-side proxy APIs may vary; these changes have not been
+validated in a live Ultimate Build session.
