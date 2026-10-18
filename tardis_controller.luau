@@ -67,8 +67,10 @@ local function state(letter)
     local p=input[letter]
     if not p then return nil,false end
     local ok,value=pcall(function() return p:GetState() end)
-    if ok and value~=nil then return value,true end
-    -- Some socket proxies expose their state as a property instead.
+    -- An explicitly successful NIL from FIU means no active pulse.
+    -- Do not replace it with a potentially stale State/Value property.
+    if ok then return value,true end
+    -- Fall back to properties only if GetState itself is unavailable.
     for _,key in ipairs({"State","Value"}) do
         ok,value=pcall(function() return p[key] end)
         if ok and value~=nil and type(value)~="function" then
