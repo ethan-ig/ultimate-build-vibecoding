@@ -37,6 +37,8 @@ end
 local toggleInput=port("inputs","a")
 local destinationOutput=port("outputs","a")
 local travelOutput=port("outputs","b")
+-- Optional diagnostic text output. Leave it unwired if no spare socket exists.
+local diagnosticOutput=port("outputs","c")
 local function emit(portObject,value)
     if not portObject then return false end
     local ok=pcall(function() portObject:SetState(value) end)
@@ -120,9 +122,10 @@ local candidates,exclusions,params={}, {}, nil
 local screen,button,panel,coords,status,confirm=nil,nil,nil,nil,nil,nil
 local uiClickTargets={}
 
-local function log(text)
-    print("TARDIS NAV:",text)
-    if status then pcall(function() status.Text=text end) end
+local function log(message)
+    print("TARDIS NAV:",message)
+    if status then pcall(function() status.Text=message end) end
+    if diagnosticOutput then emit(diagnosticOutput,message) end
 end
 local function playerPosition()
     local character=player and player.Character
@@ -467,9 +470,22 @@ close=function(reason)
 end
 open=function()
     if opened then return end
+    if not player then
+        log("MAP CANNOT OPEN: Players.LocalPlayer unavailable. "
+            .."This Code Block may be running server-side; the map "
+            .."requires a client-side GUI and camera.")
+        return
+    end
     local cam=camera()
-    if not cam then log("CAMERA UNAVAILABLE"); return end
+    if not cam then
+        log("MAP CANNOT OPEN: workspace.CurrentCamera unavailable")
+        return
+    end
     if not screen then buildGui() end
+    if not screen then
+        log("MAP CANNOT OPEN: PlayerGui unavailable or GUI creation failed")
+        return
+    end
     local snapshot={}
     pcall(function()
         snapshot.kind=cam.CameraType
@@ -610,15 +626,30 @@ if mouse and not keyboardMouseOK then
 end
 
 buildGui()
+-- Navigation A is a momentary TRUE pulse, unlike the controller's
+-- materialization level switch. Unknown initial state must count as FALSE.
+-- In the previous revision, a first TRUE after an unreadable startup level
+-- initialized the latch and silently discarded the actual button press.
 local lastA=inputState()
+if lastA==nil then lastA=false end
+print("TARDIS NAV START:",
+    toggleInput and "INPUT A FOUND" or "INPUT A NOT FOUND",
+    "initial="..tostring(lastA),
+    player and ("local player="..tostring(player.Name))
+        or "NO LOCAL PLAYER / SERVER OR RESTRICTED CONTEXT",
+    camera() and "CAMERA FOUND" or "NO CAMERA")
+if not player then
+    log("No LocalPlayer: input pulses can be detected but the "
+        .."map GUI/camera cannot run server-side.")
+end
 local function onToggle(value)
     value=asSwitch(value)
-    if value==nil then return end
-    if lastA==nil then lastA=value;return end
-    if value and not lastA then
+    if value==nil or value==lastA then return end
+    lastA=value
+    print("TARDIS NAV INPUT A:",value and "TRUE" or "FALSE")
+    if value then
         if opened then close("CANCELLED") else open() end
     end
-    lastA=value
 end
 if toggleInput then
     pcall(function()
