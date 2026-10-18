@@ -190,3 +190,36 @@ release or a distinct new press event.
 
 These changes have not been exercised inside a live Ultimate Build
 session. No HTTP loader or dynamic string execution is involved.
+
+## FIU pulse release is `nil`, not always `false`
+
+Observed navigation socket diagnostics in-game:
+`GetState CHANGED: nil -> true -> nil -> true -> nil`.
+
+This means the Code Block sees a momentary `true` followed by an
+**empty (`nil`) socket**, not an explicit boolean `false`. This was
+why a working pulse source appeared "stuck": the script previously
+ignored `nil` and never cleared its `lastA` latch.
+
+Navigation now treats an observed input `nil` **after an accepted
+TRUE** as release/rearm. It accepts a new `nil -> true` as the next
+press. An explicit `false` also rearms. It does **not** treat a
+continuously held TRUE as repeated presses.
+
+Expected diagnostics on each normal momentary press:
+
+```text
+TARDIS NAV A GetState CHANGED: nil -> true
+TARDIS NAV ACCEPTED A PULSE: POLL map was CLOSED
+TARDIS NAV A GetState CHANGED: true -> nil
+TARDIS NAV INPUT A: NIL / rearmed after pulse
+```
+
+The order of the lines can differ when an input event arrives before
+the polling loop. On the next press the accepted pulse should say
+`map was OPEN` if the first press has not already been confirmed/
+closed by navigation actions, or `map was CLOSED` after travel.
+
+If `true -> nil` happens but no accepted pulse appears, check
+whether the script is still running and whether GUI/camera operations
+logged failures. Live FIU testing is still required.
